@@ -38,6 +38,7 @@ services:
       start_period: 20s
 
   picoctl:
+    image: ${PICO_IMAGE:-ghcr.io/exmeaning/pico-onebot:latest}
     build:
       context: ..
       dockerfile: docker/Dockerfile
@@ -56,11 +57,12 @@ services:
       PICO_INTERVAL: ${PICO_INTERVAL:-30}
       PICO_DNS_PROXY: 1
       PICO_DNS_UPSTREAM: ${PICO_DNS_UPSTREAM:-223.5.5.5}
-    volumes:
-      - type: bind
-        source: ${PICO_APK_PATH:?Set PICO_APK_PATH in docker/.env}
-        target: /opt/pico-onebot/PicoOnebot.apk
-        read_only: true
+    # 官方镜像已内置 PicoOnebot.apk；若本地有定制开发 APK 需挂载覆盖，可在 docker/.env 设置 PICO_APK_PATH 并解开下方注释：
+    # volumes:
+    #   - type: bind
+    #     source: ${PICO_APK_PATH}
+    #     target: /opt/pico-onebot/PicoOnebot.apk
+    #     read_only: true
     command: ["watch"]
     networks:
       pico:

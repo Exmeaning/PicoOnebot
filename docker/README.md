@@ -7,16 +7,15 @@
 1. 宿主内核有 binder/binderfs:`test -e /dev/binder`。
 2. 已安装 Docker Compose v2。
 3. 已通过 Waydroid 的 `waydroid_script` 安装 `libndk_translation`。
-4. 已有构建好的 `PicoOnebot_*.apk`。
+4. （可选）如有本地定制需求可准备 `PicoOnebot_*.apk`，官方 `ghcr.io` 镜像已预置对应版本的 Release APK。
 
 ## 启动
 
 ```bash
 cp docker/.env.example docker/.env
-# 编辑 PICO_APK_PATH;相对路径以 docker/compose.yml 所在目录为基准
 
 sudo docker/prepare-libndk.sh /var/lib/waydroid/overlay/system
-sudo docker compose --env-file docker/.env -f docker/compose.yml up -d --build
+sudo docker compose --env-file docker/.env -f docker/compose.yml up -d
 
 sudo docker compose --env-file docker/.env -f docker/compose.yml \
   exec picoctl /opt/pico-onebot/picoctl.sh qr

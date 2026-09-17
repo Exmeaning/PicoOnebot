@@ -1,7 +1,4 @@
 # 打 tag(v1.2.3) 触发 GitHub Actions 自动构建 WebUI 与混合 APK 并发布 GitHub Release。
-# 宿主 APK 是腾讯版权文件，不入库；通过仓库 Secrets/Vars (PICO_BASE_APK_URL, PICO_BASE_APK_SHA256) 传入。
-name: Release
-
 on:
   push:
     tags: ["v*"]

@@ -1,0 +1,1 @@
+﻿# Placeholder file to ensure Dockerfile copy wildcard succeeds when no APK is provided.
