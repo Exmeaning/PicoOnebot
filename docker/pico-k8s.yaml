@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pico-onebot
+  namespace: default
+  labels:
+    app: pico-onebot
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: pico-onebot
+  template:
+    metadata:
+      labels:
+        app: pico-onebot
+    spec:
+      containers:
+      - name: pico-onebot
+        image: ghcr.io/exmeaning/pico-onebot:latest
+        imagePullPolicy: Always
+        securityContext:
+          privileged: true
+        ports:
+        - containerPort: 6099
+          name: webui
+        - containerPort: 3001
+          name: onebot
+        - containerPort: 5555
+          name: adb
+        volumeMounts:
+        - name: binder
+          mountPath: /dev/binder
+        - name: data
+          mountPath: /data
+      volumes:
+      - name: binder
+        hostPath:
+          path: /dev/binder
+      - name: data
+        hostPath:
+          path: /var/lib/pico-onebot-data
+          type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pico-onebot
+  namespace: default
+spec:
+  type: NodePort
+  selector:
+    app: pico-onebot
+  ports:
+  - name: webui
+    port: 6099
+    targetPort: 6099
+    nodePort: 30099
+  - name: onebot
+    port: 3001
+    targetPort: 3001
+    nodePort: 30001
