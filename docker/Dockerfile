@@ -1,3 +1,6 @@
+# Global ARGs used across FROM instructions must be declared before the first FROM
+ARG REDROID_IMAGE=redroid/redroid:13.0.0-latest
+
 # Multi-stage build: stage 1 prepares Google libndk translation & runtime scripts
 FROM --platform=$BUILDPLATFORM alpine:3.20 AS builder
 ARG TARGETARCH
@@ -37,7 +40,6 @@ RUN if [ -f /stage/tmp/PicoOnebot.apk ]; then \
     fi && rm -rf /stage/tmp
 
 # Stage 2: Final All-in-One Image
-ARG REDROID_IMAGE=redroid/redroid:13.0.0-latest
 FROM ${REDROID_IMAGE}
 
 # Copy prepared Android system layer & PicoOnebot runtime
