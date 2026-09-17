@@ -7,6 +7,9 @@ URL="${PICO_BASE_APK_URL:-https://download.wearstore.asia/APK/QQ%E6%89%8B%E8%A1%
 SHA="${PICO_BASE_APK_SHA256:-cbf5f4373c4eca3a12fb4d18106de5760d62bffc68f4aa1ebf25537d787e92ab}"
 DEX2JAR="${DEX2JAR:-d2j-dex2jar.sh}"   # https://github.com/pxb1988/dex2jar (dex-tools)
 
+mkdir -p "$HERE/app/mixin" "$HERE/buildtools/gen-dep" "$HERE/app/libs"
+chmod +x "$HERE/gradlew" 2>/dev/null || true
+
 apk="$HERE/app/mixin/source.apk"
 if [ ! -f "$apk" ]; then
   echo "[fetch-base] downloading base apk"

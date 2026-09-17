@@ -1,7 +1,13 @@
+<div align="center">
+
+<img src="docs/logo.png" alt="PicoOnebot" width="360" />
+
 # PicoOnebot
 
-> 基于手表 NT QQ 的 Android 原生 OneBot v11 协议端。
-> 免 Root、免 Xposed，内置现代 WebUI 管理控制台。
+**基于手表 NT QQ 的 Android 原生 OneBot v11 协议端。**  
+免 Root、免 Xposed，内置现代 WebUI 管理控制台。
+
+</div>
 
 ---
 

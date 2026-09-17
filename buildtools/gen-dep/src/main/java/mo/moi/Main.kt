@@ -25,6 +25,7 @@ fun main() {
 
 val excluded = arrayOf("kotlin", "androidx")
 fun processJar(inputJar: File, outputJar: File) {
+    outputJar.parentFile?.mkdirs()
     ZipOutputStream(BufferedOutputStream(FileOutputStream(outputJar))).use { zos ->
         ZipInputStream(BufferedInputStream(FileInputStream(inputJar))).use { zis ->
             var entry: ZipEntry? = zis.nextEntry

@@ -57,10 +57,12 @@ jobs:
         env:
           PICO_BASE_APK_URL: ${{ secrets.PICO_BASE_APK_URL || vars.PICO_BASE_APK_URL }}
           PICO_BASE_APK_SHA256: ${{ secrets.PICO_BASE_APK_SHA256 || vars.PICO_BASE_APK_SHA256 }}
-        run: scripts/fetch-base.sh
+        run: |
+          chmod +x scripts/fetch-base.sh gradlew
+          bash scripts/fetch-base.sh
 
       # ---- 混合 APK 构建 ----
-      - run: chmod +x gradlew && ./gradlew MixinApk-release --no-daemon -PpicoVersion=${{ steps.ver.outputs.version }}
+      - run: ./gradlew MixinApk-release --no-daemon -PpicoVersion=${{ steps.ver.outputs.version }}
 
       - name: Generate Checksums
         run: |
