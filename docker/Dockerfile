@@ -2,11 +2,11 @@ FROM debian:bookworm-slim
 
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        adb bash ca-certificates curl python3 \
+        adb bash ca-certificates curl python3 python3-qrcode \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/pico-onebot
-COPY linux/picoctl.sh linux/picoqr.py ./
+COPY scripts/picoctl.sh scripts/picoqr.py ./
 COPY docker/entrypoint.sh docker/dns_proxy.py docker/qimei-hosts ./
 # 若构建上下文中存在 APK（如 CI 构建或本地预置），直接将其内置到容器中
 COPY docker/placeholder.txt docker/PicoOnebot.ap[k]* /tmp/

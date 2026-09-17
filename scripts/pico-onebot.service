@@ -1,0 +1,29 @@
+[Unit]
+Description=PicoOneBot (Waydroid + watch QQ) keepalive
+# waydroid-container 是 Waydroid 自带的系统服务;没有它 session 起不来
+After=network-online.target waydroid-container.service pico-wayland@%i.service
+Wants=network-online.target
+Requires=waydroid-container.service pico-wayland@%i.service
+
+[Service]
+Type=simple
+# Waydroid session 必须以**实际使用的那个用户**跑,不能用 root ——
+# session 是按用户隔离的,root 起的 session 普通用户看不见也连不上。
+User=%i
+Environment=XDG_RUNTIME_DIR=/run/pico-wayland-%i
+Environment=PICO_WAYLAND_DISPLAY=wayland-pico
+Environment=PICO_PKG=com.tencent.qqlite
+Environment=PICO_PORT=3001
+Environment=PICO_INTERVAL=30
+# 有 access_token 时在这里给,别写进脚本
+# Environment=PICO_TOKEN=xxxx
+ExecStart=/opt/pico-onebot/picoctl.sh watch
+Restart=always
+RestartSec=15
+# 保活脚本自己会重启容器,别让 systemd 再叠一层杀进程
+KillMode=process
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

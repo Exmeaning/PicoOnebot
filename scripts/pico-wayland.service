@@ -1,0 +1,16 @@
+[Unit]
+Description=Headless Wayland compositor for PicoOnebot (%i)
+After=network.target
+
+[Service]
+Type=simple
+User=%i
+RuntimeDirectory=pico-wayland-%i
+RuntimeDirectoryMode=0700
+Environment=XDG_RUNTIME_DIR=/run/pico-wayland-%i
+ExecStart=/usr/bin/weston --backend=headless-backend.so --socket=wayland-pico --idle-time=0 --log=/run/pico-wayland-%i/weston.log
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
