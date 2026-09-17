@@ -1,0 +1,17 @@
+# Temporary real-IP overrides for QQ QIMEI and login bootstrap endpoints.
+43.135.106.161 msfwifi.3g.qq.com
+43.135.106.161 msfxg.3g.qq.com
+183.47.126.26 msfwifiv6.3g.qq.com
+14.22.9.84 msfxgv6.3g.qq.com
+43.135.106.184 configsvr.msf.3g.qq.com
+43.129.254.155 msfhttp.3g.qq.com
+129.226.103.123 otheve.beacon.qq.com
+121.14.75.217 othstr.beacon.qq.com
+43.129.2.38 snowflake.qq.com
+129.226.103.162 ssl.log.wtlogin.qq.com
+120.241.201.99 wlogin.qq.com
+120.241.201.99 wlogin1.qq.com
+129.226.103.233 p.rdelivery.qq.com
+43.154.254.142 rdelivery.qq.com
+43.135.106.65 tdid.m.qq.com
+14.22.7.199 rmonitor.qq.com

@@ -1,0 +1,91 @@
+@import "tailwindcss";
+
+:root {
+  --pico: #ff85a2;
+  --pico-ink: #5b3a47;
+  --pico-muted: #a67c8c;
+  --pico-bg-a: #fff5f8;
+  --pico-bg-b: #ffe9f0;
+  --pico-card: rgba(255, 255, 255, 0.82);
+  --pico-line: color-mix(in srgb, var(--pico) 22%, white);
+}
+
+@theme inline {
+  --color-pico: var(--pico);
+  --color-pico-ink: var(--pico-ink);
+  --color-pico-muted: var(--pico-muted);
+  --color-pico-line: var(--pico-line);
+  --color-pico-soft: color-mix(in srgb, var(--pico) 14%, white);
+  --color-pico-softer: color-mix(in srgb, var(--pico) 7%, white);
+  --color-pico-deep: color-mix(in srgb, var(--pico) 85%, #4a1f30);
+  --font-sans: "Nunito", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+  --radius-bubble: 1.75rem;
+  --shadow-cute: 0 10px 30px -12px color-mix(in srgb, var(--pico) 45%, transparent), 0 2px 6px -2px color-mix(in srgb, var(--pico) 20%, transparent);
+  --shadow-cute-lg: 0 24px 60px -20px color-mix(in srgb, var(--pico) 55%, transparent);
+
+}
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  color: var(--pico-ink);
+  background:
+    radial-gradient(1200px 600px at 10% -10%, color-mix(in srgb, var(--pico) 26%, white) 0%, transparent 60%),
+    radial-gradient(900px 500px at 100% 0%, color-mix(in srgb, var(--pico) 18%, white) 0%, transparent 55%),
+    radial-gradient(800px 700px at 50% 110%, color-mix(in srgb, var(--pico) 20%, white) 0%, transparent 60%),
+    linear-gradient(180deg, var(--pico-bg-a), var(--pico-bg-b));
+  background-attachment: fixed;
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--pico) 35%, white);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--pico) 45%, white) transparent;
+}
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--pico) 45%, white);
+  border-radius: 999px;
+}
+*::-webkit-scrollbar-track { background: transparent; }
+
+.pico-dots {
+  background-image: radial-gradient(color-mix(in srgb, var(--pico) 28%, white) 1.2px, transparent 1.2px);
+  background-size: 18px 18px;
+}
+
+.pico-glass {
+  background: var(--pico-card);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+}
+
+.pico-ring:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--pico) 30%, white);
+}
+
+input, textarea, select {
+  font-family: inherit;
+}
+
+*, *::before, *::after {
+  animation: none !important;
+  animation-duration: 0s !important;
+}
+
+.animate-spin {
+  animation: spin 1s linear infinite !important;
+  animation-duration: 1s !important;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}

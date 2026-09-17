@@ -1,0 +1,85 @@
+# 打 tag(v1.2.3) 触发 GitHub Actions 自动构建 WebUI 与混合 APK 并发布 GitHub Release。
+# 宿主 APK 是腾讯版权文件，不入库；通过仓库 Secrets/Vars (PICO_BASE_APK_URL, PICO_BASE_APK_SHA256) 传入。
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version override (e.g. 0.5.0)'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version from tag
+        id: ver
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            v="${{ github.event.inputs.version }}"
+          elif [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            v="${GITHUB_REF_NAME#v}"
+          else
+            v="0.0.0-ci.${GITHUB_SHA::7}"
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      # ---- WebUI(单文件产物,之后作为 asset 注入 APK)----
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci && npm run build
+        working-directory: web
+
+      # ---- 宿主 APK 与编译期依赖 ----
+      - uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: temurin
+          cache: gradle
+      - name: Install dex2jar
+        run: |
+          curl -fL -o /tmp/dex-tools.zip https://github.com/pxb1988/dex2jar/releases/download/v2.4/dex-tools-v2.4.zip
+          unzip -q /tmp/dex-tools.zip -d /tmp && chmod +x /tmp/dex-tools-v2.4/*.sh
+          echo "/tmp/dex-tools-v2.4" >> "$GITHUB_PATH"
+
+      - name: Fetch base apk + gen source.jar
+        env:
+          PICO_BASE_APK_URL: ${{ secrets.PICO_BASE_APK_URL || vars.PICO_BASE_APK_URL }}
+          PICO_BASE_APK_SHA256: ${{ secrets.PICO_BASE_APK_SHA256 || vars.PICO_BASE_APK_SHA256 }}
+        run: scripts/fetch-base.sh
+
+      # ---- 混合 APK 构建 ----
+      - run: chmod +x gradlew && ./gradlew MixinApk-release --no-daemon -PpicoVersion=${{ steps.ver.outputs.version }}
+
+      - name: Generate Checksums
+        run: |
+          cd app/dist
+          sha256sum PicoOnebot_*.apk > sha256sums.txt
+          cat sha256sums.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PicoOnebot-${{ steps.ver.outputs.version }}
+          path: |
+            app/dist/PicoOnebot_*.apk
+            app/dist/sha256sums.txt
+
+      - name: GitHub Release
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            app/dist/PicoOnebot_*.apk
+            app/dist/sha256sums.txt
+          generate_release_notes: true

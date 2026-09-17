@@ -1,0 +1,76 @@
+services:
+  android:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.redroid
+      args:
+        REDROID_IMAGE: ${REDROID_IMAGE:-redroid/redroid:13.0.0-latest}
+    privileged: true
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${PICO_ADB_PORT:-5555}:5555"
+      - "${PICO_ONEBOT_PORT:-3001}:3001"
+      - "${PICO_WEBUI_PORT:-6099}:6099"
+    volumes:
+      - android-data:/data
+    networks:
+      pico:
+        ipv4_address: ${PICO_ANDROID_IP:-172.30.90.2}
+    command:
+      - androidboot.redroid_width=${PICO_WIDTH:-720}
+      - androidboot.redroid_height=${PICO_HEIGHT:-1256}
+      - androidboot.redroid_dpi=${PICO_DPI:-320}
+      - androidboot.redroid_gpu_mode=guest
+      - androidboot.redroid_net_ndns=1
+      - androidboot.redroid_net_dns1=${PICO_DNS:-172.30.90.3}
+      - ro.product.cpu.abilist=x86_64,arm64-v8a,x86,armeabi-v7a,armeabi
+      - ro.product.cpu.abilist32=x86,armeabi-v7a,armeabi
+      - ro.product.cpu.abilist64=x86_64,arm64-v8a
+      - ro.dalvik.vm.isa.arm=x86
+      - ro.dalvik.vm.isa.arm64=x86_64
+      - ro.enable.native.bridge.exec=1
+      - ro.dalvik.vm.native.bridge=libndk_translation.so
+    healthcheck:
+      test: ["CMD-SHELL", "test \"$(getprop sys.boot_completed)\" = 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 20s
+
+  picoctl:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      android:
+        condition: service_healthy
+    environment:
+      PICO_BACKEND: adb
+      PICO_SERIAL: ${PICO_ANDROID_IP:-172.30.90.2}:5555
+      PICO_IP: ${PICO_ANDROID_IP:-172.30.90.2}
+      PICO_PUBLIC_HOST: ${PICO_PUBLIC_HOST:-localhost}
+      PICO_PORT: 3001
+      PICO_WEBUI_PORT: ${PICO_WEBUI_PORT:-6099}
+      PICO_WEBUI_TOKEN: ${PICO_WEBUI_PASSWORD:-picopico}
+      PICO_INTERVAL: ${PICO_INTERVAL:-30}
+      PICO_DNS_PROXY: 1
+      PICO_DNS_UPSTREAM: ${PICO_DNS_UPSTREAM:-223.5.5.5}
+    volumes:
+      - type: bind
+        source: ${PICO_APK_PATH:?Set PICO_APK_PATH in docker/.env}
+        target: /opt/pico-onebot/PicoOnebot.apk
+        read_only: true
+    command: ["watch"]
+    networks:
+      pico:
+        ipv4_address: ${PICO_OPERATOR_IP:-172.30.90.3}
+
+volumes:
+  android-data:
+
+networks:
+  pico:
+    ipam:
+      config:
+        - subnet: ${PICO_DOCKER_SUBNET:-172.30.90.0/24}

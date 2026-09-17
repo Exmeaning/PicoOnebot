@@ -1,0 +1,4 @@
+ARG REDROID_IMAGE=redroid/redroid:13.0.0-latest
+FROM ${REDROID_IMAGE}
+
+COPY docker/libndk/system/ /system/

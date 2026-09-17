@@ -1,0 +1,63 @@
+# Gradle / Android Studio
+.gradle/
+**/.gradle/
+.kotlin/
+**/.kotlin/
+.idea/
+**/.idea/
+.vscode/
+**/.vscode/
+*.iml
+*.ipr
+*.iws
+/build
+**/build/
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Build outputs & APKs
+app/dist/
+**/dist/
+*.apk
+*.idsig
+*.aab
+
+# Agent & AI artifacts (not for repository exhibition)
+.agent/
+**/.agent/
+docs/.agent/
+.gemini/
+**/.gemini/
+
+# Local build inputs
+app/mixin/source.apk
+app/libs/source.jar
+buildtools/gen-dep/raw.jar
+docker/libndk/
+
+# WebUI
+web/node_modules/
+node_modules/
+web/dist/
+web/.vite/
+web/.vite-temp/
+web/tsconfig.tsbuildinfo
+
+# Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# System & Temp
+*.log
+*.tmp
+*.bak
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+linux/
