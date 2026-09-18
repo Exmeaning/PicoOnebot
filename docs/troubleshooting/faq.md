@@ -54,3 +54,22 @@
 
 ### 7. 是否需要额外配置 `/dev/ashmem`？
 **说明**：不需要。PicoOnebot 镜像基于 Android 13，Android 系统自 Android 10+ 起已逐步由 Linux 原生 `memfd` 替代了 ashmem 驱动。
+
+---
+
+## APK 安装
+
+### 8. 安装 APK 报错 `INSTALL_FAILED_NO_MATCHING_ABIS` / `Failed to extract native libraries, res=-113`？
+**原因**：这台设备不支持运行 32 位（`armeabi-v7a`）应用。PicoOnebot 以官方手表 QQ 为底包，手表 QQ 只有 32 位原生库且官方没有 64 位版本，本项目无法在 APK 层面修复。
+常见于 Pixel 7 及之后机型、部分三星与海外版机型；搭载同款纯 64 位芯片的大部分国产旗舰因厂商内置了 32 位转译层，通常可以正常安装。
+**排查**：
+```bash
+adb shell getprop ro.product.cpu.abilist
+```
+输出中不含 `armeabi-v7a` 即为此问题。更换安装器、重新签名均无效。
+**解决**：改用其他运行环境，任选其一：
+- 手机内运行光速虚拟机 / VMOS Pro 等自带 32 位转译的虚拟机，在虚拟机内安装 APK；
+- 电脑模拟器（MuMu、雷电、BlueStacks 等）；
+- [Docker 一体化容器](/deploy/docker) 或 Waydroid。
+
+详细步骤见 [纯 64 位设备的备选方案](/deploy/apk#无法安装-纯-64-位设备的备选方案)。

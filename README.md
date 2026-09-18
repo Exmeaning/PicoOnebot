@@ -53,6 +53,7 @@
    - **不支持**特种动画表情、戳一戳、频道、红包等高级扩展功能。
 2. **运行环境门槛**：
    - 依赖 Android 运行环境（真机、模拟器、Waydroid 或 redroid 容器）；
+   - 手表 QQ 底包仅提供 32 位（`armeabi-v7a`）原生库，纯 64 位且厂商未内置转译层的手机（如 Pixel 7 及之后）无法直接安装；
    - 在 x86 Linux 上需要 32 位 ARM 转译层（如 libndk）及 binder 支持，配置门槛高于开箱即用的 PC 桌面无头方案。
 3. **稳定性与验证尚浅**：
    - 缺少大规模高并发群聊与长期无人值守验证，网络异常重连与极端掉线场景仍在打磨。
@@ -64,6 +65,7 @@
 ### 方式一：Android 设备 / 模拟器（APK 安装）
 
 1. 前往 [Releases](../../releases) 下载最新 APK 安装至 Android 设备或模拟器；
+   > 设备须支持运行 32 位应用。若安装报错 `INSTALL_FAILED_NO_MATCHING_ABIS`，说明该机型不支持 32 位，可改用光速虚拟机 / VMOS Pro 等自带转译的手机虚拟机、电脑模拟器或下方的 Docker 方案，详见 [纯 64 位设备的备选方案](https://exmeaning.github.io/PicoOnebot/deploy/apk#无法安装-纯-64-位设备的备选方案)。
 2. 启动应用，使用同一局域网下的浏览器访问 `http://<设备IP>:6099` 进入 WebUI（初始密码 `picopico`，首次登录需修改）；
 3. 在 WebUI 查看二维码，手机 QQ 扫码登录；
 4. 在「网络配置」中添加反向 WebSocket 或 HTTP 上报地址，即可连接机器人框架。
