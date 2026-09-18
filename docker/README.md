@@ -2,6 +2,8 @@
 
 官方 `ghcr.io/exmeaning/pico-onebot:latest` 为一体化（All-in-One）镜像，内置 Redroid (Android 13)、Google `libndk`（ARM 转译层）、PicoOnebot APK 及守护服务。
 
+首次启动不依赖屏幕坐标：容器通过包管理器授予通知权限，PicoOnebot 在 QQ 隐私页创建后点击真实的 `agree` 控件，并在欢迎页创建后点击真实的 `login` 控件。隐私授权由 QQ 原生监听器落盘，随后仅重启一次 QQ 以重新初始化 QIMEI。
+
 > **环境要求说明**
 > 
 > 镜像基于 Redroid 运行 Android 环境，依赖宿主机内核提供 **Binder IPC** 支持。

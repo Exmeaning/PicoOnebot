@@ -14,7 +14,7 @@
 #
 # 用法:
 #   linux/picoctl.sh up        拉起 session + 容器 + QQ,等到协议端应答
-#   linux/picoctl.sh install <apk>  卸旧装新 + 重启容器 + 点掉隐私政策
+#   linux/picoctl.sh install <apk>  卸旧装新 + 重启容器 + Hook 完成首次引导
 #   linux/picoctl.sh qr        在终端里显示登录二维码
 #   linux/picoctl.sh status    一屏看清各层状态
 #   linux/picoctl.sh doctor    只做体检,退出码非 0 表示有问题
@@ -269,45 +269,24 @@ cmd_install() {
   log "安装 $apk"
   local out; out="$($ADB -s "$(serial)" install "$apk" 2>&1 | tr -d '\r')"
   echo "$out" | grep -q "Success" || { log "安装失败:"; echo "$out" | grep -v Incremental; return 1; }
+  adbx shell pm grant "$PKG" android.permission.POST_NOTIFICATIONS >/dev/null 2>&1 || true
+  adbx shell sh -c "mkdir -p /sdcard/pico-onebot && printf '%s\\n' pico-auto-accept-privacy-v1 > /sdcard/pico-onebot/auto-accept-privacy && printf '%s\\n' pico-auto-accept-privacy-v1 > /data/local/tmp/pico-auto-accept-privacy && chmod 0644 /data/local/tmp/pico-auto-accept-privacy" >/dev/null 2>&1 || true
   cmd_restart
-  first_run_taps
-  # QIMEI 在首次进程启动时早于隐私弹窗初始化,此时 userAllow=false 且不会自行重试。
-  # 同意后重启一次,让主进程和 :MSF 在授权已落盘的条件下重新初始化设备身份。
-  log "隐私授权已落盘,重启 QQ 以重新初始化 QIMEI"
-  cmd_restart
-  sleep 5
-  tap_login_button
+  # QIMEI 在首次进程启动时早于隐私页初始化。Hook 点击真实“同意”按钮后，
+  # 等日志确认授权已经由 QQ 自己落盘，再重启一次主进程和 :MSF。
+  local i=0
+  while [ $i -lt 30 ]; do
+    adbx shell logcat -d -s PicoOB:I '*:S' 2>/dev/null | grep -q 'Privacy agreement accepted by deployment hook' && break
+    sleep 1; i=$((i + 1))
+  done
+  if [ $i -lt 30 ]; then
+    log "隐私授权已由应用内 Hook 完成,重启 QQ 以重新初始化 QIMEI"
+    cmd_restart
+  else
+    log "等待隐私授权 Hook 超时;未执行盲点点击,请查看 PicoOB 日志"
+  fi
   log "装好了。接下来:$0 qr  扫码登录"
   show_access
-}
-
-# 官方底包首次启动的三连弹窗(1440x2512 上实测坐标 → 按当前分辩率换算):
-#   1) 系统"允许通知"        中间偏上  (722,1245)
-#   2) 隐私政策 "同意"       右下      (1071,1499)
-#   3) 欢迎页 "登录"          底部居中  (722,2243)  → 进入二维码页
-# 每步之间等 2s;某个弹窗不在时对应位置基本落在空白/二维码图上,不会误触别的功能。
-first_run_taps() {
-  sleep 6
-  local size w h
-  size="$(adbx shell wm size | sed -n 's/.*: *\([0-9]*\)x\([0-9]*\).*/\1 \2/p' | tail -1)"
-  [ -z "$size" ] && { log "拿不到屏幕尺寸,跳过首启点击"; return 0; }
-  w="${size% *}"; h="${size#* }"
-  local step
-  for step in "501 496 允许通知" "744 597 隐私政策-同意" "501 893 欢迎页-登录"; do
-    set -- $step
-    adbx shell input tap $((w * $1 / 1000)) $((h * $2 / 1000)) >/dev/null 2>&1
-    log "首启点击 $3 ($((w * $1 / 1000)),$((h * $2 / 1000)))"
-    sleep 2
-  done
-}
-
-tap_login_button() {
-  local size w h
-  size="$(adbx shell wm size | sed -n 's/.*: *\([0-9]*\)x\([0-9]*\).*/\1 \2/p' | tail -1)"
-  [ -n "$size" ] || return 0
-  w="${size% *}"; h="${size#* }"
-  adbx shell input tap $((w / 2)) $((h * 845 / 1000)) >/dev/null 2>&1
-  log "重启后点击登录 ($((w / 2)),$((h * 845 / 1000)))"
 }
 
 cmd_qr() {

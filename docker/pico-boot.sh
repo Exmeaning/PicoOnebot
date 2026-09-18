@@ -98,25 +98,27 @@ fi
 
 # ── 4. 启动应用 ─────────────────────────────────────────────────────────────
 log "启动应用 $PKG/$ACTIVITY ..."
+logcat -c >/dev/null 2>&1 || true
 am start -W -n "$PKG/$ACTIVITY" >/dev/null 2>&1 || true
 
 # ── 5. 首次运行引导处理 ────────────────────────────────────────────────────
 if [ "$is_first_install" -eq 1 ]; then
-    log "首次安装，执行初始化引导流程 ..."
-    sleep 6
-    # 坐标基于 720x1256 分辨率
-    input tap 360 622 2>/dev/null || true   # 允许通知
-    sleep 2
-    input tap 535 749 2>/dev/null || true   # 同意隐私政策
-    sleep 2
-    input tap 360 1121 2>/dev/null || true  # 欢迎页登录
-    sleep 3
-    log "重启 $PKG 应用..."
-    am force-stop "$PKG" >/dev/null 2>&1 || true
-    sleep 2
-    am start -W -n "$PKG/$ACTIVITY" >/dev/null 2>&1 || true
-    sleep 4
-    input tap 360 1121 2>/dev/null || true
+    log "首次安装，等待应用内 Hook 完成隐私授权与登录页导航 ..."
+    i=0
+    while [ "$i" -lt 30 ]; do
+        if logcat -d -s PicoOB:I '*:S' 2>/dev/null | grep -q 'Privacy agreement accepted by deployment hook'; then
+            log "隐私授权已由应用内 Hook 完成，重启 QQ 以重新初始化 QIMEI。"
+            am force-stop "$PKG" >/dev/null 2>&1 || true
+            sleep 2
+            am start -W -n "$PKG/$ACTIVITY" >/dev/null 2>&1 || true
+            break
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    if [ "$i" -ge 30 ]; then
+        log "WARN: 等待隐私授权 Hook 超时；未执行盲点点击，请查看 PicoOB 日志。"
+    fi
 fi
 
 # ── 6. 检测 WebUI 服务就绪 ──────────────────────────────────────────────────

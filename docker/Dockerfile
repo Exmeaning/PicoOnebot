@@ -31,6 +31,7 @@ RUN mkdir -p /stage/system/etc \
 COPY docker/pico-entrypoint.sh docker/pico-boot.sh docker/pico-doctor.sh docker/pico-health.sh /stage/system/bin/
 COPY docker/pico.rc /stage/system/etc/init/pico.rc
 COPY docker/pico-container /stage/system/etc/pico-container
+COPY docker/pico-auto-accept-privacy /stage/system/etc/pico-auto-accept-privacy
 COPY docker/pico-restart.sh /stage/system/bin/pico-restart.sh
 RUN chmod 755 /stage/system/bin/pico-entrypoint.sh \
         /stage/system/bin/pico-boot.sh \

@@ -5,7 +5,9 @@ import android.view.View
 import com.tencent.qqnt.account.login.ui.LoginWithStateFragment
 import com.tencent.qqnt.account.login.ui.LoginWithoutStatePage
 import com.tencent.qqnt.account.login.ui.QrLoginFragment
+import com.tencent.qqnt.watch.mainframe.PrivacyLicenseFragment
 import momoi.anno.mixin.Mixin
+import pico.onebot.core.DeploymentAutomation
 import pico.onebot.core.PicoLog
 import pico.onebot.kernel.PicoLoginManager
 
@@ -95,5 +97,26 @@ abstract class PicoLoginWithoutStateHook : LoginWithoutStatePage() {
     override fun onDestroyView() {
         PicoLoginManager.onWelcomeViewDestroyed(this)
         super.onDestroyView()
+    }
+}
+
+@Mixin
+abstract class PicoPrivacyLicenseHook : PrivacyLicenseFragment() {
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        if (!DeploymentAutomation.autoAcceptPrivacy) return
+        view.post {
+            try {
+                val id = view.resources.getIdentifier("agree", "id", view.context.packageName)
+                val button = if (id != 0) view.findViewById<View>(id) else f?.b
+                if (button?.performClick() == true) {
+                    PicoLog.i("Privacy agreement accepted by deployment hook")
+                } else {
+                    PicoLog.w("PicoPrivacyLicenseHook: agree button unavailable")
+                }
+            } catch (error: Throwable) {
+                PicoLog.e("PicoPrivacyLicenseHook: agree click failed", error)
+            }
+        }
     }
 }
