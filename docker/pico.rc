@@ -1,5 +1,22 @@
+# PicoOnebot Android init 配置
+
+# 确保 Binder 设备权限为 0666，支持非 root 系统服务正常访问
+on early-init
+    chmod 0666 /dev/binderfs/binder
+    chmod 0666 /dev/binderfs/hwbinder
+    chmod 0666 /dev/binderfs/vndbinder
+    chmod 0666 /dev/binder
+    chmod 0666 /dev/hwbinder
+    chmod 0666 /dev/vndbinder
+
+on init
+    chmod 0666 /dev/binder
+    chmod 0666 /dev/hwbinder
+    chmod 0666 /dev/vndbinder
+
+# 启动 PicoOnebot 后台守护服务
 service pico_boot /system/bin/sh /system/bin/pico-boot.sh
     class late_start
     user root
     group root
-    oneshot
+    stdio_to_kmsg

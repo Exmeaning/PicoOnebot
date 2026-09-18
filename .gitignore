@@ -37,13 +37,14 @@ app/libs/source.jar
 buildtools/gen-dep/raw.jar
 docker/libndk/
 
-# WebUI
+# WebUI & Docs
 web/node_modules/
 node_modules/
 web/dist/
 web/.vite/
 web/.vite-temp/
 web/tsconfig.tsbuildinfo
+docs/.vitepress/cache/
 
 # Python
 __pycache__/

@@ -26,10 +26,13 @@ RUN mkdir -p /stage/system/etc \
     && printf "127.0.0.1 localhost\n::1 ip6-localhost\n" > /stage/system/etc/hosts \
     && cat /tmp/qimei-hosts >> /stage/system/etc/hosts
 
-# 3. Prepare boot script & init service
-COPY docker/pico-boot.sh /stage/system/bin/pico-boot.sh
+# 3. Prepare entrypoint, boot script, diagnostics & init service
+COPY docker/pico-entrypoint.sh docker/pico-boot.sh docker/pico-doctor.sh docker/pico-health.sh /stage/system/bin/
 COPY docker/pico.rc /stage/system/etc/init/pico.rc
-RUN chmod 755 /stage/system/bin/pico-boot.sh \
+RUN chmod 755 /stage/system/bin/pico-entrypoint.sh \
+        /stage/system/bin/pico-boot.sh \
+        /stage/system/bin/pico-doctor.sh \
+        /stage/system/bin/pico-health.sh \
     && chmod 644 /stage/system/etc/init/pico.rc
 
 # 4. Prepare APK if present in build context
@@ -48,6 +51,13 @@ COPY --from=builder /stage/opt/ /opt/
 
 # Expose WebUI (6099), OneBot v11 (3001), ADB (5555)
 EXPOSE 6099 3001 5555
+
+# Entrypoint: Binder checks, kmsg relay to stdout, and exec /init (PID 1)
+ENTRYPOINT ["/system/bin/sh", "/system/bin/pico-entrypoint.sh"]
+
+# Health check: verifies Android boot completion and WebUI port (6099) readiness
+HEALTHCHECK --start-period=360s --interval=30s --timeout=15s --retries=3 \
+    CMD ["/system/bin/sh", "/system/bin/pico-health.sh"]
 
 # Default Redroid boot arguments for ARM translation and display settings
 CMD [ \

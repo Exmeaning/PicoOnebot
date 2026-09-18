@@ -4,15 +4,32 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    # 特权模式：挂载 binderfs 及管理 Android 系统节点所需
     privileged: true
     restart: unless-stopped
+    # 共享内存大小：SurfaceFlinger / Gralloc 需要较大 /dev/shm
+    shm_size: "1gb"
+    stop_grace_period: 30s
     ports:
       - "${PICO_WEBUI_PORT:-6099}:6099"
       - "${PICO_ONEBOT_PORT:-3001}:3001"
       - "127.0.0.1:${PICO_ADB_PORT:-5555}:5555"
     volumes:
-      - /dev/binder:/dev/binder
       - android-data:/data
+    environment:
+      # 将 /dev/kmsg 转发至容器 stdout (1: 核心日志, all: 全量, 0: 关闭)
+      PICO_LOG_KMSG: "${PICO_LOG_KMSG:-1}"
+      # Binder 校验失败时是否直接退出容器 (1: 退出, 0: 仅告警并继续)
+      PICO_BINDER_STRICT: "${PICO_BINDER_STRICT:-0}"
+
+    # ── Binder 设备配置 ───────────────────────────────────────────────────────
+    # 默认使用 binderfs 模式（无需映射宿主机 binder 设备）。
+    # 若宿主机内核仅支持 binder_linux 字符设备且无法使用 binderfs，请取消以下注释。
+    # 需确保宿主机节点权限为 0666，详见 docs/BINDER.md。
+    # devices:
+    #   - /dev/binder:/dev/binder
+    #   - /dev/hwbinder:/dev/hwbinder
+    #   - /dev/vndbinder:/dev/vndbinder
 
 volumes:
   android-data:

@@ -1,5 +1,23 @@
-# PicoOnebot All-in-One 部署清单（Kubernetes / K3s）
-# 节点内核需支持 CONFIG_ANDROID_BINDERFS 或加载 binder_linux 模块，详见 docs/BINDER.md
+# Kubernetes / K3s 部署
+
+在云原生 Kubernetes 或轻量级 K3s 集群中，可通过本仓库提供的 Deployment 与 Service 清单快速交付 PicoOnebot。
+
+---
+
+## 节点前置要求
+
+1. **节点内核 Binder 支持**：Pod 调度的物理/虚拟节点必须支持 Binder（支持 `binderfs` 或具备 `0666` 权限的 `/dev/binder` 设备节点）。
+   建议在目标集群节点上运行检测脚本：
+   ```bash
+   bash docker/scripts/pico-host-check.sh
+   ```
+2. **特权容器支持**：集群的 PodSecurity / SecurityContextConstraints 需允许运行 `privileged: true` 容器。
+
+---
+
+## 清单配置 (`docker/pico-k8s.yaml`)
+
+```yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -26,7 +44,6 @@ spec:
         securityContext:
           privileged: true
         env:
-        # 将 /dev/kmsg 核心系统日志转发至 stdout
         - name: PICO_LOG_KMSG
           value: "1"
         ports:
@@ -36,7 +53,7 @@ spec:
           name: onebot
         - containerPort: 5555
           name: adb
-        # 首次启动需完成 Android 系统与应用初始化
+        # 首次初始化包含 Android 启动及 APK 安装，配置适当的启动探测超时
         startupProbe:
           tcpSocket:
             port: 6099
@@ -49,16 +66,9 @@ spec:
         volumeMounts:
         - name: data
           mountPath: /data
-        # 共享内存 (/dev/shm)
+        # SurfaceFlinger 与 Gralloc 所需的共享内存
         - name: dshm
           mountPath: /dev/shm
-        # ── 设备节点映射模式（若内核不支持 binderfs，需映射字符设备，节点权限需为 0666）──
-        # - name: binder
-        #   mountPath: /dev/binder
-        # - name: hwbinder
-        #   mountPath: /dev/hwbinder
-        # - name: vndbinder
-        #   mountPath: /dev/vndbinder
       volumes:
       - name: data
         hostPath:
@@ -68,18 +78,6 @@ spec:
         emptyDir:
           medium: Memory
           sizeLimit: 1Gi
-      # - name: binder
-      #   hostPath:
-      #     path: /dev/binder
-      #     type: CharDevice
-      # - name: hwbinder
-      #   hostPath:
-      #     path: /dev/hwbinder
-      #     type: CharDevice
-      # - name: vndbinder
-      #   hostPath:
-      #     path: /dev/vndbinder
-      #     type: CharDevice
 ---
 apiVersion: v1
 kind: Service
@@ -99,3 +97,29 @@ spec:
     port: 3001
     targetPort: 3001
     nodePort: 30001
+```
+
+---
+
+## 部署与管理
+
+### 1. 应用清单
+```bash
+kubectl apply -f docker/pico-k8s.yaml
+```
+
+### 2. 检查 Pod 状态
+由于首次冷启动包含系统引导，Pod 状态将由 `Running (0/1)` 逐步进入 `Running (1/1)` 就绪状态：
+```bash
+kubectl get pods -l app=pico-onebot -w
+```
+
+### 3. 查看日志
+```bash
+kubectl logs -f deployment/pico-onebot
+```
+
+### 4. 访问服务
+默认配置为 `NodePort` 暴露：
+- **WebUI 控制台**：`http://<节点IP>:30099`（默认密码: `picopico`）
+- **OneBot 端口**：`<节点IP>:30001`

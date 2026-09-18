@@ -7,6 +7,11 @@
 **基于手表 NT QQ 的 Android 原生 OneBot v11 协议端。**  
 免 Root、免 Xposed，内置现代 WebUI 管理控制台。
 
+[![Documentation](https://img.shields.io/badge/docs-GitHub_Pages-blue?logo=github)](https://exmeaning.github.io/PicoOnebot/)
+[![License](https://img.shields.io/badge/license-GPL--3.0-green.svg)](LICENSE)
+
+[官方文档站](https://exmeaning.github.io/PicoOnebot/) | [产物下载](../../releases)
+
 </div>
 
 ---
@@ -43,8 +48,9 @@
 
 1. **协议支持较为有限**：
    - 手表 QQ 原生能力经过高度精简，缺乏桌面端庞大的交互体系；
-   - **不支持**特种动画表情、戳一戳、频道、红包、复杂群管（如设置管理员/高级禁言/修改群名片）等进阶功能；
-   - 发送合并转发受手表协议限制会自动降级，部分 OneBot v11 API 无法支持或返回未实现。
+   - **群管理功能暂未支持 / 待开发验证**：禁言、移出群聊、设置管理员、修改群名片、群公告等功能暂未支持；
+   - **合并转发消息发送采用降级处理**：支持接收与解析合并转发，但发送合并转发消息受手表端协议限制会自动降级（降级为单条文本或连续消息发送）；
+   - **不支持**特种动画表情、戳一戳、频道、红包等高级扩展功能。
 2. **运行环境门槛**：
    - 依赖 Android 运行环境（真机、模拟器、Waydroid 或 redroid 容器）；
    - 在 x86 Linux 上需要 32 位 ARM 转译层（如 libndk）及 binder 支持，配置门槛高于开箱即用的 PC 桌面无头方案。
@@ -55,10 +61,38 @@
 
 ## 快速上手
 
+### 方式一：Android 设备 / 模拟器（APK 安装）
+
 1. 前往 [Releases](../../releases) 下载最新 APK 安装至 Android 设备或模拟器；
 2. 启动应用，使用同一局域网下的浏览器访问 `http://<设备IP>:6099` 进入 WebUI（初始密码 `picopico`，首次登录需修改）；
 3. 在 WebUI 查看二维码，手机 QQ 扫码登录；
 4. 在「网络配置」中添加反向 WebSocket 或 HTTP 上报地址，即可连接机器人框架。
+
+### 方式二：Docker 容器（无头服务器）
+
+基于 Redroid (Android 13) 构建的一体化镜像，已内置 ARM 转译层与 PicoOnebot APK。
+
+> **注意**：容器依赖宿主机内核提供 **Binder IPC** 支持。不支持 Docker Desktop (Windows / macOS)、原生 WSL2、OpenVZ/LXC VPS 等未集成 Binder 的环境。
+
+部署前可检测宿主机环境：
+
+```bash
+bash docker/scripts/pico-host-check.sh
+```
+
+启动容器：
+
+```bash
+docker run -d --name pico-onebot --privileged --shm-size 1g \
+  -p 6099:6099 -p 3001:3001 -v pico-data:/data \
+  --restart unless-stopped ghcr.io/exmeaning/pico-onebot:latest
+```
+
+首次启动约需 2–5 分钟完成系统初始化与 APK 安装，`docker ps` 显示 `healthy` 状态后即可访问 WebUI。
+
+- **官方完整文档站**：[https://exmeaning.github.io/PicoOnebot/](https://exmeaning.github.io/PicoOnebot/)
+- 详细部署与运维说明：[docker/README.md](docker/README.md)
+- Binder 内核配置与排错：[docs/deploy/binder.md](docs/deploy/binder.md)
 
 ---
 
