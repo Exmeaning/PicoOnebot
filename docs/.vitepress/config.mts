@@ -22,61 +22,56 @@ export default defineConfig({
         link: 'https://github.com/exmeaning/PicoOnebot/releases'
       }
     ],
-    sidebar: {
-      '/guide/': [
-        {
-          text: '基础指南',
-          items: [
-            { text: '项目介绍', link: '/guide/introduction' },
-            { text: '快速入门', link: '/guide/quick-start' },
-            { text: '架构与运行原理', link: '/guide/architecture' }
-          ]
-        }
-      ],
-      '/deploy/': [
-        {
-          text: '部署方案',
-          items: [
-            { text: '部署形态总览', link: '/deploy/' },
-            { text: 'Android / 模拟器 (APK)', link: '/deploy/apk' },
-            { text: 'Docker 一体化容器', link: '/deploy/docker' },
-            { text: 'Kubernetes / K3s 部署', link: '/deploy/k8s' },
-            { text: 'Linux 宿主 Binder 指南', link: '/deploy/binder' },
-            { text: 'WSL2 环境配置', link: '/deploy/wsl2' }
-          ]
-        }
-      ],
-      '/config/': [
-        {
-          text: '配置指南',
-          items: [
-            { text: 'WebUI 控制台', link: '/config/webui' },
-            { text: '网络与 OneBot 上报', link: '/config/network' },
-            { text: '环境变量参考', link: '/config/env' }
-          ]
-        }
-      ],
-      '/frameworks/': [
-        {
-          text: '机器人框架对接',
-          items: [
-            { text: 'NoneBot2', link: '/frameworks/nonebot2' },
-            { text: 'Koishi', link: '/frameworks/koishi' },
-            { text: 'AstrBot', link: '/frameworks/astrbot' },
-            { text: '通用 OneBot v11 适配', link: '/frameworks/generic' }
-          ]
-        }
-      ],
-      '/troubleshooting/': [
-        {
-          text: '排错与运维',
-          items: [
-            { text: '常见问题 (FAQ)', link: '/troubleshooting/faq' },
-            { text: '诊断工具与日志排查', link: '/troubleshooting/doctor' }
-          ]
-        }
-      ]
-    },
+    sidebar: [
+      {
+        text: '基础指南',
+        collapsed: false,
+        items: [
+          { text: '项目介绍', link: '/guide/introduction' },
+          { text: '快速入门', link: '/guide/quick-start' },
+          { text: '架构与运行原理', link: '/guide/architecture' }
+        ]
+      },
+      {
+        text: '部署方案',
+        collapsed: false,
+        items: [
+          { text: '部署形态总览', link: '/deploy/' },
+          { text: 'Android / 模拟器 (APK)', link: '/deploy/apk' },
+          { text: 'Docker 一体化容器', link: '/deploy/docker' },
+          { text: 'Kubernetes / K3s 部署', link: '/deploy/k8s' },
+          { text: 'Linux 宿主 Binder 指南', link: '/deploy/binder' },
+          { text: 'WSL2 环境配置', link: '/deploy/wsl2' }
+        ]
+      },
+      {
+        text: '配置指南',
+        collapsed: false,
+        items: [
+          { text: 'WebUI 控制台', link: '/config/webui' },
+          { text: '网络与 OneBot 上报', link: '/config/network' },
+          { text: '环境变量参考', link: '/config/env' }
+        ]
+      },
+      {
+        text: '机器人框架对接',
+        collapsed: false,
+        items: [
+          { text: 'NoneBot2', link: '/frameworks/nonebot2' },
+          { text: 'Koishi', link: '/frameworks/koishi' },
+          { text: 'AstrBot', link: '/frameworks/astrbot' },
+          { text: '通用 OneBot v11 适配', link: '/frameworks/generic' }
+        ]
+      },
+      {
+        text: '排错与运维',
+        collapsed: false,
+        items: [
+          { text: '常见问题 (FAQ)', link: '/troubleshooting/faq' },
+          { text: '诊断工具与日志排查', link: '/troubleshooting/doctor' }
+        ]
+      }
+    ],
     search: {
       provider: 'local',
       options: {
