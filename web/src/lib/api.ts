@@ -94,8 +94,8 @@ export const api = {
   status: () => http<BotStatus>("/api/status"),
   connections: () => http<ConnectionInfo[]>("/api/connections"),
   getConfig: () => http<AppConfig>("/api/config"),
-  saveConfig: (config: AppConfig) =>
-    http<{ ok: boolean; restartRequired?: boolean }>("/api/config", {
+  saveConfig: (config: Partial<AppConfig>) =>
+    http<{ ok: boolean; restartRequired?: boolean; warnings?: string[] }>("/api/config", {
       method: "PUT", body: JSON.stringify(config),
     }),
   files: (path = "") => http<FileListing>(`/api/files?path=${encodeURIComponent(path)}`),

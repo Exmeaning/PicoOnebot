@@ -81,6 +81,8 @@ if [ ! -x /init ]; then
     exit 127
 fi
 
+. /system/bin/pico-network.sh
+
 say "启动 Android init: /init $*"
 say "首次启动初始化预计耗时 2–5 分钟。"
 

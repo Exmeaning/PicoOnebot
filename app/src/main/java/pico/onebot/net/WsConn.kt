@@ -5,6 +5,7 @@ import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.Socket
+import java.util.concurrent.ArrayBlockingQueue
 
 /**
  * 一条 WebSocket 连接(正向服务端接进来的,或反向客户端连出去的都用它)。
@@ -24,16 +25,39 @@ class WsConn(
     enum class Role { API, EVENT, BOTH }
 
     private val writeLock = Object()
+    private val pending = ArrayBlockingQueue<String>(256)
+    private val writer = Thread({ writeLoop() }, "pico-ws-send").apply { isDaemon = true }
 
     @Volatile
     var closed = false
         private set
+
+    init {
+        writer.start()
+    }
 
     val wantsEvents: Boolean get() = role == Role.EVENT || role == Role.BOTH
     val wantsActions: Boolean get() = role == Role.API || role == Role.BOTH
 
     fun sendText(text: String): Boolean {
         if (closed) return false
+        if (pending.offer(text)) return true
+        PicoLog.w("ws send queue full on $tag; disconnecting slow peer")
+        close()
+        return false
+    }
+
+    private fun writeLoop() {
+        try {
+            while (!closed) {
+                val text = pending.take()
+                if (!writeText(text)) return
+            }
+        } catch (_: InterruptedException) {
+        }
+    }
+
+    private fun writeText(text: String): Boolean {
         return try {
             synchronized(writeLock) {
                 WsFrame.write(out, WsFrame.OP_TEXT, text.toByteArray(Charsets.UTF_8), maskOut)
@@ -50,13 +74,11 @@ class WsConn(
         if (closed) return
         closed = true
         try {
-            synchronized(writeLock) { WsFrame.write(out, WsFrame.OP_CLOSE, ByteArray(0), maskOut) }
-        } catch (ignored: Throwable) {
-        }
-        try {
             socket.close()
         } catch (ignored: Throwable) {
         }
+        writer.interrupt()
+        pending.clear()
     }
 
     /**

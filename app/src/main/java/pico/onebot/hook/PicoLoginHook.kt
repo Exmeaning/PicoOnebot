@@ -3,6 +3,7 @@ package pico.onebot.hook
 import android.os.Bundle
 import android.view.View
 import com.tencent.qqnt.account.login.ui.LoginWithStateFragment
+import com.tencent.qqnt.account.login.ui.LoginWithoutStatePage
 import com.tencent.qqnt.account.login.ui.QrLoginFragment
 import momoi.anno.mixin.Mixin
 import pico.onebot.core.PicoLog
@@ -72,5 +73,27 @@ abstract class PicoLoginWithStateHook : LoginWithStateFragment() {
         } catch (t: Throwable) {
             PicoLog.e("PicoLoginWithStateHook.onViewCreated error", t)
         }
+    }
+
+    override fun onDestroyView() {
+        PicoLoginManager.onStateFragmentDestroyed(this)
+        super.onDestroyView()
+    }
+}
+
+@Mixin
+abstract class PicoLoginWithoutStateHook : LoginWithoutStatePage() {
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        try {
+            PicoLoginManager.onWelcomeViewCreated(this, view)
+        } catch (error: Throwable) {
+            PicoLog.e("PicoLoginWithoutStateHook.onViewCreated error", error)
+        }
+    }
+
+    override fun onDestroyView() {
+        PicoLoginManager.onWelcomeViewDestroyed(this)
+        super.onDestroyView()
     }
 }

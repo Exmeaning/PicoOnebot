@@ -11,6 +11,7 @@ import com.google.zxing.MultiFormatReader
 import com.google.zxing.RGBLuminanceSource
 import com.google.zxing.common.HybridBinarizer
 import com.tencent.qqnt.account.login.ui.LoginWithStateFragment
+import com.tencent.qqnt.account.login.ui.LoginWithoutStatePage
 import com.tencent.qqnt.account.login.ui.QrLoginFragment
 import org.json.JSONObject
 import pico.onebot.core.PicoLog
@@ -52,6 +53,35 @@ object PicoLoginManager {
     @Volatile
     var stateFragmentRef: WeakReference<LoginWithStateFragment>? = null
         private set
+
+    @Volatile
+    private var welcomeFragmentRef: WeakReference<LoginWithoutStatePage>? = null
+
+    val hasLoginEntry: Boolean
+        get() = stateFragmentRef?.get()?.view != null || welcomeFragmentRef?.get()?.view != null
+
+    fun onWelcomeViewCreated(fragment: LoginWithoutStatePage, view: View) {
+        welcomeFragmentRef = WeakReference(fragment)
+        view.post {
+            if (welcomeFragmentRef?.get() === fragment && fragment.view === view && fragment.isAdded) {
+                clickWelcomeLogin(view)
+            }
+        }
+    }
+
+    fun onWelcomeViewDestroyed(fragment: LoginWithoutStatePage) {
+        if (welcomeFragmentRef?.get() === fragment) welcomeFragmentRef = null
+    }
+
+    private fun clickWelcomeLogin(view: View) {
+        try {
+            val resourceId = view.resources.getIdentifier("login", "id", view.context.packageName)
+            val button = if (resourceId != 0) view.findViewById<View>(resourceId) else null
+            if (button?.performClick() != true) PicoLog.w("PicoLoginManager: welcome login button unavailable")
+        } catch (error: Throwable) {
+            PicoLog.e("PicoLoginManager: welcome login click failed", error)
+        }
+    }
 
     fun onQrFragmentCreated(frag: QrLoginFragment) {
         PicoLog.i("PicoLoginManager: QrLoginFragment created: $frag")
@@ -150,7 +180,7 @@ object PicoLoginManager {
      */
     fun refreshQr(): Boolean {
         val frag = qrFragmentRef?.get()
-        if (frag != null) {
+        if (frag != null && frag.isAdded) {
             mainHandler.post {
                 try {
                     PicoLog.i("PicoLoginManager: Invoking LoginQrCode.b() to refresh QR")
@@ -176,7 +206,15 @@ object PicoLoginManager {
             return true
         }
 
-        PicoLog.w("PicoLoginManager: No active QrLoginFragment or LoginWithStateFragment found")
+        val welcome = welcomeFragmentRef?.get()
+        if (welcome != null && welcome.isAdded && welcome.view != null) {
+            mainHandler.post {
+                if (welcome.isAdded) welcome.view?.let { clickWelcomeLogin(it) }
+            }
+            return true
+        }
+
+        PicoLog.w("PicoLoginManager: No active QR or login entry fragment found")
         return false
     }
 
@@ -241,6 +279,6 @@ object PicoLoginManager {
             .put("has_qr", !latestQrUrl.isNullOrEmpty())
             .put("scanned", isScanned)
             .put("has_fragment", qrFragmentRef?.get() != null)
-            .put("has_state_fragment", stateFragmentRef?.get() != null)
+            .put("has_state_fragment", hasLoginEntry)
     }
 }

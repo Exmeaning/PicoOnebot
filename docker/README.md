@@ -193,3 +193,20 @@ adb -s 127.0.0.1:5555 shell
 | `modprobe binder_linux` 报错 `Module not found` | 当前内核未包含 binder 模块 | 更换支持 Binder 的内核或使用标准物理机/云服务器内核 |
 | APK 未安装 | 镜像中缺少 APK 文件 | 使用官方发布镜像，或将 APK 放置于 `docker/PicoOnebot.apk` 后重新构建 |
 | 扫码界面空白 | amd64 平台缺少 ARM 转译支持 | 运行 `pico-doctor.sh` 确认 `libndk_translation.so` 是否正常加载 |
+
+## WebUI 重启 QQ
+
+使用包含新版守护脚本的 PicoOnebot 容器时，控制台侧栏会显示「重启 QQ」。此操作只停止并重新启动 QQ，不重启 Android 或容器、不清除应用数据。重启后需重新登录 WebUI。
+
+接口需要控制台鉴权，并校验容器标记和守护服务心跳；非容器、旧镜像或守护服务停止时不显示按钮，直接调用接口也会被拒绝。请求有 30 秒冷却期，容器脚本只执行固定的 QQ 停止/启动命令。
+
+首次启用需要同时更新 APK 和容器镜像，然后保留 `/data` 数据卷重建容器；以后通过按钮即可单独重启 QQ。仅安装新 APK 不会安装容器守护脚本。
+
+## 容器 DNS
+
+入口脚本会把容器 `/etc/resolv.conf` 中的 DNS 服务器传给 Redroid，并合并容器 hosts 到 Android hosts；已有 QIMEI 映射保留。显式传入 `androidboot.redroid_net_dns*` 参数时尊重用户设置。
+
+- 容器服务名：两个容器必须加入同一个用户自定义 Docker 网络，使用服务名及容器内部端口。
+- 宿主机服务：Compose 已添加 `host.docker.internal:host-gateway`；使用 `docker run` 时自行添加 `--add-host=host.docker.internal:host-gateway`。宿主机服务需要监听容器可访问的网卡地址。
+- `127.0.0.1` 指向 Pico 容器自身，不是宿主机或另一个容器。
+- 网络修复需要重新构建镜像并重建容器（保留 `/data` 数据卷）；只更新 APK 不会更新入口脚本。

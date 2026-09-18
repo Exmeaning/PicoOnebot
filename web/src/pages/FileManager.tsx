@@ -133,7 +133,10 @@ export function FileManager() {
       setDocument(next);
       setSavedContent(content);
       setSelected((current) => current ? { ...current, size: result.size, modifiedAt: result.modifiedAt } : current);
-      toast.push("success", result.restartRequired ? "文件已保存，重启 QQ 进程后生效" : "文件已保存");
+      toast.push(result.warnings?.length ? "info" : "success", result.warnings?.length
+        ? "文件已保存，但部分监听启动失败：" + result.warnings.join("；")
+        : result.restartRequired ? "文件已保存，部分启动设置需重启 QQ 生效"
+        : listing?.activeConfig?.path === document.path ? "文件已保存，网络配置已即时应用" : "文件已保存");
       if (listing) void loadDirectory(listing.path);
     } catch (error) {
       toast.push("error", (error as Error).message);

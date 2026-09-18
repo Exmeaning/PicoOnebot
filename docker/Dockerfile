@@ -22,6 +22,7 @@ RUN mkdir -p /stage/system \
 
 # 2. Prepare /system/etc/hosts with QIMEI overrides
 COPY docker/qimei-hosts /tmp/qimei-hosts
+COPY docker/qimei-hosts /stage/system/etc/pico-qimei-hosts
 RUN mkdir -p /stage/system/etc \
     && printf "127.0.0.1 localhost\n::1 ip6-localhost\n" > /stage/system/etc/hosts \
     && cat /tmp/qimei-hosts >> /stage/system/etc/hosts
@@ -29,6 +30,8 @@ RUN mkdir -p /stage/system/etc \
 # 3. Prepare entrypoint, boot script, diagnostics & init service
 COPY docker/pico-entrypoint.sh docker/pico-boot.sh docker/pico-doctor.sh docker/pico-health.sh /stage/system/bin/
 COPY docker/pico.rc /stage/system/etc/init/pico.rc
+COPY docker/pico-container /stage/system/etc/pico-container
+COPY docker/pico-restart.sh /stage/system/bin/pico-restart.sh
 RUN chmod 755 /stage/system/bin/pico-entrypoint.sh \
         /stage/system/bin/pico-boot.sh \
         /stage/system/bin/pico-doctor.sh \
@@ -47,6 +50,7 @@ FROM ${REDROID_IMAGE}
 
 # Copy prepared Android system layer & PicoOnebot runtime
 COPY --from=builder /stage/system/ /system/
+COPY docker/pico-network.sh /system/bin/pico-network.sh
 COPY --from=builder /stage/opt/ /opt/
 
 # Expose WebUI (6099), OneBot v11 (3001), ADB (5555)

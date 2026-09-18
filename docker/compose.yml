@@ -16,6 +16,8 @@ services:
       - "127.0.0.1:${PICO_ADB_PORT:-5555}:5555"
     volumes:
       - android-data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       # 将 /dev/kmsg 转发至容器 stdout (1: 核心日志, all: 全量, 0: 关闭)
       PICO_LOG_KMSG: "${PICO_LOG_KMSG:-1}"

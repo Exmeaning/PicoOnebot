@@ -179,6 +179,7 @@ object Config {
         if (!g.has("webui_dir")) g.put("webui_dir", "webui")
     }
 
+    @Synchronized
     fun save() {
         val f = file ?: return
         try {
@@ -238,6 +239,7 @@ object Config {
     }
 
     /** 只允许首次初始化；后续不提供修改或从配置文件找回明文密码的入口。 */
+    @Synchronized
     fun initializeWebuiPassword(password: String): Boolean {
         if (webuiPasswordInitialized) return false
         val w = root.optJSONObject("webui") ?: JSONObject().also { root.put("webui", it) }
@@ -247,26 +249,61 @@ object Config {
     }
 
     /** 写回 WebUI 提交的 AppConfig(webui.host/port + network + general),token 不在此改。 */
+    @Synchronized
     fun applyAppConfig(patch: JSONObject) {
-        patch.optJSONObject("network")?.let { root.put("network", it) }
-        patch.optJSONObject("general")?.let { g ->
-            // 保留不在表单里的调优项
-            val cur = root.optJSONObject("general") ?: JSONObject()
-            val keys = g.keys()
-            while (keys.hasNext()) {
-                val k = keys.next()
-                cur.put(k, g.get(k))
+        val previous = root
+        root = JSONObject(previous.toString())
+        try {
+            patch.optJSONObject("network")?.let { root.put("network", it) }
+            patch.optJSONObject("general")?.let { g ->
+                // 保留不在表单里的调优项
+                val cur = root.optJSONObject("general") ?: JSONObject()
+                val keys = g.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    cur.put(k, g.get(k))
+                }
+                root.put("general", cur)
             }
-            root.put("general", cur)
+            patch.optJSONObject("webui")?.let { w ->
+                val cur = root.optJSONObject("webui") ?: JSONObject()
+                if (w.has("host")) cur.put("host", w.get("host"))
+                if (w.has("port")) cur.put("port", w.get("port"))
+                root.put("webui", cur)
+            }
+            fillDefaults()
+            persist()
+        } catch (error: Throwable) {
+            root = previous
+            throw error
         }
-        patch.optJSONObject("webui")?.let { w ->
-            val cur = root.optJSONObject("webui") ?: JSONObject()
-            if (w.has("host")) cur.put("host", w.get("host"))
-            if (w.has("port")) cur.put("port", w.get("port"))
-            root.put("webui", cur)
+    }
+
+    @Synchronized
+    fun replaceConfig(candidate: JSONObject) {
+        require(candidate.optInt("version", 0) == 2) { "文件编辑仅支持 version: 2 配置" }
+        val errors = validateNetwork(candidate.optJSONObject("network") ?: JSONObject())
+        require(errors.isEmpty()) { errors.joinToString("；") }
+        val previous = root
+        root = JSONObject(candidate.toString())
+        try {
+            fillDefaults()
+            persist()
+        } catch (error: Throwable) {
+            root = previous
+            throw error
         }
-        fillDefaults()
-        save()
+    }
+
+    private fun persist() {
+        val target = checkNotNull(file) { "配置文件尚未初始化" }
+        val temporary = File(target.parentFile, target.name + ".tmp")
+        try {
+            temporary.writeText(root.toString(2), Charsets.UTF_8)
+            check(temporary.renameTo(target)) { "无法替换配置文件" }
+        } finally {
+            temporary.delete()
+        }
     }
 
     /**

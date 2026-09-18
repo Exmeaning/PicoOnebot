@@ -7,6 +7,7 @@ import pico.onebot.PicoBoot
 import pico.onebot.action.ActionRouter
 import pico.onebot.action.SystemActions
 import pico.onebot.core.Config
+import pico.onebot.core.ContainerRestart
 import pico.onebot.core.Counters
 import pico.onebot.core.NetUtil
 import pico.onebot.core.PicoLog
@@ -149,6 +150,7 @@ object WebApi {
             .put("version", PicoBoot.VERSION + if (PicoBoot.GIT_SHA.isNotEmpty() && PicoBoot.GIT_SHA != "unknown") "+" + PicoBoot.GIT_SHA else "")
             .put("qqVersion", hostQqVersion())
             .put("platform", "Android Watch")
+            .put("canRestartQq", ContainerRestart.available())
             .put("protocol", "OneBot 11")
             .put("msgSent", Counters.sent())
             .put("msgRecv", Counters.recv())
@@ -215,7 +217,7 @@ object WebApi {
         return out
     }
 
-    private fun putConfig(body: ByteArray): Response {
+    private fun putConfig(body: ByteArray): Response = synchronized(fileWriteLock) {
         val patch = JSONObject(String(body, Charsets.UTF_8))
         val candidate = patch.optJSONObject("network") ?: Config.network()
         val errors = Config.validateNetwork(candidate)
@@ -225,10 +227,24 @@ object WebApi {
                 JSONObject().put("ok", false).put("message", errors.joinToString("；"))
             )
         }
+        val previous = Config.raw().toString()
         Config.applyAppConfig(patch)
         PicoLog.i("config updated via webui")
-        // 网络监听不热重启,诚实告知需要重启
-        return Response(200, JSONObject().put("ok", true).put("restartRequired", true))
+        return Response(200, applyRuntimeConfig(previous).put("ok", true))
+    }
+
+    private fun applyRuntimeConfig(previousText: String): JSONObject {
+        val previous = JSONObject(previousText)
+        val errors = if (previous.optJSONObject("network")?.toString() != Config.network().toString()) {
+            PicoBoot.reloadNetwork()
+        } else emptyList()
+        val oldWebui = previous.optJSONObject("webui") ?: JSONObject()
+        val restart = oldWebui.optString("host", "0.0.0.0") != Config.webuiHost ||
+            oldWebui.optInt("port", 6099) != Config.webuiPort ||
+            previous.optBoolean("enable", true) != Config.enabled ||
+            (previous.optJSONObject("general")?.optInt("event_queue_size", 8192) ?: 8192) != Config.eventQueueSize
+        return JSONObject().put("restartRequired", restart)
+            .put("warnings", JSONArray(errors))
     }
 
     private fun logs(query: Map<String, String>): JSONArray {
@@ -333,12 +349,21 @@ object WebApi {
         }
 
         val expectedModifiedAt = req.optLong("expectedModifiedAt", -1L)
+        var runtime = JSONObject().put("restartRequired", false).put("warnings", JSONArray())
         synchronized(fileWriteLock) {
             if (expectedModifiedAt >= 0 && target.lastModified() != expectedModifiedAt) {
                 return error(409, "文件已被其他程序修改，请重新加载后再保存")
             }
             try {
-                target.writeBytes(bytes)
+                if (activeConfig) {
+                    val previous = Config.raw().toString()
+                    Config.replaceConfig(JSONObject(content))
+                    runtime = applyRuntimeConfig(previous)
+                } else {
+                    target.writeBytes(bytes)
+                }
+            } catch (error: IllegalArgumentException) {
+                return error(400, "配置无效: " + error.message)
             } catch (t: Throwable) {
                 return error(500, "文件保存失败: " + t.message)
             }
@@ -351,7 +376,8 @@ object WebApi {
                 .put("ok", true)
                 .put("size", target.length())
                 .put("modifiedAt", target.lastModified())
-                .put("restartRequired", activeConfig)
+                .put("restartRequired", runtime.optBoolean("restartRequired"))
+                .put("warnings", runtime.getJSONArray("warnings"))
         )
     }
 
@@ -397,11 +423,16 @@ object WebApi {
         Response(status, JSONObject().put("ok", false).put("message", message))
 
     private fun restart(): Response {
-        // 手表端做不到"只重启协议端线程组不动 QQ 进程";网络配置改动请重启 QQ 进程
-        return Response(
-            200, JSONObject().put("ok", false)
-                .put("wording", "手表端暂不支持热重启协议端;网络配置改动需重启 QQ 进程后生效")
-        )
+        if (!ContainerRestart.available()) return error(403, "仅支持容器内重启 QQ；请确认已更新容器镜像且守护服务正在运行")
+        return try {
+            if (!ContainerRestart.request()) return error(429, "QQ 重启请求正在处理，请稍后再试")
+            PicoLog.i("QQ restart requested via authenticated WebUI")
+            Response(202, JSONObject().put("ok", true)
+                .put("wording", "QQ 将在数秒后重启，容器不会重启；恢复后请重新登录 WebUI"))
+        } catch (error: Throwable) {
+            PicoLog.e("QQ restart request failed", error)
+            error(503, "无法提交重启请求，请检查容器守护服务")
+        }
     }
 
     private fun accountLogout(): JSONObject {
@@ -435,7 +466,7 @@ object WebApi {
     private fun qr(refresh: Boolean): JSONObject {
         val out = JSONObject()
         val hasFrag = PicoLoginManager.qrFragmentRef?.get() != null
-        val hasState = PicoLoginManager.stateFragmentRef?.get() != null
+        val hasState = PicoLoginManager.hasLoginEntry
         if (KernelGate.state == KernelGate.State.ONLINE) {
             return out.put("status", "online").put("online", true).put("user_id", KernelGate.selfUin())
                 .put("url", "").put("image", "").put("ageSeconds", 0).put("expiresIn", 0)
@@ -473,7 +504,7 @@ object WebApi {
             .put("expiresIn", if (status == "ok") (QR_TTL_SEC - age).coerceAtLeast(0) else 0)
             .put("scanned", info.optBoolean("scanned", false))
             .put("hasFragment", PicoLoginManager.qrFragmentRef?.get() != null)
-            .put("hasStateFragment", PicoLoginManager.stateFragmentRef?.get() != null)
+            .put("hasStateFragment", PicoLoginManager.hasLoginEntry)
     }
 
     private fun imageMime(b: ByteArray): String = when {

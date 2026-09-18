@@ -28,6 +28,7 @@ export interface BotStatus {
   lastHeartbeat: number;
   webuiUrl?: string;
   lanIp?: string;
+  canRestartQq?: boolean;
 }
 
 export interface WsServer {
@@ -149,6 +150,7 @@ export interface SaveFileResult {
   size: number;
   modifiedAt: number;
   restartRequired: boolean;
+  warnings?: string[];
 }
 
 export interface ConnectionInfo {

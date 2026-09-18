@@ -143,8 +143,12 @@ fi
 
 # ── 7. 进程保活守护 ─────────────────────────────────────────────────────────
 log "启动进程守护循环。"
+. /system/bin/pico-restart.sh
+restart_enabled=0
+restart_init && restart_enabled=1
 while true; do
-    sleep 15
+    sleep 3
+    [ "$restart_enabled" = 0 ] || restart_tick
     if pm path "$PKG" >/dev/null 2>&1; then
         if ! pidof "$PKG" >/dev/null 2>&1; then
             log "$PKG 未运行，正在重新拉起 ..."

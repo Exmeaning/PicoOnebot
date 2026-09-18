@@ -114,9 +114,11 @@ export function Network() {
     }
     setSaving(true);
     try {
-      await api.saveConfig(cfg);
+      const result = await api.saveConfig({ network: cfg.network });
       setSaved(JSON.stringify(cfg.network));
-      toast.push("success", "网络配置已保存并热重载");
+      toast.push(result.warnings?.length ? "info" : "success", result.warnings?.length
+        ? "配置已保存，但部分监听启动失败：" + result.warnings.join("；")
+        : result.restartRequired ? "配置已保存，部分设置需重启 QQ 生效" : "网络配置已保存并热重载");
     } catch (e) {
       toast.push("error", (e as Error).message);
     } finally {

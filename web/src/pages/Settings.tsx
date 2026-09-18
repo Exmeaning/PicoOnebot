@@ -32,9 +32,9 @@ export function Settings() {
     if (!cfg) return;
     setSaving(true);
     try {
-      const r = await api.saveConfig(cfg);
+      const r = await api.saveConfig({ general: cfg.general, webui: cfg.webui });
       setSaved(snap(cfg));
-      toast.push("success", (r as { restartRequired?: boolean }).restartRequired ? "已保存,网络配置改动需重启 QQ 进程后生效" : "设置已保存");
+      toast.push("success", r.restartRequired ? "已保存，WebUI 监听地址或启动设置需重启 QQ 生效" : "设置已保存");
     } catch (e) {
       toast.push("error", (e as Error).message);
     } finally {

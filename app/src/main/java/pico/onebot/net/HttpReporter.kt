@@ -40,6 +40,7 @@ object HttpReporter {
     @Volatile
     private var targets: List<Target> = emptyList()
 
+    @Synchronized
     fun start() {
         val configured = Config.httpClients()
         targets = (0 until configured.length()).mapNotNull { i ->
@@ -49,7 +50,7 @@ object HttpReporter {
             if (url.isBlank()) return@mapNotNull null
             Target(url, item.optString("token", ""), item.optString("secret", ""))
         }
-        if (targets.isEmpty()) return
+        if (running || targets.isEmpty()) return
         queue = ArrayBlockingQueue(Config.int("post_queue_size", 1024))
         running = true
         Thread({ pump() }, "pico-report").apply { isDaemon = true }.start()

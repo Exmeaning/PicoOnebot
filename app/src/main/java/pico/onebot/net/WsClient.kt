@@ -16,34 +16,47 @@ import java.security.SecureRandom
 class WsClient(
     private val url: String,
     private val accessToken: String,
-    private val server: HttpServer
+    private val server: HttpServer,
+    private val reconnectInterval: Long = 3000
 ) {
 
     @Volatile
     private var running = false
 
+    @Volatile
     private var conn: WsConn? = null
+
+    @Volatile
+    private var socket: Socket? = null
+
+    private var worker: Thread? = null
 
     fun start() {
         if (running) return
         running = true
-        Thread({ loop() }, "pico-rws").apply { isDaemon = true }.start()
+        worker = Thread({ loop() }, "pico-rws").apply { isDaemon = true; start() }
     }
 
     fun stop() {
         running = false
         conn?.close()
+        try { socket?.close() } catch (_: Throwable) { }
+        worker?.interrupt()
     }
 
     private fun loop() {
-        var backoff = Config.long("reverse_reconnect_min_ms", 3000)
-        val maxBackoff = Config.long("reverse_reconnect_max_ms", 60000)
+        val minBackoff = reconnectInterval.coerceAtLeast(100)
+        var backoff = minBackoff
+        val maxBackoff = Config.long("reverse_reconnect_max_ms", 60000).coerceAtLeast(minBackoff)
         while (running) {
             try {
                 connectOnce()
-                backoff = Config.long("reverse_reconnect_min_ms", 3000)
+                backoff = minBackoff
             } catch (t: Throwable) {
-                PicoLog.w("reverse ws $url failed: " + t.javaClass.simpleName + " " + t.message)
+                if (running) PicoLog.w("reverse ws $url failed: " + t.javaClass.simpleName + " " + t.message)
+            } finally {
+                try { socket?.close() } catch (_: Throwable) { }
+                socket = null
             }
             if (!running) return
             try {
@@ -64,9 +77,11 @@ class WsClient(
             (if (uri.rawQuery.isNullOrEmpty()) "" else "?" + uri.rawQuery)
 
         val sock = Socket()
+        socket = sock
+        if (!running) return
         sock.connect(java.net.InetSocketAddress(uri.host, port), 10000)
         sock.tcpNoDelay = true
-        sock.soTimeout = 0
+        sock.soTimeout = 10000
 
         val keyBytes = ByteArray(16)
         SecureRandom().nextBytes(keyBytes)
@@ -107,10 +122,13 @@ class WsClient(
 
         val c = WsConn(sock, ins, out, "rws:$url", WsConn.Role.BOTH, true)
         conn = c
-        Transport.add(c)
         try {
+            if (!running) return
+            sock.soTimeout = 0
+            Transport.add(c)
             c.loop { text -> server.onActionText(c, text) }
         } finally {
+            c.close()
             Transport.remove(c)
             conn = null
         }

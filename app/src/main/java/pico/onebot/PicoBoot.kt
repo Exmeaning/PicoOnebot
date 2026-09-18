@@ -92,6 +92,49 @@ object PicoBoot {
             PicoLog.w("unsafe network config loaded from file: $warning")
         }
 
+        reloadNetwork()
+        if (onebotServers.isNotEmpty()) KernelGate.setState(KernelGate.State.TRANSPORT_UP)
+
+        // WebUI 独立监听(6099),静态页 + /api/*
+        try {
+            val web = HttpServer(Config.webuiHost, Config.webuiPort, HttpServer.Role.WEBUI)
+            web.start()
+            webuiServer = web
+            PicoLog.i("WebUI 控制台: http://" + Config.webuiHost + ":" + Config.webuiPort + "/  password=" +
+                (if (!Config.webuiPasswordInitialized) Config.DEFAULT_WEBUI_PASSWORD + " (初始,首次进入必须修改)" else "已设置"))
+        } catch (t: Throwable) {
+            PicoLog.e("webui server bind failed on " + Config.webuiHost + ":" + Config.webuiPort, t)
+        }
+
+        PicoLog.i("WebUI 局域网地址: " + pico.onebot.core.NetUtil.webuiUrl())
+
+        MetaEvents.start()
+
+        // 延迟首探:别在宿主自己 init 内核之前去碰 KernelServiceUtil 的静态初始化
+        val delay = Config.long("kernel_probe_delay_ms", 5000)
+        try {
+            Thread.sleep(delay)
+        } catch (t: InterruptedException) {
+            return
+        }
+        KernelGate.startWatch()
+
+        Runtime.getRuntime().addShutdownHook(Thread {
+            MsgIdStore.save()
+            UinUidStore.save()
+        })
+
+        PicoLog.i("PicoOnebot ready: ${onebotServers.size} server(s), ${reverseClients.size} reverse WS client(s)")
+    }
+
+    @Synchronized
+    fun reloadNetwork(): List<String> {
+        reverseClients.forEach { it.stop() }
+        reverseClients.clear()
+        onebotServers.forEach { it.stop() }
+        onebotServers.clear()
+        pico.onebot.net.Transport.closeAll()
+        val errors = ArrayList<String>()
         // 正向 WS 监听:每个 enabled 的 wsServers 项各起一个(各自的端口与口令)
         val servers = Config.wsServers()
         for (i in 0 until servers.length()) {
@@ -105,6 +148,7 @@ object PicoBoot {
                 hs.start()
                 onebotServers.add(hs)
             } catch (t: Throwable) {
+                errors.add("正向 WS $host:$port: ${t.message}")
                 PicoLog.e("onebot server bind failed on $host:$port", t)
             }
         }
@@ -122,27 +166,11 @@ object PicoBoot {
                 hs.start()
                 onebotServers.add(hs)
             } catch (t: Throwable) {
+                errors.add("HTTP $host:$port: ${t.message}")
                 PicoLog.e("http server bind failed on $host:$port", t)
             }
         }
         server = onebotServers.firstOrNull()
-        if (onebotServers.isNotEmpty()) KernelGate.setState(KernelGate.State.TRANSPORT_UP)
-
-        // WebUI 独立监听(6099),静态页 + /api/*
-        try {
-            val web = HttpServer(Config.webuiHost, Config.webuiPort, HttpServer.Role.WEBUI)
-            web.start()
-            webuiServer = web
-            PicoLog.i("WebUI 控制台: http://" + Config.webuiHost + ":" + Config.webuiPort + "/  password=" +
-                (if (!Config.webuiPasswordInitialized) Config.DEFAULT_WEBUI_PASSWORD + " (初始,首次进入必须修改)" else "已设置"))
-        } catch (t: Throwable) {
-            PicoLog.e("webui server bind failed on " + Config.webuiHost + ":" + Config.webuiPort, t)
-        }
-
-        PicoLog.i("WebUI 局域网地址: " + pico.onebot.core.NetUtil.webuiUrl())
-
-        MetaEvents.start()
-        pico.onebot.net.HttpReporter.start()
 
         val actionDispatcher = server ?: HttpServer("127.0.0.1", 0, HttpServer.Role.ONEBOT)
         val clients = Config.wsClients()
@@ -150,27 +178,15 @@ object PicoBoot {
             val o = clients.optJSONObject(i) ?: continue
             if (!o.optBoolean("enabled", true)) continue
             val url = o.optString("url", "")
-            val c = WsClient(url, o.optString("token", ""), actionDispatcher)
+            val c = WsClient(url, o.optString("token", ""), actionDispatcher, o.optLong("reconnectInterval", 3000))
             reverseClients.add(c)
             c.start()
             PicoLog.i("reverse ws target: $url")
         }
 
-        // 延迟首探:别在宿主自己 init 内核之前去碰 KernelServiceUtil 的静态初始化
-        val delay = Config.long("kernel_probe_delay_ms", 5000)
-        try {
-            Thread.sleep(delay)
-        } catch (t: InterruptedException) {
-            return
-        }
-        KernelGate.startWatch()
-
-        Runtime.getRuntime().addShutdownHook(Thread {
-            MsgIdStore.save()
-            UinUidStore.save()
-        })
-
-        PicoLog.i("PicoOnebot ready: ${onebotServers.size} server(s), ${reverseClients.size} reverse WS client(s)")
+        pico.onebot.net.HttpReporter.start()
+        PicoLog.i("network applied: " + onebotServers.size + " server(s), " + reverseClients.size + " reverse WS client(s)")
+        return errors
     }
 
     /** /proc/self/cmdline 是判断进程名最不依赖框架的办法。 */

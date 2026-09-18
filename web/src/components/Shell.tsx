@@ -43,16 +43,17 @@ export function Shell({
   }, [page]);
 
   const restart = async () => {
-    if (!confirm("确定要重启 PicoOnebot 吗？连接会短暂断开喔。")) return;
+    if (!status?.canRestartQq || restarting) return;
+    if (!confirm("确定重启 QQ 吗？不会重启容器或清除数据。QQ 和 WebUI 会短暂断开，恢复后需要重新登录控制台。")) return;
     setRestarting(true);
     try {
       const r = await api.restart();
-      if (r.ok) toast.push("success", "重启指令已发送，稍等片刻就好");
-      else toast.push("info", r.wording ?? "当前形态不支持热重启");
+      if (r.ok) toast.push("success", r.wording ?? "QQ 重启请求已提交");
+      else toast.push("info", r.wording ?? "当前环境不支持重启 QQ");
     } catch (e) {
       toast.push("error", (e as Error).message);
     } finally {
-      setRestarting(false);
+      window.setTimeout(() => setRestarting(false), 30000);
     }
   };
 
@@ -111,9 +112,10 @@ export function Shell({
             <Button variant="soft" size="sm" onClick={() => onNavigate("qr")}>
               <QrCode className="h-3.5 w-3.5" /> 扫码
             </Button>
-          ) : (
+          ) : null}
+          {status?.canRestartQq && (
             <Button variant="soft" size="sm" onClick={restart} loading={restarting}>
-              <RefreshCw className="h-3.5 w-3.5" /> 重启
+              <RefreshCw className="h-3.5 w-3.5" /> 重启 QQ
             </Button>
           )}
           <Button variant="outline" size="sm" onClick={onLogout}>
