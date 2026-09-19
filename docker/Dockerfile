@@ -46,23 +46,39 @@ RUN if [ -f /stage/tmp/PicoOnebot.apk ]; then \
         mv /stage/tmp/PicoOnebot.apk /stage/opt/pico-onebot/PicoOnebot.apk; \
     fi && rm -rf /stage/tmp
 
+# Stage 1b: static BusyBox for the TARGET arch (no --platform override => built under the target platform).
+# Android's /system/bin/sh (and every other /system/bin tool) is dynamically linked against
+# /system/bin/linker64 -> /apex/com.android.runtime/bin/linker64, and /apex is only populated by /init.
+# The ENTRYPOINT runs *before* /init, so it must use a fully static shell or exec fails with
+# "exec /system/bin/sh: no such file or directory".
+FROM alpine:3.20 AS bbox
+RUN apk add --no-cache busybox-static \
+    && mkdir -p /stage/pico-bb \
+    && cp /bin/busybox.static /stage/pico-bb/busybox \
+    && for a in $(/stage/pico-bb/busybox --list); do \
+        [ -e "/stage/pico-bb/$a" ] || ln -s busybox "/stage/pico-bb/$a"; \
+    done \
+    && /stage/pico-bb/sh -c 'echo "busybox ok: $(/stage/pico-bb/busybox | head -1)"'
+
 # Stage 2: Final All-in-One Image
 FROM ${REDROID_IMAGE}
 
 # Copy prepared Android system layer & PicoOnebot runtime
 COPY --from=builder /stage/system/ /system/
+COPY --from=bbox /stage/pico-bb/ /system/bin/pico-bb/
 COPY docker/pico-network.sh /system/bin/pico-network.sh
 COPY --from=builder /stage/opt/ /opt/
 
 # Expose WebUI (6099), OneBot v11 (3001), ADB (5555)
 EXPOSE 6099 3001 5555
 
-# Entrypoint: Binder checks, kmsg relay to stdout, and exec /init (PID 1)
-ENTRYPOINT ["/system/bin/sh", "/system/bin/pico-entrypoint.sh"]
+# Entrypoint: Binder checks, kmsg relay to stdout, and exec /init (PID 1).
+# Must run on the static BusyBox: Android's own sh cannot start until /init has mounted /apex.
+ENTRYPOINT ["/system/bin/pico-bb/busybox", "sh", "/system/bin/pico-entrypoint.sh"]
 
 # Health check: verifies Android boot completion and WebUI port (6099) readiness
 HEALTHCHECK --start-period=360s --interval=30s --timeout=15s --retries=3 \
-    CMD ["/system/bin/sh", "/system/bin/pico-health.sh"]
+    CMD ["/system/bin/pico-bb/busybox", "sh", "/system/bin/pico-health.sh"]
 
 # Default Redroid boot arguments for ARM translation and display settings
 CMD [ \

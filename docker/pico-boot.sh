@@ -29,7 +29,7 @@ for node in /dev/binder /dev/hwbinder /dev/vndbinder; do
         binder_ok=0
         continue
     fi
-    perm="$(stat -c '%a %U %G' "$node" 2>/dev/null)"
+    perm="$(stat -L -c '%a %U %G' "$node" 2>/dev/null)"
     log "binder 节点 $node -> $perm ($(readlink -f "$node" 2>/dev/null))"
     case "$perm" in
         666\ *) ;;

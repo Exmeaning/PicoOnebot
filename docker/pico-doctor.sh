@@ -12,8 +12,8 @@ hr "1. Binder 设备节点与权限"
 for n in /dev/binder /dev/hwbinder /dev/vndbinder; do
     if [ -e "$n" ]; then
         printf '%-18s mode=%s owner=%s:%s target=%s\n' \
-            "$n" "$(stat -c %a "$n" 2>/dev/null)" \
-            "$(stat -c %U "$n" 2>/dev/null)" "$(stat -c %G "$n" 2>/dev/null)" \
+            "$n" "$(stat -L -c %a "$n" 2>/dev/null)" \
+            "$(stat -L -c %U "$n" 2>/dev/null)" "$(stat -L -c %G "$n" 2>/dev/null)" \
             "$(readlink -f "$n" 2>/dev/null)"
     else
         printf '%-18s 缺失\n' "$n"
@@ -25,7 +25,7 @@ echo "-- 检查结果 --"
 bad=0
 for n in /dev/binder /dev/hwbinder /dev/vndbinder; do
     [ -e "$n" ] || { echo "❌ $n 不存在 (内核缺少 Binder 支持或未配置 --privileged)"; bad=1; continue; }
-    [ "$(stat -c %a "$n" 2>/dev/null)" = "666" ] || { echo "❌ $n 权限不是 0666 (Android 系统服务需要 0666 权限)"; bad=1; }
+    [ "$(stat -L -c %a "$n" 2>/dev/null)" = "666" ] || { echo "❌ $n 权限不是 0666 (Android 系统服务需要 0666 权限)"; bad=1; }
 done
 [ "$bad" = "0" ] && echo "✅ Binder 节点状态正常"
 

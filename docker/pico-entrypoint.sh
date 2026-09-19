@@ -1,10 +1,17 @@
-#!/system/bin/sh
+#!/system/bin/pico-bb/sh
 # pico-entrypoint.sh: 容器启动入口脚本
 # 负责 Binder 设备校验、权限检查、kmsg 日志转发与启动 Android init (PID 1)。
+#
+# 注意：本脚本在 /init 之前运行。此时 /apex 尚未挂载，Android 自带的 /system/bin/sh、stat、
+# grep 等全部动态链接到 /apex/com.android.runtime 下的 linker/libc，execve 会直接报
+# "no such file or directory"。因此入口必须使用镜像内置的静态 BusyBox (/system/bin/pico-bb)，
+# 且 PATH 里 BusyBox 必须排在 /system/bin 之前。
 #
 # 环境变量：
 #   PICO_LOG_KMSG=1|all|0   将 /dev/kmsg 转发至 stdout。默认 1 (关键日志)，all (全量)，0 (关闭)
 #   PICO_BINDER_STRICT=1    Binder 校验未通过时直接退出（默认 0，仅告警）
+
+export PATH=/system/bin/pico-bb:/system/bin:/system/xbin
 
 say() { echo "[pico-entrypoint] $*"; }
 
@@ -20,11 +27,11 @@ binder_bad=""
 for node in /dev/binder /dev/hwbinder /dev/vndbinder; do
     [ -e "$node" ] || continue
     binder_state="present"
-    mode="$(stat -c %a "$node" 2>/dev/null)"
-    owner="$(stat -c '%U:%G' "$node" 2>/dev/null)"
+    mode="$(stat -L -c %a "$node" 2>/dev/null)"
+    owner="$(stat -L -c '%U:%G' "$node" 2>/dev/null)"
     say "检测到 Binder 设备 $node (mode=$mode owner=$owner)"
     if [ "$mode" != "666" ]; then
-        if chmod 0666 "$node" 2>/dev/null && [ "$(stat -c %a "$node" 2>/dev/null)" = "666" ]; then
+        if chmod 0666 "$node" 2>/dev/null && [ "$(stat -L -c %a "$node" 2>/dev/null)" = "666" ]; then
             say "  已将 $node 权限修正为 0666"
         else
             say "  警告: 无法修改 $node 权限 (当前 0$mode)"
@@ -82,6 +89,20 @@ if [ ! -x /init ]; then
 fi
 
 . /system/bin/pico-network.sh
+
+# redroid 官方镜像的 ENTRYPOINT 是 ["/init","qemu=1","androidboot.hardware=redroid"]。
+# 我们替换了 ENTRYPOINT，这两个参数必须由这里补回：缺少 androidboot.hardware=redroid 时
+# ro.hardware 不是 redroid，hwcomposer HAL 找不到 hwcomposer.redroid.so 而退出(status 1)，
+# 其 onrestart 会不断重启 surfaceflinger → zygote → 整个系统 5 秒一轮死循环，永远到不了 boot_completed。
+has_hw=0; has_qemu=0
+for boot_arg in "$@"; do
+    case "$boot_arg" in
+        androidboot.hardware=*) has_hw=1 ;;
+        qemu=*) has_qemu=1 ;;
+    esac
+done
+[ "$has_hw" = 1 ] || set -- androidboot.hardware=redroid "$@"
+[ "$has_qemu" = 1 ] || set -- qemu=1 "$@"
 
 say "启动 Android init: /init $*"
 say "首次启动初始化预计耗时 2–5 分钟。"

@@ -1,0 +1,4 @@
+# Only docker/ is needed by docker/Dockerfile; keeps build context tiny (repo has build/, node_modules, docs/dist).
+*
+!docker/
+docker/.env
