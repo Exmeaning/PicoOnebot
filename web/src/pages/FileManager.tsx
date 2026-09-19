@@ -17,7 +17,7 @@ import {
 } from "lucide-react";
 import { Badge, Button, Card, CardHeader, Empty, Input, PageHeader, useToast } from "../components/ui";
 import { api } from "../lib/api";
-import { fmtDateTime } from "../lib/format";
+import { fmtApplied, fmtDateTime } from "../lib/format";
 import type { FileDocument, FileEntry, FileListing } from "../lib/types";
 import { cn } from "../utils/cn";
 
@@ -133,10 +133,13 @@ export function FileManager() {
       setDocument(next);
       setSavedContent(content);
       setSelected((current) => current ? { ...current, size: result.size, modifiedAt: result.modifiedAt } : current);
-      toast.push(result.warnings?.length ? "info" : "success", result.warnings?.length
-        ? "文件已保存，但部分监听启动失败：" + result.warnings.join("；")
-        : result.restartRequired ? "文件已保存，部分启动设置需重启 QQ 生效"
-        : listing?.activeConfig?.path === document.path ? "文件已保存，网络配置已即时应用" : "文件已保存");
+      // 只有改到正在生效的配置文件才谈得上"应用"；别的文件就是写盘,别替它宣布生效。
+      if (listing?.activeConfig?.path === document.path) {
+        const applied = fmtApplied(result);
+        toast.push(applied.tone, "文件已保存。" + applied.message);
+      } else {
+        toast.push("success", "文件已保存");
+      }
       if (listing) void loadDirectory(listing.path);
     } catch (error) {
       toast.push("error", (error as Error).message);

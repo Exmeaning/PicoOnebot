@@ -19,7 +19,9 @@ class WsConn(
     val tag: String,
     val role: Role,
     /** 客户端角色必须给帧加掩码(RFC 6455)。 */
-    private val maskOut: Boolean
+    private val maskOut: Boolean,
+    /** 产生这条连接的网络配置项 id;WebUI 要按配置项如实统计在线对端。 */
+    val ownerId: String = ""
 ) {
 
     enum class Role { API, EVENT, BOTH }

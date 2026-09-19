@@ -44,6 +44,39 @@ object PicoBoot {
     private val onebotServers = ArrayList<HttpServer>()
     private val reverseClients = ArrayList<WsClient>()
 
+    /** 配置项 id -> 真正起来的监听 / 反向客户端 / 绑定失败原因。WebUI 的状态只看这三张表。 */
+    private val listenerById = LinkedHashMap<String, HttpServer>()
+    private val reverseById = LinkedHashMap<String, WsClient>()
+    private val bindErrorById = LinkedHashMap<String, String>()
+
+    /** 最近一次 [reloadNetwork] 真正执行完的时刻。 */
+    @Volatile
+    var networkAppliedAt: Long = 0
+        private set
+
+    /** 这个配置项此刻是否真的在监听。 */
+    fun listening(id: String): Boolean = synchronized(this) { listenerById[id]?.running == true }
+
+    /** 这个配置项此刻是否真的连着对端。 */
+    fun reverseConnected(id: String): Boolean = synchronized(this) { reverseById[id]?.connected == true }
+
+    /** 这个配置项是否已经起了重连线程(连上与否另说)。 */
+    fun reverseRunning(id: String): Boolean = synchronized(this) { reverseById.containsKey(id) }
+
+    /** 这条反向连接建立的时刻;没连上是 0。 */
+    fun reverseSince(id: String): Long = synchronized(this) { reverseById[id]?.connectedAt ?: 0L }
+
+    /** 上一次重载时这个配置项的失败原因,没有就是 null。 */
+    fun bindError(id: String): String? = synchronized(this) { bindErrorById[id] }
+
+    /** [reloadNetwork] 的结果:如实告诉调用方到底起来了什么。 */
+    class ReloadResult(
+        val errors: List<String>,
+        val listeners: Int,
+        val reverse: Int,
+        val reporters: Int
+    )
+
     fun start(ctx: Context) {
         if (started) return
         QimeiCompat.installSignatureCompat(ctx)
@@ -128,11 +161,14 @@ object PicoBoot {
     }
 
     @Synchronized
-    fun reloadNetwork(): List<String> {
+    fun reloadNetwork(): ReloadResult {
         reverseClients.forEach { it.stop() }
         reverseClients.clear()
         onebotServers.forEach { it.stop() }
         onebotServers.clear()
+        listenerById.clear()
+        reverseById.clear()
+        bindErrorById.clear()
         pico.onebot.net.Transport.closeAll()
         val errors = ArrayList<String>()
         // 正向 WS 监听:每个 enabled 的 wsServers 项各起一个(各自的端口与口令)
@@ -140,15 +176,18 @@ object PicoBoot {
         for (i in 0 until servers.length()) {
             val o = servers.optJSONObject(i) ?: continue
             if (!o.optBoolean("enabled", true)) continue
+            val id = o.optString("id")
             val host = o.optString("host", "0.0.0.0")
             val port = o.optInt("port", 3001)
             val token = o.optString("token", "")
-            val hs = HttpServer(host, port, HttpServer.Role.ONEBOT, token)
+            val hs = HttpServer(host, port, HttpServer.Role.ONEBOT, token, id)
             try {
                 hs.start()
                 onebotServers.add(hs)
+                listenerById[id] = hs
             } catch (t: Throwable) {
                 errors.add("正向 WS $host:$port: ${t.message}")
+                bindErrorById[id] = t.message ?: t.javaClass.simpleName
                 PicoLog.e("onebot server bind failed on $host:$port", t)
             }
         }
@@ -157,16 +196,22 @@ object PicoBoot {
         for (i in 0 until httpServers.length()) {
             val o = httpServers.optJSONObject(i) ?: continue
             if (!o.optBoolean("enabled", true)) continue
+            val id = o.optString("id")
             val host = o.optString("host", "0.0.0.0")
             val port = o.optInt("port", 0)
-            if (port <= 0) continue
+            if (port <= 0) {
+                bindErrorById[id] = "端口无效"
+                continue
+            }
             val token = o.optString("token", "")
-            val hs = HttpServer(host, port, HttpServer.Role.ONEBOT, token)
+            val hs = HttpServer(host, port, HttpServer.Role.ONEBOT, token, id)
             try {
                 hs.start()
                 onebotServers.add(hs)
+                listenerById[id] = hs
             } catch (t: Throwable) {
                 errors.add("HTTP $host:$port: ${t.message}")
+                bindErrorById[id] = t.message ?: t.javaClass.simpleName
                 PicoLog.e("http server bind failed on $host:$port", t)
             }
         }
@@ -177,16 +222,23 @@ object PicoBoot {
         for (i in 0 until clients.length()) {
             val o = clients.optJSONObject(i) ?: continue
             if (!o.optBoolean("enabled", true)) continue
+            val id = o.optString("id")
             val url = o.optString("url", "")
-            val c = WsClient(url, o.optString("token", ""), actionDispatcher, o.optLong("reconnectInterval", 3000))
+            val c = WsClient(url, o.optString("token", ""), actionDispatcher, o.optLong("reconnectInterval", 3000), id)
             reverseClients.add(c)
+            reverseById[id] = c
             c.start()
             PicoLog.i("reverse ws target: $url")
         }
 
         pico.onebot.net.HttpReporter.start()
-        PicoLog.i("network applied: " + onebotServers.size + " server(s), " + reverseClients.size + " reverse WS client(s)")
-        return errors
+        networkAppliedAt = System.currentTimeMillis()
+        val reporters = pico.onebot.net.HttpReporter.targetCount()
+        PicoLog.i(
+            "network applied: " + onebotServers.size + " listener(s), " +
+                reverseClients.size + " reverse WS client(s), " + reporters + " http report target(s)"
+        )
+        return ReloadResult(errors, onebotServers.size, reverseClients.size, reporters)
     }
 
     /** /proc/self/cmdline 是判断进程名最不依赖框架的办法。 */

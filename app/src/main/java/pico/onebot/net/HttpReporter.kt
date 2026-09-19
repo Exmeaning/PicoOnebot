@@ -57,6 +57,12 @@ object HttpReporter {
         PicoLog.i("http report targets: " + targets.joinToString(", ") { it.url })
     }
 
+    /** 当前真正会收到事件的上报地址数量。 */
+    fun targetCount(): Int = if (running) targets.size else 0
+
+    /** 这个地址此刻是否真的在上报队列里 —— 配置写了不代表生效。 */
+    fun reporting(url: String): Boolean = running && targets.any { it.url == url }
+
     /** 事件分发线程调用:只入队。队列满时丢**最老的**,保证新事件优先送达。 */
     fun offer(text: String) {
         if (!running) return

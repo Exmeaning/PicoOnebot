@@ -121,7 +121,7 @@ export function Dashboard({ status, onNavigate }: { status: BotStatus | null; on
             title="消息活动"
             desc="最近数分钟的消息吞吐（每 5 秒采样）"
             icon={<Activity className="h-4 w-4" />}
-            action={<Badge tone="pink">{conns.filter((c) => c.connected).length} 个连接在线</Badge>}
+            action={<Badge tone="pink">{conns.filter((c) => c.connected).length}/{conns.filter((c) => c.enabled).length} 条已启用连接在线</Badge>}
           />
           <div className="p-6 pt-4">
             <div className="flex h-36 items-end gap-1.5 rounded-3xl bg-pico-softer p-4">
@@ -144,10 +144,16 @@ export function Dashboard({ status, onNavigate }: { status: BotStatus | null; on
               ) : (
                 conns.map((c) => (
                   <div key={c.id} className="flex items-center gap-3 rounded-2xl border border-pico-line bg-white/70 p-3">
-                    <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${c.connected ? "bg-emerald-400" : "bg-slate-300"}`} />
+                    {/* 灯只跟着后端实测的 connected 走：配置勾上了但没起来，就是灰的 */}
+                    <span
+                      className={`h-2.5 w-2.5 shrink-0 rounded-full ${
+                        c.connected ? "bg-emerald-400" : c.enabled ? "bg-amber-400" : "bg-slate-300"
+                      }`}
+                    />
                     <div className="min-w-0 flex-1">
                       <p className="truncate text-sm font-extrabold text-pico-ink">{c.name}</p>
                       <p className="truncate font-mono text-[11px] text-pico-muted">{c.peer}</p>
+                      <p className="truncate text-[11px] text-pico-muted">{c.detail}</p>
                     </div>
                     <Badge tone="gray">{kindLabel(c.kind)}</Badge>
                   </div>

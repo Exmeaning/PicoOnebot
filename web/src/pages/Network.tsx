@@ -3,6 +3,7 @@ import { Plus, Pencil, Trash2, Save, RotateCcw, Radio, Cable, Globe, SendHorizon
 import { Badge, Button, Card, Empty, Field, Input, Modal, PageHeader, Select, Toggle, useToast } from "../components/ui";
 import { api } from "../lib/api";
 import type { AppConfig, HttpClient, HttpServer, NetworkConfig, WsClient, WsServer } from "../lib/types";
+import { fmtApplied } from "../lib/format";
 import { cn } from "../utils/cn";
 
 type Kind = keyof NetworkConfig;
@@ -116,9 +117,8 @@ export function Network() {
     try {
       const result = await api.saveConfig({ network: cfg.network });
       setSaved(JSON.stringify(cfg.network));
-      toast.push(result.warnings?.length ? "info" : "success", result.warnings?.length
-        ? "配置已保存，但部分监听启动失败：" + result.warnings.join("；")
-        : result.restartRequired ? "配置已保存，部分设置需重启 QQ 生效" : "网络配置已保存并热重载");
+      const applied = fmtApplied(result);
+      toast.push(applied.tone, applied.message);
     } catch (e) {
       toast.push("error", (e as Error).message);
     } finally {
@@ -209,7 +209,7 @@ export function Network() {
           ) : list.length === 0 ? (
             <Empty
               title={`还没有${current.label}`}
-              desc="点击右上角「添加」创建第一条连接，保存后立即生效。"
+              desc="点击右上角「添加」创建第一条连接，保存后会立刻重启监听；实际连上没有，看「概览」的连接列表。"
               action={
                 <Button
                   size="sm"

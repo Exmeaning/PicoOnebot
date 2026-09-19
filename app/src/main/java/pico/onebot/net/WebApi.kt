@@ -179,40 +179,77 @@ object WebApi {
         ""
     }
 
-    /** ConnectionInfo[]:配置里的每个连接项 + 当前存活的入站 WS 连接数。 */
+    /**
+     * ConnectionInfo[]:配置里的每个连接项 + 它此刻**真实**的运行状态。
+     *
+     * 这里绝不能拿 `enabled` 冒充 `connected` —— 配置写了不等于端口起来了,
+     * 更不等于对端连上了。前端的在线灯就靠这份数据,报假的等于骗用户。
+     */
     private fun connections(): JSONArray {
         val out = JSONArray()
-        val started = PicoBoot.startedAt
-        fun add(id: String, kind: String, name: String, peer: String, connected: Boolean) {
+        fun add(
+            id: String, kind: String, name: String, peer: String,
+            enabled: Boolean, connected: Boolean, peers: Int, since: Long, detail: String
+        ) {
             out.put(
-                JSONObject().put("id", id).put("kind", kind).put("name", name)
-                    .put("peer", peer).put("connected", connected).put("since", started)
-                    .put("sent", 0).put("recv", 0)
+                JSONObject().put("id", id).put("kind", kind).put("name", name).put("peer", peer)
+                    .put("enabled", enabled).put("connected", connected).put("peers", peers)
+                    .put("since", since).put("detail", detail)
             )
         }
+
+        fun addListener(o: JSONObject, kind: String, fallbackName: String, peer: String) {
+            val id = o.optString("id")
+            val enabled = o.optBoolean("enabled", true)
+            val listening = enabled && PicoBoot.listening(id)
+            val peers = if (listening) Transport.peers(id) else 0
+            val detail = when {
+                !enabled -> "已停用"
+                !listening -> "监听未启动" + (PicoBoot.bindError(id)?.let { "：$it" } ?: "")
+                peers > 0 -> "监听中 · $peers 个客户端在线"
+                else -> "监听中 · 暂无客户端"
+            }
+            add(id, kind, o.optString("name", fallbackName), peer, enabled, listening, peers,
+                if (listening) PicoBoot.networkAppliedAt else 0L, detail)
+        }
+
         val ws = Config.wsServers()
         for (i in 0 until ws.length()) {
             val o = ws.optJSONObject(i) ?: continue
-            add(o.optString("id"), "ws-server", o.optString("name", "正向 WS"),
-                "ws://" + o.optString("host") + ":" + o.optInt("port"), o.optBoolean("enabled", true))
-        }
-        val wc = Config.wsClients()
-        for (i in 0 until wc.length()) {
-            val o = wc.optJSONObject(i) ?: continue
-            add(o.optString("id"), "ws-client", o.optString("name", "反向 WS"),
-                o.optString("url"), o.optBoolean("enabled", true))
+            addListener(o, "ws-server", "正向 WS", "ws://" + o.optString("host") + ":" + o.optInt("port"))
         }
         val hs = Config.httpServers()
         for (i in 0 until hs.length()) {
             val o = hs.optJSONObject(i) ?: continue
-            add(o.optString("id"), "http-server", o.optString("name", "HTTP 服务"),
-                "http://" + o.optString("host") + ":" + o.optInt("port"), o.optBoolean("enabled", true))
+            addListener(o, "http-server", "HTTP 服务", "http://" + o.optString("host") + ":" + o.optInt("port"))
+        }
+        val wc = Config.wsClients()
+        for (i in 0 until wc.length()) {
+            val o = wc.optJSONObject(i) ?: continue
+            val id = o.optString("id")
+            val enabled = o.optBoolean("enabled", true)
+            val connected = enabled && PicoBoot.reverseConnected(id)
+            val detail = when {
+                !enabled -> "已停用"
+                connected -> "已连接"
+                PicoBoot.reverseRunning(id) -> "重连中…"
+                else -> "未启动"
+            }
+            add(id, "ws-client", o.optString("name", "反向 WS"), o.optString("url"),
+                enabled, connected, if (connected) 1 else 0,
+                if (connected) PicoBoot.reverseSince(id) else 0L, detail)
         }
         val hc = Config.httpClients()
         for (i in 0 until hc.length()) {
             val o = hc.optJSONObject(i) ?: continue
-            add(o.optString("id"), "http-client", o.optString("name", "HTTP 上报"),
-                o.optString("url"), o.optBoolean("enabled", true))
+            val id = o.optString("id")
+            val enabled = o.optBoolean("enabled", true)
+            val url = o.optString("url")
+            // HTTP 上报是"有事件才发"的单向通道,没有长连接可言:在队列里就算生效。
+            val reporting = enabled && HttpReporter.reporting(url)
+            add(id, "http-client", o.optString("name", "HTTP 上报"), url,
+                enabled, reporting, 0, if (reporting) PicoBoot.networkAppliedAt else 0L,
+                if (!enabled) "已停用" else if (reporting) "已生效 · 有事件即上报" else "未生效")
         }
         return out
     }
@@ -233,18 +270,28 @@ object WebApi {
         return Response(200, applyRuntimeConfig(previous).put("ok", true))
     }
 
+    /**
+     * 保存后真正去动运行时,并把**实际发生了什么**原样回给前端 ——
+     * 前端的提示语只许复述这里的数字,不许自己替后端宣布"已热重载"。
+     */
     private fun applyRuntimeConfig(previousText: String): JSONObject {
         val previous = JSONObject(previousText)
-        val errors = if (previous.optJSONObject("network")?.toString() != Config.network().toString()) {
-            PicoBoot.reloadNetwork()
-        } else emptyList()
+        val networkChanged = previous.optJSONObject("network")?.toString() != Config.network().toString()
+        val reload = if (networkChanged) PicoBoot.reloadNetwork() else null
         val oldWebui = previous.optJSONObject("webui") ?: JSONObject()
         val restart = oldWebui.optString("host", "0.0.0.0") != Config.webuiHost ||
             oldWebui.optInt("port", 6099) != Config.webuiPort ||
             previous.optBoolean("enable", true) != Config.enabled ||
             (previous.optJSONObject("general")?.optInt("event_queue_size", 8192) ?: 8192) != Config.eventQueueSize
+        val applied = JSONObject()
+            .put("reloaded", reload != null)
+            .put("listeners", reload?.listeners ?: 0)
+            .put("reverse", reload?.reverse ?: 0)
+            .put("reporters", reload?.reporters ?: 0)
+            .put("appliedAt", if (reload != null) PicoBoot.networkAppliedAt else 0L)
         return JSONObject().put("restartRequired", restart)
-            .put("warnings", JSONArray(errors))
+            .put("warnings", JSONArray(reload?.errors ?: emptyList<String>()))
+            .put("applied", applied)
     }
 
     private fun logs(query: Map<String, String>): JSONArray {
@@ -350,6 +397,8 @@ object WebApi {
 
         val expectedModifiedAt = req.optLong("expectedModifiedAt", -1L)
         var runtime = JSONObject().put("restartRequired", false).put("warnings", JSONArray())
+            .put("applied", JSONObject().put("reloaded", false).put("listeners", 0)
+                .put("reverse", 0).put("reporters", 0).put("appliedAt", 0L))
         synchronized(fileWriteLock) {
             if (expectedModifiedAt >= 0 && target.lastModified() != expectedModifiedAt) {
                 return error(409, "文件已被其他程序修改，请重新加载后再保存")
@@ -378,6 +427,7 @@ object WebApi {
                 .put("modifiedAt", target.lastModified())
                 .put("restartRequired", runtime.optBoolean("restartRequired"))
                 .put("warnings", runtime.getJSONArray("warnings"))
+                .put("applied", runtime.getJSONObject("applied"))
         )
     }
 

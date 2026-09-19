@@ -17,7 +17,9 @@ class WsClient(
     private val url: String,
     private val accessToken: String,
     private val server: HttpServer,
-    private val reconnectInterval: Long = 3000
+    private val reconnectInterval: Long = 3000,
+    /** 对应的网络配置项 id,WebUI 按它回报这条反向连接的真实状态。 */
+    private val configId: String = ""
 ) {
 
     @Volatile
@@ -25,6 +27,14 @@ class WsClient(
 
     @Volatile
     private var conn: WsConn? = null
+
+    /** 握手完成且尚未断开才算连上 —— 配置里 enabled 不等于连上了。 */
+    val connected: Boolean get() = conn?.closed == false
+
+    /** 当前这条连接建立的时刻;没连上是 0。 */
+    @Volatile
+    var connectedAt: Long = 0
+        private set
 
     @Volatile
     private var socket: Socket? = null
@@ -39,6 +49,7 @@ class WsClient(
 
     fun stop() {
         running = false
+        connectedAt = 0
         conn?.close()
         try { socket?.close() } catch (_: Throwable) { }
         worker?.interrupt()
@@ -120,8 +131,9 @@ class WsClient(
             if (line.isEmpty()) break
         }
 
-        val c = WsConn(sock, ins, out, "rws:$url", WsConn.Role.BOTH, true)
+        val c = WsConn(sock, ins, out, "rws:$url", WsConn.Role.BOTH, true, configId)
         conn = c
+        connectedAt = System.currentTimeMillis()
         try {
             if (!running) return
             sock.soTimeout = 0
@@ -131,6 +143,7 @@ class WsClient(
             c.close()
             Transport.remove(c)
             conn = null
+            connectedAt = 0
         }
     }
 }

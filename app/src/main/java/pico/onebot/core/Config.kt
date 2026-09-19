@@ -160,6 +160,7 @@ object Config {
         if (!net.has("wsClients")) net.put("wsClients", JSONArray())
         if (!net.has("httpServers")) net.put("httpServers", JSONArray())
         if (!net.has("httpClients")) net.put("httpClients", JSONArray())
+        fillConnectionIds(net)
 
         val g = root.optJSONObject("general") ?: JSONObject().also { root.put("general", it) }
         if (!g.has("logLevel")) g.put("logLevel", "info")
@@ -470,6 +471,27 @@ object Config {
         is String -> if (v.isEmpty()) emptyList() else listOf(v)
         is JSONArray -> (0 until v.length()).mapNotNull { i -> v.optString(i, "").ifEmpty { null } }
         else -> emptyList()
+    }
+
+    /**
+     * 每个连接项都必须有**唯一**的 id:运行时的监听/反向连接表按 id 索引,
+     * WebUI 也按 id 回报真实状态。手写配置文件漏了 id 或重复了,状态就会张冠李戴,
+     * 所以在这里补齐(WebUI 新建时自带 id,这条只兜手写的底)。
+     */
+    private fun fillConnectionIds(net: JSONObject) {
+        val seen = HashSet<String>()
+        for (key in arrayOf("wsServers", "wsClients", "httpServers", "httpClients")) {
+            val arr = net.optJSONArray(key) ?: continue
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val id = o.optString("id")
+                if (id.isEmpty() || !seen.add(id)) {
+                    var fresh = newId()
+                    while (!seen.add(fresh)) fresh = newId()
+                    o.put("id", fresh)
+                }
+            }
+        }
     }
 
     private fun newId(): String = java.lang.Long.toHexString(

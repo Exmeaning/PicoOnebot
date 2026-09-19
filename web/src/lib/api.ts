@@ -1,4 +1,4 @@
-import type { AppConfig, BotStatus, ConnectionInfo, FileDocument, FileListing, LogEntry, LoginResult, QrInfo, SaveFileResult } from "./types";
+import type { AppConfig, BotStatus, ConnectionInfo, FileDocument, FileListing, LogEntry, LoginResult, QrInfo, SaveConfigResult, SaveFileResult } from "./types";
 
 const STORAGE = {
   token: "picoonebot.token",
@@ -95,7 +95,7 @@ export const api = {
   connections: () => http<ConnectionInfo[]>("/api/connections"),
   getConfig: () => http<AppConfig>("/api/config"),
   saveConfig: (config: Partial<AppConfig>) =>
-    http<{ ok: boolean; restartRequired?: boolean; warnings?: string[] }>("/api/config", {
+    http<SaveConfigResult>("/api/config", {
       method: "PUT", body: JSON.stringify(config),
     }),
   files: (path = "") => http<FileListing>(`/api/files?path=${encodeURIComponent(path)}`),

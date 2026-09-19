@@ -145,12 +145,30 @@ export interface FileDocument {
   modifiedAt: number;
 }
 
+/** 保存配置后后端**实际**做了什么。前端的提示语只许复述它,不许自己宣布已生效。 */
+export interface AppliedResult {
+  /** 网络段有变化、确实重载过才是 true;只是写盘就是 false。 */
+  reloaded: boolean;
+  listeners: number;
+  reverse: number;
+  reporters: number;
+  appliedAt: number;
+}
+
+export interface SaveConfigResult {
+  ok: boolean;
+  restartRequired?: boolean;
+  warnings?: string[];
+  applied?: AppliedResult;
+}
+
 export interface SaveFileResult {
   ok: boolean;
   size: number;
   modifiedAt: number;
   restartRequired: boolean;
   warnings?: string[];
+  applied?: AppliedResult;
 }
 
 export interface ConnectionInfo {
@@ -158,10 +176,16 @@ export interface ConnectionInfo {
   kind: "ws-server" | "ws-client" | "http-server" | "http-client";
   name: string;
   peer: string;
+  /** 配置里勾没勾上。**不等于**连上了,别拿它当在线灯。 */
+  enabled: boolean;
+  /** 监听项:端口真的起来了;反向连接:握手真的完成了。 */
   connected: boolean;
+  /** 监听项当前挂着的对端数量。 */
+  peers: number;
+  /** connected 为真时的起始时刻,否则 0。 */
   since: number;
-  sent: number;
-  recv: number;
+  /** 后端给的人话状态,例如「监听中 · 暂无客户端」「重连中…」。 */
+  detail: string;
 }
 
 /** `GET /api/qr` / `POST /api/qr/refresh`:image 是 QQ 登录 SDK 给宿主的那张图(data URL),没有时看 url。 */

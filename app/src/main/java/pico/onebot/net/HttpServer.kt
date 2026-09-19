@@ -24,11 +24,13 @@ import java.security.MessageDigest
  * 线程模型:一个 accept 线程 + 每连接一条线程(连接数量级是个位数,够用且没有依赖)。
  */
 class HttpServer(
-    private val host: String,
-    private val port: Int,
+    val host: String,
+    val port: Int,
     val role: Role = Role.ONEBOT,
     /** ONEBOT 角色的鉴权口令；WEBUI 角色使用 Config 中的密码派生值校验。 */
-    private val serverToken: String = ""
+    private val serverToken: String = "",
+    /** 起这个监听的网络配置项 id,接进来的连接都挂在它名下。 */
+    val configId: String = ""
 ) {
 
     enum class Role { ONEBOT, WEBUI }
@@ -226,7 +228,7 @@ class HttpServer(
             "/event" -> WsConn.Role.EVENT
             else -> WsConn.Role.BOTH
         }
-        val conn = WsConn(sock, ins, out, sock.inetAddress.hostAddress + ":" + sock.port, role, false)
+        val conn = WsConn(sock, ins, out, sock.inetAddress.hostAddress + ":" + sock.port, role, false, configId)
         Transport.add(conn)
         try {
             conn.loop { text -> onActionText(conn, text) }

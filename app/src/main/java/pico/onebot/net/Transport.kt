@@ -34,6 +34,10 @@ object Transport {
 
     fun count(): Int = conns.size
 
+    /** 某个网络配置项当前真正挂着的对端数量(WebUI 的在线灯只认这个,不认 enabled)。 */
+    fun peers(ownerId: String): Int =
+        if (ownerId.isEmpty()) 0 else conns.count { !it.closed && it.ownerId == ownerId }
+
     fun describe(): List<String> = conns.map { it.tag + "(" + it.role + ")" }
 
     fun closeAll() {
