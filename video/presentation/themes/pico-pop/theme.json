@@ -1,0 +1,15 @@
+{
+  "id": "pico-pop",
+  "name": "Pico Pop",
+  "nameZh": "Pico 萌系科技",
+  "description": "Warm-white tutorial canvas with Pico pink, rounded technical diagrams, and a soft dot grid. Friendly Bilibili tech-explainer energy.",
+  "descriptionZh": "暖白教程画布 + Pico 品牌粉 + 圆润技术图形 + 淡点阵网格。适合 B 站科技教程，清楚、轻快、带一点萌系气质。",
+  "mood": ["light", "friendly", "technical", "playful", "tutorial"],
+  "bestFor": ["B 站科技教程", "Android 实操", "开源项目介绍", "产品 onboarding"],
+  "preview": {
+    "shell": "#eef3f8",
+    "surface": "#fffafb",
+    "text": "#23334d",
+    "accent": "#ce3d67"
+  }
+}
