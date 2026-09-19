@@ -2,7 +2,11 @@ import type { ChapterStepProps } from "../../registry/types";
 import "./FitAndLimit.css";
 
 export default function FitAndLimit({ step }: ChapterStepProps) {
-  if (step === 0) return (
+  // script.md combines the comparison and capability boundary into one block.
+  // Start on the more informative boundary scene, then close on the repository card.
+  const sceneStep = step + 1;
+
+  if (sceneStep === 0) return (
     <section className="fl-scene fl-choice">
       <div className="fl-choice-copy"><span className="mono">CHOOSE BY DEVICE</span><h2>不是全功能复刻。<br />是<em>手机路线。</em></h2><p>同一套 OneBot 生态，不同的设备取舍。</p></div>
       <div className="fl-choice-map">
@@ -14,7 +18,7 @@ export default function FitAndLimit({ step }: ChapterStepProps) {
     </section>
   );
 
-  if (step === 1) return (
+  if (sceneStep === 1) return (
     <section className="fl-scene fl-boundary">
       <div className="fl-boundary-head"><span className="mono">CAPABILITY BOUNDARY</span><h2>先看你要的功能。</h2></div>
       <div className="fl-cap-grid">
@@ -25,7 +29,7 @@ export default function FitAndLimit({ step }: ChapterStepProps) {
     </section>
   );
 
-  if (step === 2) return (
+  if (sceneStep === 2) return (
     <section className="fl-scene fl-finale">
       <div className="fl-finale-glow" />
       <div className="fl-finale-route">

@@ -62,3 +62,6 @@ __pycache__/
 Thumbs.db
 desktop.ini
 linux/
+# Generated video work products
+video/incoming/
+video/output/

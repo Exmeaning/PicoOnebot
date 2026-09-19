@@ -92,6 +92,28 @@
 .ps-qr-flow { margin-top: 48px; display: grid; gap: 16px; font-size: 24px; font-weight: 600; }
 .ps-qr-flow b { color: var(--accent); font-size: 42px; }
 
+.ps-auth-flow { padding: 62px 92px 72px; }
+.ps-auth-heading { height: 165px; display: flex; align-items: flex-end; justify-content: space-between; gap: 60px; }
+.ps-auth-heading > span { padding-bottom: 13px; color: var(--accent); font-size: 15px; letter-spacing: .16em; }
+.ps-auth-heading h2 { max-width: 1070px; margin: 0; font-size: 66px; line-height: 1.1; letter-spacing: -.04em; text-align: right; }
+.ps-auth-cards { height: 760px; margin-top: 30px; display: grid; grid-template-columns: minmax(0, 1fr) 105px minmax(0, 1fr); align-items: center; gap: 24px; }
+.ps-auth-card { position: relative; height: 705px; overflow: hidden; border: 2px solid var(--rule); border-radius: 28px; background: var(--surface-2); box-shadow: var(--card-shadow); animation: ps-window-in .8s ease-out both; }
+.ps-auth-card--qr { animation-delay: .3s; }
+.ps-auth-card > img { width: 100%; height: 530px; display: block; object-fit: cover; object-position: center top; }
+.ps-auth-browser-bar { height: 52px; display: flex; align-items: center; gap: 9px; padding: 0 17px; border-bottom: 2px dashed var(--rule); }
+.ps-auth-browser-bar i { width: 10px; height: 10px; border: 1px solid var(--accent); border-radius: 50%; background: var(--accent-soft); }
+.ps-auth-browser-bar span { margin-left: 12px; color: var(--text-mute); font-size: 12px; }
+.ps-auth-card--login > img { height: 478px; }
+.ps-auth-caption { position: absolute; left: 0; right: 0; bottom: 0; height: 175px; padding: 25px 30px; display: grid; grid-template-columns: 1fr auto; align-content: center; gap: 8px 20px; border-top: 2px dashed var(--rule); background: color-mix(in srgb, var(--surface-2) 95%, transparent); }
+.ps-auth-caption span { color: var(--text-mute); font-size: 12px; letter-spacing: .12em; }
+.ps-auth-caption strong { color: var(--accent); font-size: 29px; }
+.ps-auth-caption small { grid-column: 1 / -1; color: var(--text-2); font-size: 16px; }
+.ps-auth-arrow { display: flex; flex-direction: column; align-items: center; gap: 12px; color: var(--accent); }
+.ps-auth-arrow span { font-size: 65px; line-height: 1; animation: ps-auth-arrow 1.5s ease-in-out infinite; }
+.ps-auth-arrow b { color: var(--text-mute); font-size: 11px; letter-spacing: .14em; }
+.ps-auth-qr-focus { position: absolute; left: 50%; top: 82px; width: 245px; height: 300px; transform: translateX(-50%); border: 4px solid var(--accent); border-radius: 24px; box-shadow: 0 0 0 999px color-mix(in srgb, var(--surface) 34%, transparent), 0 0 36px var(--accent-glow); animation: ps-focus 1s .7s ease-out both; }
+
+@keyframes ps-auth-arrow { 0%, 100% { transform: translateX(-7px); opacity: .55; } 50% { transform: translateX(8px); opacity: 1; } }
 @keyframes ps-window-in { from { opacity: 0; transform: translateY(42px); } to { opacity: 1; transform: translateY(0); } }
 @keyframes ps-phone-in { from { opacity: 0; transform: translateX(80px) rotate(5deg); } to { opacity: 1; transform: translateX(0) rotate(0); } }
 @keyframes ps-install { from { width: 0; } to { width: 82%; } }

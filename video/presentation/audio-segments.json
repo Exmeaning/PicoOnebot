@@ -2,127 +2,109 @@
   {
     "chapter": "mobile-route",
     "step": 1,
-    "text": "旧安卓机还在吃灰？拿它给 AstrBot 挂个 QQ。",
+    "text": "旧安卓机还在吃灰？ 拿它给 AstrBot 挂个 QQ。 不用 Root，也不用 Xposed。",
     "audio": "mobile-route/1.mp3"
   },
   {
     "chapter": "mobile-route",
     "step": 2,
-    "text": "不用 Root，也不用 Xposed。这个方案叫 PicoOnebot。",
+    "text": "这个方案叫 PicoOnebot。 它跑在官方手表 QQ 里面。 对外提供 OneBot v11。",
     "audio": "mobile-route/2.mp3"
   },
   {
     "chapter": "mobile-route",
     "step": 3,
-    "text": "它跑在官方手表 QQ 里面。对外提供 OneBot v11。",
+    "text": "NapCat 的功能更全。 但它更适合桌面端。 PicoOnebot 走的是手机路线。",
     "audio": "mobile-route/3.mp3"
-  },
-  {
-    "chapter": "mobile-route",
-    "step": 4,
-    "text": "NapCat 的功能更全。但它更适合桌面端。PicoOnebot 走的是手机路线。",
-    "audio": "mobile-route/4.mp3"
   },
   {
     "chapter": "phone-setup",
     "step": 1,
-    "text": "先去 GitHub Releases。下载最新版 APK。项目名是 PicoOnebot。装好后直接打开。",
+    "text": "先去 GitHub Releases。 下载最新版 APK。 项目名是 PicoOnebot。 装好后直接打开。",
     "audio": "phone-setup/1.mp3"
   },
   {
     "chapter": "phone-setup",
     "step": 2,
-    "text": "这里有个前提。手机必须支持三十二位应用。纯六十四位机型可能装不上。",
+    "text": "这里有个前提。 手机必须支持三十二位应用。 纯六十四位机型可能装不上。",
     "audio": "phone-setup/2.mp3"
   },
   {
     "chapter": "phone-setup",
     "step": 3,
-    "text": "没有合适的旧手机也能用。Windows 和 macOS 可以跑安卓模拟器。Linux 可以跑项目提供的 Docker，里面自带安卓环境，只是开销会大一点。",
+    "text": "没有合适的旧手机也能用。 Windows 和 macOS 可以跑安卓模拟器。 Linux 可以跑项目提供的 Docker。 里面自带安卓环境，只是开销会大一点。",
     "audio": "phone-setup/3.mp3"
   },
   {
     "chapter": "phone-setup",
     "step": 4,
-    "text": "启动后把基础权限给它。如果全程只用这一台手机，浏览器打开一二七点零点零点一加六零九九。",
+    "text": "启动后把基础权限给它。 如果全程只用这一台手机， 浏览器打开一二七点零点零点一加六零九九。",
     "audio": "phone-setup/4.mp3"
   },
   {
     "chapter": "phone-setup",
     "step": 5,
-    "text": "初始密码是 picopico。第一次登录会要求改密码。",
+    "text": "初始密码是 picopico。 第一次登录会要求改密码。 改完就去扫码登录 QQ。",
     "audio": "phone-setup/5.mp3"
-  },
-  {
-    "chapter": "phone-setup",
-    "step": 6,
-    "text": "改完就去扫码登录 QQ。",
-    "audio": "phone-setup/6.mp3"
   },
   {
     "chapter": "bot-endpoint",
     "step": 1,
-    "text": "这里别搞混。PicoOnebot 跑在手机上。机器人框架可以跑在电脑或服务器上。",
+    "text": "这里别搞混。 PicoOnebot 跑在手机上。 机器人框架可以跑在电脑或服务器上。",
     "audio": "bot-endpoint/1.mp3"
   },
   {
     "chapter": "bot-endpoint",
     "step": 2,
-    "text": "机器人端只要准备一个 PicoOnebot 能访问的 OneBot v11 反向 WebSocket 入口。AstrBot 的具体配置这里不展开。",
+    "text": "机器人端只要准备一个 PicoOnebot 能访问的 OneBot v11 反向 WebSocket 入口。 AstrBot 的具体配置这里不展开。",
     "audio": "bot-endpoint/2.mp3"
   },
   {
     "chapter": "bot-endpoint",
     "step": 3,
-    "text": "这个入口不一定在同一个局域网。有公网可访问的地址，PicoOnebot 也能直接连。",
+    "text": "这个入口不一定在同一个局域网。 有公网可访问的地址， PicoOnebot 也能直接连。",
     "audio": "bot-endpoint/3.mp3"
   },
   {
     "chapter": "connect-test",
     "step": 1,
-    "text": "回到 PicoOnebot。打开网络配置。添加一条反向 WebSocket。",
+    "text": "回到 PicoOnebot。 打开“网络配置”。 添加一条反向 WebSocket。",
     "audio": "connect-test/1.mp3"
   },
   {
     "chapter": "connect-test",
     "step": 2,
-    "text": "目标地址填机器人真正提供的 ws 或 wss 地址。内网和公网都行，别填 127.0.0.1。",
+    "text": "目标地址填机器人真正提供的 ws 或 wss 地址。 内网和公网都行，别填 127.0.0.1。",
     "audio": "connect-test/2.mp3"
   },
   {
     "chapter": "connect-test",
     "step": 3,
-    "text": "对方如果设了 Token，PicoOnebot 里填同一个。没设就留空。",
+    "text": "对方如果设了 Token， PicoOnebot 里填同一个。 没设就留空。",
     "audio": "connect-test/3.mp3"
   },
   {
     "chapter": "connect-test",
     "step": 4,
-    "text": "保存配置就会热重载。不用重启 QQ。断线也会自动重连。",
+    "text": "保存配置就会热重载。 不用重启 QQ。 断线也会自动重连。",
     "audio": "connect-test/4.mp3"
   },
   {
     "chapter": "connect-test",
     "step": 5,
-    "text": "去机器人端看连接状态。OneBot v11 连接建立后，再发个唤醒词测试。能正常回复，这台手机就挂好了。",
+    "text": "去机器人端看连接状态。 OneBot v11 连接建立后， 再发个唤醒词测试。 能正常回复，这台手机就挂好了。",
     "audio": "connect-test/5.mp3"
   },
   {
     "chapter": "fit-and-limit",
     "step": 1,
-    "text": "它不是 NapCat 的完整复刻。",
+    "text": "它不是 NapCat 的完整复刻。 群管理能力还不齐。 旧手机免 Root 接 AstrBot。 这条路确实够省事。",
     "audio": "fit-and-limit/1.mp3"
   },
   {
     "chapter": "fit-and-limit",
     "step": 2,
-    "text": "群管理能力还不齐。旧手机免 Root 接 AstrBot。这条路确实够省事。",
+    "text": "项目地址就在 GitHub。 去搜 PicoOnebot。 安装包和对接文档都在那里。",
     "audio": "fit-and-limit/2.mp3"
-  },
-  {
-    "chapter": "fit-and-limit",
-    "step": 3,
-    "text": "项目地址就在 GitHub。去搜 PicoOnebot。安装包和对接文档都在那里。",
-    "audio": "fit-and-limit/3.mp3"
   }
 ]

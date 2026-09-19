@@ -30,7 +30,11 @@ function RouteArrow() {
 }
 
 export default function MobileRoute({ step }: ChapterStepProps) {
-  if (step === 0) {
+  // The supplied voice-over follows script.md's 3 blocks for this chapter.
+  // Keep the hook, then jump directly to the implementation and comparison scenes.
+  const sceneStep = step === 0 ? 0 : step + 1;
+
+  if (sceneStep === 0) {
     return (
       <section className="mr-scene mr-hook">
         <div className="mr-hook-device">
@@ -51,7 +55,7 @@ export default function MobileRoute({ step }: ChapterStepProps) {
     );
   }
 
-  if (step === 1) {
+  if (sceneStep === 1) {
     return (
       <section className="mr-scene mr-barriers">
         <div className="mr-barrier-word mr-barrier-word--left">
@@ -75,7 +79,7 @@ export default function MobileRoute({ step }: ChapterStepProps) {
     );
   }
 
-  if (step === 2) {
+  if (sceneStep === 2) {
     return (
       <section className="mr-scene mr-stack-scene">
         <div className="mr-stack-title">
@@ -108,7 +112,7 @@ export default function MobileRoute({ step }: ChapterStepProps) {
     );
   }
 
-  if (step === 3) {
+  if (sceneStep === 3) {
     return (
       <section className="mr-scene mr-compare">
         <div className="mr-compare-copy">

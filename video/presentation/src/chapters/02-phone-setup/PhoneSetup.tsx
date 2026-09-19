@@ -102,17 +102,31 @@ export default function PhoneSetup({ step }: ChapterStepProps) {
 
   if (step === 4) {
     return (
-      <section className="ps-scene ps-login-shot">
-        <div className="ps-browser-frame">
-          <div className="ps-browser-bar"><i /><i /><i /><span className="mono">http://127.0.0.1:6099</span></div>
-          <img src="/assets/webui-login.png" alt="PicoOnebot WebUI 登录页" />
+      <section className="ps-scene ps-auth-flow">
+        <div className="ps-auth-heading">
+          <span className="mono">FIRST LOGIN</span>
+          <h2>改密码。然后<em>扫码上线</em>。</h2>
         </div>
-        <div className="ps-login-callout">
-          <span className="mono">WEBUI PORT</span>
-          <strong className="hero-num">6099</strong>
-          <p>初始密码</p>
-          <b className="mono">picopico</b>
-          <small>首次登录后修改</small>
+        <div className="ps-auth-cards">
+          <div className="ps-auth-card ps-auth-card--login">
+            <div className="ps-auth-browser-bar"><i /><i /><i /><span className="mono">127.0.0.1:6099</span></div>
+            <img src="/assets/webui-login.png" alt="PicoOnebot WebUI 登录页" />
+            <div className="ps-auth-caption">
+              <span className="mono">01 · INITIAL PASSWORD</span>
+              <strong className="mono">picopico</strong>
+              <small>首次登录后修改</small>
+            </div>
+          </div>
+          <div className="ps-auth-arrow"><span>→</span><b className="mono">NEXT</b></div>
+          <div className="ps-auth-card ps-auth-card--qr">
+            <img src="/assets/webui-qr.png" alt="PicoOnebot 扫码登录页" />
+            <div className="ps-auth-qr-focus" />
+            <div className="ps-auth-caption">
+              <span className="mono">02 · QQ LOGIN</span>
+              <strong>扫码登录 QQ</strong>
+              <small>确认后协议端上线</small>
+            </div>
+          </div>
         </div>
       </section>
     );
