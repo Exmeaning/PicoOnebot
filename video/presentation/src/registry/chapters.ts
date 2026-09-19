@@ -3,10 +3,10 @@ import MobileRoute from "../chapters/01-mobile-route/MobileRoute";
 import { narrations as mobileRouteNarrations } from "../chapters/01-mobile-route/narrations";
 import PhoneSetup from "../chapters/02-phone-setup/PhoneSetup";
 import { narrations as phoneSetupNarrations } from "../chapters/02-phone-setup/narrations";
-import AstrbotSide from "../chapters/03-astrbot-side/AstrbotSide";
-import { narrations as astrbotSideNarrations } from "../chapters/03-astrbot-side/narrations";
-import ConnectTwoSides from "../chapters/04-connect-two-sides/ConnectTwoSides";
-import { narrations as connectTwoSidesNarrations } from "../chapters/04-connect-two-sides/narrations";
+import AstrbotSide from "../chapters/03-bot-endpoint/AstrbotSide";
+import { narrations as astrbotSideNarrations } from "../chapters/03-bot-endpoint/narrations";
+import ConnectTwoSides from "../chapters/04-connect-test/ConnectTwoSides";
+import { narrations as connectTwoSidesNarrations } from "../chapters/04-connect-test/narrations";
 import FitAndLimit from "../chapters/05-fit-and-limit/FitAndLimit";
 import { narrations as fitAndLimitNarrations } from "../chapters/05-fit-and-limit/narrations";
 
