@@ -101,3 +101,9 @@
 @keyframes ps-router-pulse { 0%, 100% { opacity: .25; } 50% { opacity: 1; box-shadow: 0 0 12px var(--accent-glow); } }
 @keyframes ps-ring { from { transform: scale(.72); opacity: .7; } to { transform: scale(1.08); opacity: 0; } }
 @keyframes ps-focus { from { opacity: 0; transform: scale(1.16); } to { opacity: 1; transform: scale(1); } }
+.ps-local-node { flex-direction: row; align-items: flex-start; }
+.ps-local-node > span { position: absolute; bottom: 43px; color: var(--text); font-size: 16px; font-weight: 700; }
+.ps-local-node > strong { bottom: 20px; }
+.ps-lan-option { position: absolute; right: 5px; top: 105px; width: 300px; padding: 20px 24px; display: flex; flex-direction: column; border: 2px dashed var(--rule); border-radius: 17px; background: var(--surface); }
+.ps-lan-option span { color: var(--text-mute); font-size: 14px; }
+.ps-lan-option strong { margin-top: 9px; color: var(--text-2); font-size: 17px; }

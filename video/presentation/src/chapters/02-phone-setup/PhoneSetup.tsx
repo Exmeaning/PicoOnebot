@@ -68,17 +68,18 @@ export default function PhoneSetup({ step }: ChapterStepProps) {
       <section className="ps-scene ps-lan">
         <div className="ps-lan-copy">
           <p className="mono">PHONE READY</p>
-          <h2>给权限。<br />再找到<em>局域网 IP</em>。</h2>
+          <h2>给权限。<br />手机里<em>直接打开</em>。</h2>
           <div className="ps-permissions">
             <span>基础运行权限</span><i className="ps-toggle"><b /></i><strong>ON</strong>
           </div>
         </div>
-        <div className="ps-lan-map">
+        <div className="ps-lan-map ps-local-map">
           <div className="ps-wifi-ring ps-wifi-ring--one" />
           <div className="ps-wifi-ring ps-wifi-ring--two" />
-          <div className="ps-phone-node"><MiniPhone label="192.168.1.x" /><span className="mono">PHONE / PICOONEBOT</span></div>
-          <div className="ps-router-node"><i /><i /><i /><strong className="mono">LAN ROUTER</strong></div>
-          <div className="ps-browser-node"><b className="mono">BROWSER</b><span>同一局域网</span></div>
+          <div className="ps-phone-node"><MiniPhone label="127.0.0.1" /><span className="mono">PHONE / PICOONEBOT</span></div>
+          <div className="ps-router-node ps-local-node"><i /><i /><strong className="mono">LOCALHOST</strong><span>同一台手机</span></div>
+          <div className="ps-browser-node"><b className="mono">BROWSER</b><span>127.0.0.1:6099</span></div>
+          <div className="ps-lan-option"><span>也可从其它设备访问</span><strong>手机 IP : 6099</strong></div>
           <svg viewBox="0 0 940 600" aria-hidden="true"><path d="M200 300 C360 300 350 150 500 150 S680 300 790 300"/><path d="M500 150 V450 H790"/></svg>
         </div>
       </section>
@@ -89,7 +90,7 @@ export default function PhoneSetup({ step }: ChapterStepProps) {
     return (
       <section className="ps-scene ps-login-shot">
         <div className="ps-browser-frame">
-          <div className="ps-browser-bar"><i /><i /><i /><span className="mono">http://192.168.1.x:6099</span></div>
+          <div className="ps-browser-bar"><i /><i /><i /><span className="mono">http://127.0.0.1:6099</span></div>
           <img src="/assets/webui-login.png" alt="PicoOnebot WebUI 登录页" />
         </div>
         <div className="ps-login-callout">

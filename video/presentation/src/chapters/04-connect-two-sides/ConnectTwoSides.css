@@ -15,3 +15,26 @@
 
 /* Final log verification overrides the earlier checklist layout. */
 .ct-success-board{position:relative;height:760px;padding:0;display:block;overflow:hidden;border:3px solid var(--text-2);border-radius:30px;background:var(--surface-2);box-shadow:var(--card-shadow)}.ct-log-head{height:80px;padding:0 34px;display:flex;align-items:center;gap:11px;border-bottom:2px dashed var(--rule);color:var(--text-mute);font-size:13px;letter-spacing:.1em}.ct-log-head i{width:13px;height:13px;border-radius:50%;background:var(--accent)}.ct-log-head i:nth-child(2){opacity:.6}.ct-log-head i:nth-child(3){opacity:.3}.ct-log-line{height:180px;margin:55px 44px 0;padding:35px;display:grid;grid-template-columns:75px 1fr 140px;align-items:center;gap:18px;border:3px solid var(--accent);border-radius:20px;background:var(--accent-soft);animation:ct-ok-in .75s .35s ease-out both}.ct-log-line>span{color:var(--accent);font-size:13px}.ct-log-line>strong{font-size:23px}.ct-log-line>b{padding:10px 12px;border-radius:99px;background:var(--accent);color:var(--surface);font-size:11px;text-align:center}.ct-success-board>.ct-message{position:absolute;left:44px;right:44px;bottom:60px;height:190px;margin:0}.ct-success-stamp{position:absolute;right:70px;top:315px;display:flex;align-items:center;gap:15px;transform:rotate(-4deg);color:var(--accent)}.ct-success-stamp span{width:65px;height:65px;display:grid;place-items:center;border:3px solid var(--accent);border-radius:50%;font-size:35px}.ct-success-stamp b{font-size:18px;line-height:1.35}
+.ct-url-protocol strong { display: flex; align-items: baseline; gap: 12px; font-size: 38px; }
+.ct-url-protocol strong small { color: var(--text-mute); font-family: var(--font-body); font-size: 15px; }
+.ct-route-choice { position: relative; z-index: 2; width: 280px; display: grid; grid-template-rows: 180px 42px 180px; align-items: center; text-align: center; }
+.ct-route-choice > div { height: 180px; padding: 28px 20px; display: flex; flex-direction: column; justify-content: center; border: 3px solid var(--text-faint); border-radius: 22px; background: var(--surface-2); }
+.ct-route-choice > div.is-public { border-color: var(--accent); background: var(--accent-soft); box-shadow: 0 12px 32px var(--accent-glow); }
+.ct-route-choice span { color: var(--text-mute); font-family: var(--font-mono); font-size: 11px; }
+.ct-route-choice strong { margin-top: 9px; font-family: var(--font-mono); font-size: 19px; }
+.ct-route-choice small { margin-top: 7px; color: var(--text-mute); font-size: 13px; }
+.ct-route-choice > b { color: var(--accent); font-size: 17px; }
+.ct-token-copy > p { margin-top: 26px; color: var(--text-2); font-size: 19px; line-height: 1.55; }
+.ct-local-compare { display: grid; grid-template-rows: 190px 190px 72px 150px; gap: 20px; align-content: center; }
+.ct-local-row, .ct-local-real { position: relative; z-index: 2; padding: 28px 35px; display: grid; grid-template-columns: 185px 1fr 170px 60px; align-items: center; gap: 18px; border: 3px solid var(--text-faint); border-radius: 23px; background: var(--surface-2); }
+.ct-local-row--ok { border-color: var(--accent); background: var(--accent-soft); }
+.ct-local-row > span, .ct-local-real > span { color: var(--text-mute); font-size: 11px; }
+.ct-local-row > strong { color: var(--accent); font-size: 27px; }
+.ct-local-row > b { font-size: 18px; }
+.ct-local-row > i, .ct-local-real > i { width: 48px; height: 48px; display: grid; place-items: center; border: 3px solid var(--accent); border-radius: 50%; color: var(--accent); font-size: 28px; font-style: normal; }
+.ct-local-row--bad { opacity: .7; }
+.ct-local-arrow { position: relative; z-index: 2; color: var(--accent); font-size: 44px; text-align: center; }
+.ct-local-real { grid-template-columns: 185px 1fr 60px; border-color: var(--accent); }
+.ct-local-real > strong { font-size: 22px; }
+.ct-local-compare > svg { position: absolute; inset: 0; width: 100%; height: 100%; color: var(--rule); z-index: 1; }
+.ct-local-compare > svg path { fill: none; stroke: currentColor; stroke-width: 3; stroke-dasharray: 12 10; }

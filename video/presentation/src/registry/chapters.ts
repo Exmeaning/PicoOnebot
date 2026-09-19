@@ -24,8 +24,8 @@ export const CHAPTERS: ChapterDef[] = [
     Component: PhoneSetup,
   },
   {
-    id: "astrbot-side",
-    title: "AstrBot 侧配置",
+    id: "bot-endpoint",
+    title: "机器人端只准备一个入口",
     narrations: astrbotSideNarrations,
     Component: AstrbotSide,
   },
