@@ -107,3 +107,28 @@
 .ps-lan-option { position: absolute; right: 5px; top: 105px; width: 300px; padding: 20px 24px; display: flex; flex-direction: column; border: 2px dashed var(--rule); border-radius: 17px; background: var(--surface); }
 .ps-lan-option span { color: var(--text-mute); font-size: 14px; }
 .ps-lan-option strong { margin-top: 9px; color: var(--text-2); font-size: 17px; }
+.ps-platforms { padding: 85px 110px; }
+.ps-platform-title { display: flex; align-items: end; justify-content: space-between; }
+.ps-platform-title > span { color: var(--accent); font-family: var(--font-mono); font-size: 15px; letter-spacing: .16em; }
+.ps-platform-title h2 { margin: 0; font-size: 68px; line-height: 1.12; text-align: right; }
+.ps-platform-grid { height: 650px; margin-top: 55px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 36px; }
+.ps-platform-card { position: relative; padding: 42px; display: flex; flex-direction: column; align-items: center; border: 3px solid var(--text-faint); border-radius: 28px; background: var(--surface-2); box-shadow: var(--card-shadow); }
+.ps-platform-card--phone { border-color: var(--accent); background: var(--accent-soft); box-shadow: 0 18px 45px var(--accent-glow); }
+.ps-platform-card > span { color: var(--text-mute); font-size: 11px; letter-spacing: .13em; }
+.ps-platform-card > strong { margin-top: 14px; font-size: 31px; }
+.ps-platform-card > small { margin-top: 30px; color: var(--text-2); font-size: 17px; }
+.ps-device-icon { position: relative; width: 145px; height: 265px; margin-top: 42px; border: 3px solid var(--accent); border-radius: 28px; background: var(--surface-2); }
+.ps-device-icon > i { position: absolute; left: 50%; top: 13px; width: 45px; height: 5px; transform: translateX(-50%); border-radius: 99px; background: var(--text-faint); }
+.ps-window-icon { position: relative; width: 250px; height: 185px; margin-top: 82px; display: grid; place-items: center; border: 3px solid var(--text-2); border-radius: 18px; }
+.ps-window-icon > i { position: absolute; top: 17px; width: 12px; height: 12px; border-radius: 50%; background: var(--accent); }
+.ps-window-icon > i:nth-child(1) { left: 20px; }.ps-window-icon > i:nth-child(2) { left: 42px; opacity: .6; }.ps-window-icon > i:nth-child(3) { left: 64px; opacity: .3; }
+.ps-window-icon > b { margin-top: 20px; font-family: var(--font-mono); color: var(--text-2); font-size: 20px; }
+.ps-docker-icon { width: 270px; height: 215px; margin-top: 65px; padding: 25px; display: flex; flex-direction: column; justify-content: center; border: 3px solid var(--text-2); border-radius: 20px; }
+.ps-docker-icon > i { height: 95px; display: grid; place-items: center; border: 3px dashed var(--accent); border-radius: 14px; background: var(--accent-soft); color: var(--accent); font-family: var(--font-mono); font-style: normal; font-weight: 700; }
+.ps-docker-icon > b { margin-top: 17px; color: var(--text-mute); font-family: var(--font-mono); font-size: 13px; text-align: center; }
+.ps-load { position: absolute; left: 40px; right: 40px; bottom: 35px; height: 9px; overflow: hidden; border-radius: 99px; background: var(--accent-soft); }
+.ps-load > b { display: block; width: 30%; height: 100%; background: var(--accent); }
+.ps-load--mid > b { width: 58%; }.ps-load--high > b { width: 84%; }
+.ps-platform-note { position: absolute; left: 50%; bottom: 38px; transform: translateX(-50%); display: flex; align-items: center; gap: 12px; color: var(--text-mute); font-size: 11px; }
+.ps-platform-note > i { width: 160px; height: 3px; background: var(--rule); }
+.ps-platform-note > b { color: var(--text-2); font-size: 13px; }

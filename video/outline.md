@@ -3,7 +3,7 @@
 > **标题**：免 Root 手机端挂 AstrBot 的方法
 > **主题**：`pico-pop`（Pico 萌系科技）—— 暖白画布、Pico 品牌粉与淡点阵网格，兼顾 B 站科技教程的清晰度和项目自身的萌系气质
 > **总时长**：约 3 分钟
-> **章节数**：5 章 / 22 步
+> **章节数**：5 章 / 21 步
 
 ---
 
@@ -22,11 +22,12 @@
 
 ---
 
-## 2. phone-setup — APK 安装与手机内登录（5 steps · ~40s）
+## 2. phone-setup — APK 安装与手机内登录（6 steps · ~50s）
 
 **信息池**：
 - 下载入口：GitHub Releases 的最新 PicoOnebot APK —— 来源 article §2
 - 架构前提：手表 QQ 底包依赖 `armeabi-v7a`，设备必须支持 32 位应用 —— 来源 article §2
+- 扩展平台：Windows / macOS 可使用 Android 模拟器；Linux / 服务器可使用内置 Android 环境的 Docker，代价是资源开销更大 —— 来源 article §2
 - 本机 WebUI：直接在运行 PicoOnebot 的手机浏览器访问 `http://127.0.0.1:6099` —— 来源 article §2
 - 跨设备 WebUI：同一局域网的其它设备使用 `http://<手机IP>:6099` —— 来源 article §2
 - 初始认证：默认密码 `picopico`，首次登录后修改；随后扫码登录 QQ —— 来源 article §2
@@ -34,9 +35,10 @@
 **开发计划**：
 - step 1 — GitHub Releases、PicoOnebot APK 与“安装 / 打开”操作路径
 - step 2 — 32 位支持条件与纯 64 位机型的兼容分界
-- step 3 — 基础权限与“手机内直接访问 / 其它设备局域网访问”两种控制台入口
-- step 4 — WebUI 登录画面、本机 `127.0.0.1:6099`、初始密码与首次改密提示
-- step 5 — 本地采集的扫码登录页面与 QQ 上线状态
+- step 3 — 真机 APK、Windows / macOS Android 模拟器、Linux Docker 三种运行路线及开销对照
+- step 4 — 基础权限与“手机内直接访问 / 其它设备局域网访问”两种控制台入口
+- step 5 — WebUI 登录画面、本机 `127.0.0.1:6099`、初始密码与首次改密提示
+- step 6 — 本地采集的扫码登录页面与 QQ 上线状态
 
 ---
 
@@ -56,25 +58,21 @@
 
 ---
 
-## 4. connect-test — PicoOnebot 回连与验证（7 steps · ~55s）
+## 4. connect-test — PicoOnebot 回连与验证（5 steps · ~40s）
 
 **信息池**：
 - PicoOnebot 入口：WebUI → 网络配置 → 添加反向 WebSocket —— 来源 article §4
-- 目标模板：机器人实际提供的 `ws://` 或 `wss://` 地址，路径与对方一致 —— 来源 article §4
-- 可达方式：局域网 IP 或公网域名 / IP 均可 —— 来源 article §4
-- 地址区分：`127.0.0.1:6099` 可用于手机浏览器进入本机 Pico 控制台；外部机器人的反向 WS 目标不能写 `127.0.0.1` —— 来源 article §2 / §4
+- 目标模板：机器人实际提供的 `ws://` 或 `wss://` 地址；局域网 IP 或公网域名 / IP 均可，外部机器人不要写 `127.0.0.1` —— 来源 article §4
 - 鉴权规则：对方设置 Token 时两端一致；未设置则留空 —— 来源 article §4
 - 保存行为：配置保存后热重载，无需重启 QQ，并自动重连 —— 来源 article §4
 - 成功标志：机器人端显示 OneBot v11 连接建立，消息测试可正常回复 —— 来源 article §5
 
 **开发计划**：
 - step 1 — 本地采集的 PicoOnebot“网络配置”页面与反向 WebSocket 入口
-- step 2 — 目标地址由协议、机器人地址和路径组成
-- step 3 — “局域网 IP / 公网入口”两种目标路径并列
-- step 4 — `127.0.0.1:6099` 控制台地址与反向 WS 目标地址的区别
-- step 5 — 可选 Token 的一致性检查
-- step 6 — 保存后热重载、无需重启 QQ、断线自动重连
-- step 7 — OneBot v11 已连接状态与群聊唤醒词正常回复
+- step 2 — 一屏带过目标地址：内网 / 公网均可，外部机器人不要写 `127.0.0.1`
+- step 3 — Token 的一致性检查
+- step 4 — 保存后热重载、无需重启 QQ、断线自动重连
+- step 5 — OneBot v11 已连接状态与群聊唤醒词正常回复
 
 ---
 
@@ -100,7 +98,7 @@
 - ✓ 项目定位与 NapCat 对照事实（README / article）
 
 ### 2. phone-setup
-- ✓ APK 安装与 32 位兼容信息（docs/deploy/apk.md）
+- ✓ APK 安装、32 位兼容与替代部署信息（docs/deploy/apk.md / docs/deploy/docker.md）
 - ✓ 脱敏采集的真实 WebUI 登录页与扫码页
 
 ### 3. bot-endpoint

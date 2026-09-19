@@ -65,6 +65,20 @@ export default function PhoneSetup({ step }: ChapterStepProps) {
 
   if (step === 2) {
     return (
+      <section className="ps-scene ps-platforms">
+        <div className="ps-platform-title"><span className="mono">MORE WAYS TO RUN</span><h2>不只旧手机。<br /><em>三条运行路线。</em></h2></div>
+        <div className="ps-platform-grid">
+          <div className="ps-platform-card ps-platform-card--phone"><span className="mono">ANDROID</span><strong>真机 APK</strong><div className="ps-device-icon"><i /></div><small>最轻量 · 推荐</small><div className="ps-load"><b /></div></div>
+          <div className="ps-platform-card"><span className="mono">WINDOWS / MACOS</span><strong>安卓模拟器</strong><div className="ps-window-icon"><i /><i /><i /><b>ANDROID</b></div><small>没有旧手机也能跑</small><div className="ps-load ps-load--mid"><b /></div></div>
+          <div className="ps-platform-card"><span className="mono">LINUX / SERVER</span><strong>Docker</strong><div className="ps-docker-icon"><i>ANDROID</i><b>CONTAINER</b></div><small>内置安卓环境 · 开销更大</small><div className="ps-load ps-load--high"><b /></div></div>
+        </div>
+        <div className="ps-platform-note"><span className="mono">RESOURCE COST</span><b>低</b><i /><b>高</b></div>
+      </section>
+    );
+  }
+
+  if (step === 3) {
+    return (
       <section className="ps-scene ps-lan">
         <div className="ps-lan-copy">
           <p className="mono">PHONE READY</p>
@@ -86,7 +100,7 @@ export default function PhoneSetup({ step }: ChapterStepProps) {
     );
   }
 
-  if (step === 3) {
+  if (step === 4) {
     return (
       <section className="ps-scene ps-login-shot">
         <div className="ps-browser-frame">
@@ -104,7 +118,7 @@ export default function PhoneSetup({ step }: ChapterStepProps) {
     );
   }
 
-  if (step === 4) {
+  if (step === 5) {
     return (
       <section className="ps-scene ps-qr-shot">
         <div className="ps-qr-browser">

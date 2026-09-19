@@ -38,3 +38,22 @@
 .ct-local-real > strong { font-size: 22px; }
 .ct-local-compare > svg { position: absolute; inset: 0; width: 100%; height: 100%; color: var(--rule); z-index: 1; }
 .ct-local-compare > svg path { fill: none; stroke: currentColor; stroke-width: 3; stroke-dasharray: 12 10; }
+.ct-quick { display: grid; grid-template-columns: 560px 1fr; gap: 75px; align-items: center; padding: 90px 110px; }
+.ct-quick-copy > span { color: var(--accent); font-family: var(--font-mono); font-size: 15px; letter-spacing: .16em; }
+.ct-quick-copy h2 { margin: 22px 0; font-size: 74px; line-height: 1.15; }
+.ct-quick-copy p { color: var(--text-2); font-size: 21px; }
+.ct-quick-board { position: relative; height: 780px; padding: 65px; display: grid; grid-template-rows: 165px 320px 120px; gap: 35px; border: 3px solid var(--text-2); border-radius: 30px; background: var(--surface-2); box-shadow: var(--card-shadow); }
+.ct-quick-field { position: relative; z-index: 2; padding: 30px 35px; display: flex; flex-direction: column; justify-content: center; border: 3px solid var(--accent); border-radius: 21px; background: var(--accent-soft); }
+.ct-quick-field > span { color: var(--text-mute); font-size: 15px; }
+.ct-quick-field > strong { margin-top: 14px; color: var(--accent); font-size: 27px; }
+.ct-quick-options { position: relative; z-index: 2; display: grid; grid-template-columns: 1fr 55px 1fr; align-items: center; gap: 20px; }
+.ct-quick-options > div { height: 190px; padding: 28px; display: flex; flex-direction: column; align-items: center; justify-content: center; border: 3px solid var(--text-faint); border-radius: 22px; background: var(--surface); }
+.ct-quick-options > div.is-public { border-color: var(--accent); background: var(--accent-soft); }
+.ct-quick-options span { color: var(--text-mute); font-size: 11px; }
+.ct-quick-options b { margin-top: 12px; color: var(--text); font-size: 22px; }
+.ct-quick-options > i { color: var(--accent); font-size: 19px; font-style: normal; text-align: center; }
+.ct-quick-warning { position: relative; z-index: 2; padding: 20px 27px; display: grid; grid-template-columns: 190px 1fr; align-items: center; border: 3px dashed var(--rule); border-radius: 18px; }
+.ct-quick-warning > span { color: var(--accent); font-size: 20px; }
+.ct-quick-warning > strong { font-size: 17px; }
+.ct-quick-board > svg { position: absolute; inset: 80px 65px; width: calc(100% - 130px); height: 650px; color: var(--rule); z-index: 1; }
+.ct-quick-board > svg path { fill: none; stroke: currentColor; stroke-width: 3; stroke-dasharray: 11 9; }
