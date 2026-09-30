@@ -79,7 +79,7 @@
 部署前可检测宿主机环境：
 
 ```bash
-bash docker/scripts/pico-host-check.sh
+curl -fsSL https://raw.githubusercontent.com/Exmeaning/PicoOnebot/main/docker/scripts/pico-host-check.sh | bash
 ```
 
 启动容器：
