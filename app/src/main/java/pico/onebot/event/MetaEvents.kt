@@ -51,19 +51,31 @@ object MetaEvents {
     private fun heartbeatLoop() {
         while (running) {
             val interval = Config.heartbeatInterval
+            if (interval <= 0L) {
+                try {
+                    Thread.sleep(5000L)
+                } catch (t: InterruptedException) {
+                    return
+                }
+                continue
+            }
             try {
                 Thread.sleep(interval)
             } catch (t: InterruptedException) {
                 return
             }
             if (!running) return
-            lastHeartbeatAt = System.currentTimeMillis()
-            EventBus.post(
-                Ob.event("meta_event")
-                    .put("meta_event_type", "heartbeat")
-                    .put("status", SystemActions.statusObject())
-                    .put("interval", interval)
-            )
+            try {
+                lastHeartbeatAt = System.currentTimeMillis()
+                EventBus.post(
+                    Ob.event("meta_event")
+                        .put("meta_event_type", "heartbeat")
+                        .put("status", SystemActions.statusObject())
+                        .put("interval", interval)
+                )
+            } catch (t: Throwable) {
+                PicoLog.w("heartbeat failed: " + t.message)
+            }
         }
     }
 }

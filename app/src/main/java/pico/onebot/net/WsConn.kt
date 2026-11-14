@@ -5,7 +5,10 @@ import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.Socket
-import java.util.concurrent.ArrayBlockingQueue
+import java.util.ArrayDeque
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.locks.ReentrantLock
 
 /**
  * 一条 WebSocket 连接(正向服务端接进来的,或反向客户端连出去的都用它)。
@@ -26,8 +29,19 @@ class WsConn(
 
     enum class Role { API, EVENT, BOTH }
 
+    private companion object {
+        const val PENDING_CAPACITY = 1024
+        const val PING_INTERVAL_MS = 20_000L
+        const val READ_IDLE_TIMEOUT_MS = 60_000
+        const val DROP_LOG_INTERVAL_MS = 5_000L
+    }
+
     private val writeLock = Object()
-    private val pending = ArrayBlockingQueue<String>(256)
+    private val queueLock = ReentrantLock()
+    private val notEmpty = queueLock.newCondition()
+    private val pending = ArrayDeque<String>(PENDING_CAPACITY)
+    private val droppedEvents = AtomicLong()
+    private val lastDropLogAt = AtomicLong()
     private val writer = Thread({ writeLoop() }, "pico-ws-send").apply { isDaemon = true }
 
     @Volatile
@@ -35,6 +49,11 @@ class WsConn(
         private set
 
     init {
+        try {
+            socket.keepAlive = true
+            socket.soTimeout = READ_IDLE_TIMEOUT_MS
+        } catch (_: Throwable) {
+        }
         writer.start()
     }
 
@@ -42,45 +61,88 @@ class WsConn(
     val wantsActions: Boolean get() = role == Role.API || role == Role.BOTH
 
     fun sendText(text: String): Boolean {
-        if (closed) return false
-        if (pending.offer(text)) return true
-        PicoLog.w("ws send queue full on $tag; disconnecting slow peer")
-        close()
-        return false
+        var droppedOldest = false
+        queueLock.lock()
+        try {
+            if (closed) return false
+            if (pending.size >= PENDING_CAPACITY) {
+                pending.removeFirst()
+                droppedOldest = true
+            }
+            pending.addLast(text)
+            notEmpty.signal()
+        } finally {
+            queueLock.unlock()
+        }
+        if (droppedOldest) {
+            val totalDropped = droppedEvents.incrementAndGet()
+            val now = System.currentTimeMillis()
+            val prev = lastDropLogAt.get()
+            if (now - prev >= DROP_LOG_INTERVAL_MS && lastDropLogAt.compareAndSet(prev, now)) {
+                PicoLog.w("ws send queue full on $tag; dropped oldest event (totalDropped=$totalDropped)")
+            }
+        }
+        return true
     }
 
     private fun writeLoop() {
+        var nextPingAt = System.currentTimeMillis() + PING_INTERVAL_MS
         try {
-            while (!closed) {
-                val text = pending.take()
-                if (!writeText(text)) return
+            while (true) {
+                val now = System.currentTimeMillis()
+                if (now >= nextPingAt) {
+                    if (!writeFrame(WsFrame.OP_PING, ByteArray(0))) return
+                    nextPingAt = System.currentTimeMillis() + PING_INTERVAL_MS
+                }
+                var text: String? = null
+                queueLock.lock()
+                try {
+                    while (!closed && pending.isEmpty()) {
+                        val waitMs = nextPingAt - System.currentTimeMillis()
+                        if (waitMs <= 0L) break
+                        notEmpty.await(waitMs, TimeUnit.MILLISECONDS)
+                    }
+                    if (closed) return
+                    text = pending.pollFirst()
+                } finally {
+                    queueLock.unlock()
+                }
+                if (text != null) {
+                    if (!writeFrame(WsFrame.OP_TEXT, text.toByteArray(Charsets.UTF_8))) return
+                }
             }
         } catch (_: InterruptedException) {
         }
     }
 
-    private fun writeText(text: String): Boolean {
+    private fun writeFrame(opcode: Int, payload: ByteArray): Boolean {
         return try {
             synchronized(writeLock) {
-                WsFrame.write(out, WsFrame.OP_TEXT, text.toByteArray(Charsets.UTF_8), maskOut)
+                WsFrame.write(out, opcode, payload, maskOut)
             }
             true
         } catch (t: Throwable) {
-            PicoLog.w("ws send failed on $tag: " + t.message)
+            if (!closed) PicoLog.w("ws send failed on $tag: " + t.message)
             close()
             false
         }
     }
 
     fun close() {
-        if (closed) return
-        closed = true
+        queueLock.lock()
+        try {
+            if (closed) return
+            closed = true
+            pending.clear()
+            notEmpty.signalAll()
+        } finally {
+            queueLock.unlock()
+        }
         try {
             socket.close()
         } catch (ignored: Throwable) {
         }
         writer.interrupt()
-        pending.clear()
     }
 
     /**
@@ -94,9 +156,7 @@ class WsConn(
             while (!closed) {
                 val f = WsFrame.read(ins)
                 when (f.opcode) {
-                    WsFrame.OP_PING -> synchronized(writeLock) {
-                        WsFrame.write(out, WsFrame.OP_PONG, f.payload, maskOut)
-                    }
+                    WsFrame.OP_PING -> if (!writeFrame(WsFrame.OP_PONG, f.payload)) return
                     WsFrame.OP_PONG -> Unit
                     WsFrame.OP_CLOSE -> return
                     WsFrame.OP_TEXT, WsFrame.OP_BIN -> {

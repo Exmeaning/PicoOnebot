@@ -143,12 +143,16 @@ object PicoBoot {
 
         MetaEvents.start()
 
-        // 延迟首探:别在宿主自己 init 内核之前去碰 KernelServiceUtil 的静态初始化
-        val delay = Config.long("kernel_probe_delay_ms", 5000)
-        try {
-            Thread.sleep(delay)
-        } catch (t: InterruptedException) {
-            return
+        // 延迟首探:别在宿主自己 init 内核之前去碰 KernelServiceUtil 的静态初始化;
+        // 旧版默认 5000ms 会拉长启动/自动登录时的监听盲窗,默认(含旧默认值 5000)收敛到 1000ms
+        val configuredDelay = Config.long("kernel_probe_delay_ms", 1000L)
+        val delay = (if (configuredDelay == 5000L) 1000L else configuredDelay).coerceAtLeast(0L)
+        if (delay > 0L) {
+            try {
+                Thread.sleep(delay)
+            } catch (t: InterruptedException) {
+                return
+            }
         }
         KernelGate.startWatch()
 

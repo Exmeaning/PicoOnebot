@@ -40,6 +40,17 @@ object KernelGate {
     var lastError: String = ""
         private set
 
+    private val watchWakeup = java.util.concurrent.Semaphore(0)
+
+    @Volatile
+    private var watchThread: Thread? = null
+
+    @Volatile
+    private var cachedSessionMethod: java.lang.reflect.Method? = null
+
+    @Volatile
+    private var cachedSessionField: java.lang.reflect.Field? = null
+
     private const val KERNEL_SERVICE_UTIL = "com.tencent.qqnt.msg.KernelServiceUtil"
 
     // ---------------- 状态机 ----------------
@@ -72,18 +83,33 @@ object KernelGate {
         Thread({ watchLoop() }, "pico-kernel-watch").apply { isDaemon = true }.start()
     }
 
+    private fun wakeWatch() {
+        if (Thread.currentThread() !== watchThread && watchWakeup.availablePermits() == 0) {
+            watchWakeup.release()
+        }
+    }
+
     private fun watchLoop() {
+        watchThread = Thread.currentThread()
         var delay = 200L
+        var prevState = state
         while (true) {
+            watchWakeup.drainPermits()
             try {
                 probe()
             } catch (t: Throwable) {
                 lastError = t.javaClass.simpleName + ": " + t.message
                 PicoLog.d("probe failed: " + lastError)
             }
-            delay = if (state == State.ONLINE) 5000L else minOf(delay * 2, 5000L)
+            val cur = state
+            delay = when (cur) {
+                State.ONLINE -> 5000L
+                State.SESSION_READY, State.LOGGED_IN -> 200L
+                else -> if (prevState == State.ONLINE) 200L else minOf(delay * 2, 1000L)
+            }
+            prevState = cur
             try {
-                Thread.sleep(delay)
+                watchWakeup.tryAcquire(delay, java.util.concurrent.TimeUnit.MILLISECONDS)
             } catch (t: InterruptedException) {
                 return
             }
@@ -92,15 +118,23 @@ object KernelGate {
 
     /** 一次探测:会话 → 登录态 → 监听器注册。每步都可独立失败并在下一轮重试。 */
     private fun probe() {
-        val s = session()
-        if (s == null || !loggedIn()) {
-            if (state == State.ONLINE || state == State.LOGGED_IN || state == State.SESSION_READY) {
-                onSessionLost(if (s == null) "no_session" else "not_logged_in")
+        val cached = sessionRef
+        val live = findSessionByReturnType()
+        if (live == null || !loggedIn()) {
+            if (state == State.ONLINE || state == State.LOGGED_IN || state == State.SESSION_READY ||
+                cached != null || listenerId != 0L
+            ) {
+                onSessionLost(if (live == null) "no_session" else "not_logged_in")
             } else if (state == State.INIT) {
                 setState(State.TRANSPORT_UP)
             }
             return
         }
+        if (cached != null && cached !== live) {
+            onSessionLost("session_replaced")
+        }
+        if (sessionRef !== live) sessionRef = live
+
         if (state == State.INIT || state == State.TRANSPORT_UP || state == State.LOGGED_OUT) {
             setState(State.SESSION_READY)
         }
@@ -128,13 +162,25 @@ object KernelGate {
 
     /** 被踢/会话失效时回落,下一轮探测会重新注册监听器。 */
     fun onSessionLost(reason: String) {
+        val oldId: Long
+        val oldSession: IQQNTWrapperSession?
+        synchronized(this) {
+            if (listenerId == 0L && sessionRef == null && state == State.LOGGED_OUT) return
+            oldId = listenerId
+            oldSession = sessionRef
+            listenerId = 0
+            sessionRef = null
+            selfUinCache = 0
+            selfUidCache = ""
+        }
         PicoLog.w("session lost: $reason")
-        listenerId = 0
+        if (oldId != 0L && oldSession != null) {
+            runCatching { oldSession.msgService?.removeKernelMsgListener(oldId) }
+                .onFailure { PicoLog.d("removeKernelMsgListener($oldId) ignored: ${it.message}") }
+        }
         ContactListeners.reset()
-        sessionRef = null
-        selfUinCache = 0
-        selfUidCache = ""
         setState(State.LOGGED_OUT)
+        wakeWatch()
     }
 
     // ---------------- 会话与服务 ----------------
@@ -155,6 +201,28 @@ object KernelGate {
         private set
 
     private fun findSessionByReturnType(): IQQNTWrapperSession? {
+        cachedSessionMethod?.let { m ->
+            try {
+                val v = m.invoke(null) as? IQQNTWrapperSession
+                if (v != null) {
+                    sessionProbe = "ok:method " + m.name + "()"
+                    return v
+                }
+            } catch (t: Throwable) {
+                cachedSessionMethod = null
+            }
+        }
+        cachedSessionField?.let { f ->
+            try {
+                val v = f.get(null) as? IQQNTWrapperSession
+                if (v != null) {
+                    sessionProbe = "ok:field " + f.name
+                    return v
+                }
+            } catch (t: Throwable) {
+                cachedSessionField = null
+            }
+        }
         val cls = try {
             Class.forName(KERNEL_SERVICE_UTIL)
         } catch (t: Throwable) {
@@ -171,6 +239,7 @@ object KernelGate {
                 m.isAccessible = true
                 val v = m.invoke(null)
                 if (v != null) {
+                    cachedSessionMethod = m
                     sessionProbe = "ok:method " + m.name + "()"
                     return v as IQQNTWrapperSession
                 }
@@ -183,6 +252,7 @@ object KernelGate {
                 f.isAccessible = true
                 val v = f.get(null)
                 if (v != null) {
+                    cachedSessionField = f
                     sessionProbe = "ok:field " + f.name
                     return v as IQQNTWrapperSession
                 }

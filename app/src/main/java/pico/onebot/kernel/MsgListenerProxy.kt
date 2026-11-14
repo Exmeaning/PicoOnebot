@@ -67,7 +67,7 @@ object MsgListenerProxy {
 
         private fun dispatch(name: String, args: Array<out Any?>?) {
             when (name) {
-                "onRecvMsg", "onMsgInfoListAdd", "onRecvOnlineFileMsg" ->
+                "onRecvMsg", "onMsgInfoListAdd", "onRecvOnlineFileMsg", "onFileMsgCome" ->
                     records(args)?.let { MsgPipeline.onIncoming(name, it) }
 
                 "onMsgInfoListUpdate" ->
@@ -93,6 +93,12 @@ object MsgListenerProxy {
                     args?.getOrNull(2) as? Int ?: 0,
                     args?.getOrNull(3) as? String ?: ""
                 )
+
+                "onNtMsgSyncStart", "onNtMsgSyncEnd", "onNtFirstViewMsgSyncEnd" ->
+                    PicoLog.d("kernel sync event: $name")
+
+                "onUserOnlineStatusChanged" ->
+                    PicoLog.i("kernel user online status changed: online=${args?.getOrNull(0)}")
             }
         }
 

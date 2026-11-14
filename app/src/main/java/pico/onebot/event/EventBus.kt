@@ -13,11 +13,14 @@ import java.util.concurrent.atomic.AtomicLong
  */
 object EventBus {
 
+    private val offerLock = Any()
+
     private lateinit var queue: ArrayBlockingQueue<JSONObject>
 
     private val posted = AtomicLong()
     private val dropped = AtomicLong()
     private val delivered = AtomicLong()
+    private val noConsumer = AtomicLong()
 
     @Volatile
     private var running = false
@@ -33,10 +36,10 @@ object EventBus {
     fun post(event: JSONObject) {
         if (!running) return
         posted.incrementAndGet()
-        if (!queue.offer(event)) {
-            queue.poll()
-            dropped.incrementAndGet()
-            queue.offer(event)
+        synchronized(offerLock) {
+            while (!queue.offer(event)) {
+                if (queue.poll() != null) dropped.incrementAndGet()
+            }
         }
     }
 
@@ -45,14 +48,27 @@ object EventBus {
             val e = try {
                 queue.take()
             } catch (t: InterruptedException) {
-                return
+                if (!running) return
+                PicoLog.w("event bus interrupted while running, continuing")
+                continue
+            } catch (t: Throwable) {
+                PicoLog.w("event bus take failed", t)
+                continue
             }
             try {
                 val text = e.toString()
+                val hasConsumers = Transport.count() > 0 || pico.onebot.net.HttpReporter.targetCount() > 0
                 Transport.broadcast(text)
                 pico.onebot.net.HttpReporter.offer(text)
-                delivered.incrementAndGet()
-                if (e.optString("post_type") != "meta_event") PicoLog.d("event -> " + brief(e))
+                if (hasConsumers) {
+                    delivered.incrementAndGet()
+                    if (e.optString("post_type") != "meta_event") PicoLog.d("event -> " + brief(e))
+                } else {
+                    noConsumer.incrementAndGet()
+                    if (e.optString("post_type") != "meta_event") {
+                        PicoLog.w("event has no active WS/HTTP consumer: " + brief(e))
+                    }
+                }
             } catch (t: Throwable) {
                 PicoLog.w("event dispatch failed", t)
             }
@@ -73,6 +89,7 @@ object EventBus {
     fun stats(): JSONObject = JSONObject()
         .put("posted", posted.get())
         .put("delivered", delivered.get())
+        .put("no_consumer", noConsumer.get())
         .put("dropped", dropped.get())
         .put("pending", if (running) queue.size else 0)
         .put("capacity", if (running) Config.eventQueueSize else 0)

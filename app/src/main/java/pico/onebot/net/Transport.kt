@@ -1,6 +1,9 @@
 package pico.onebot.net
 
+import org.json.JSONObject
+import pico.onebot.core.Config
 import pico.onebot.core.PicoLog
+import java.util.ArrayDeque
 import java.util.concurrent.CopyOnWriteArrayList
 
 /**
@@ -9,11 +12,23 @@ import java.util.concurrent.CopyOnWriteArrayList
  */
 object Transport {
 
+    private const val REPLAY_CAPACITY = 256
+    private const val REPLAY_MAX_AGE_MS = 60_000L
+
+    private data class BufferedEvent(val text: String, val ts: Long)
+
     private val conns = CopyOnWriteArrayList<WsConn>()
+    private val lock = Any()
+    private val replayBuffer = ArrayDeque<BufferedEvent>(REPLAY_CAPACITY)
 
     fun add(c: WsConn) {
-        conns.add(c)
-        PicoLog.i("ws connected: " + c.tag + " role=" + c.role + " total=" + conns.size)
+        synchronized(lock) {
+            conns.add(c)
+            PicoLog.i("ws connected: " + c.tag + " role=" + c.role + " total=" + conns.size)
+            if (c.wantsEvents && Config.enabled && !c.closed && replayBuffer.isNotEmpty()) {
+                drainReplayLocked(c)
+            }
+        }
     }
 
     fun remove(c: WsConn) {
@@ -23,13 +38,62 @@ object Transport {
     }
 
     fun broadcast(text: String) {
-        for (c in conns) {
-            if (c.closed) {
-                remove(c)
-                continue
+        synchronized(lock) {
+            var delivered = false
+            for (c in conns) {
+                if (c.closed) {
+                    remove(c)
+                    continue
+                }
+                if (c.wantsEvents && c.sendText(text)) {
+                    delivered = true
+                }
             }
-            if (c.wantsEvents) c.sendText(text)
+            if (!delivered && Config.enabled && !isMetaEvent(text)) {
+                enqueueReplayLocked(text)
+            }
         }
+    }
+
+    private fun enqueueReplayLocked(text: String) {
+        val now = System.currentTimeMillis()
+        pruneExpiredLocked(now)
+        while (replayBuffer.size >= REPLAY_CAPACITY) {
+            replayBuffer.removeFirst()
+        }
+        replayBuffer.addLast(BufferedEvent(text, now))
+    }
+
+    private fun drainReplayLocked(c: WsConn) {
+        val now = System.currentTimeMillis()
+        pruneExpiredLocked(now)
+        var replayed = 0
+        while (replayBuffer.isNotEmpty()) {
+            val ev = replayBuffer.peekFirst()
+            if (!c.sendText(ev.text)) break
+            replayBuffer.removeFirst()
+            replayed++
+        }
+        if (replayed > 0) {
+            PicoLog.i("replayed $replayed buffered event(s) to " + c.tag)
+        }
+    }
+
+    private fun pruneExpiredLocked(now: Long) {
+        while (replayBuffer.isNotEmpty()) {
+            val head = replayBuffer.peekFirst()
+            if (now - head.ts > REPLAY_MAX_AGE_MS) {
+                replayBuffer.removeFirst()
+            } else {
+                break
+            }
+        }
+    }
+
+    private fun isMetaEvent(text: String): Boolean = try {
+        JSONObject(text).optString("post_type") == "meta_event"
+    } catch (_: Throwable) {
+        false
     }
 
     fun count(): Int = conns.size
@@ -43,5 +107,10 @@ object Transport {
     fun closeAll() {
         for (c in conns) c.close()
         conns.clear()
+        if (!Config.enabled) {
+            synchronized(lock) {
+                replayBuffer.clear()
+            }
+        }
     }
 }

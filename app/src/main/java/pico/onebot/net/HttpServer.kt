@@ -16,6 +16,11 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.net.URLDecoder
 import java.security.MessageDigest
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.ThreadFactory
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * 一个端口同时承载:正向 WebSocket(`/`、`/api`、`/event`)、
@@ -37,6 +42,18 @@ class HttpServer(
 
     private companion object {
         const val WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+        const val HTTP_READ_TIMEOUT_MS = 30_000
+        val actionThreadSeq = AtomicInteger()
+        val actionExecutor = ThreadPoolExecutor(
+            2,
+            16,
+            60L,
+            TimeUnit.SECONDS,
+            ArrayBlockingQueue(256),
+            ThreadFactory { r ->
+                Thread(r, "pico-ws-act-" + actionThreadSeq.incrementAndGet()).apply { isDaemon = true }
+            }
+        ).apply { allowCoreThreadTimeOut(true) }
     }
 
     @Volatile
@@ -82,6 +99,8 @@ class HttpServer(
         var handedOff = false
         try {
             sock.tcpNoDelay = true
+            sock.keepAlive = true
+            sock.soTimeout = HTTP_READ_TIMEOUT_MS
             val ins = BufferedInputStream(sock.getInputStream(), 8192)
             val out = sock.getOutputStream()
 
@@ -237,11 +256,26 @@ class HttpServer(
         }
     }
 
-    /** 收到一条动作请求文本(正向 WS / 反向 WS 共用)。 */
+    /** 收到一条动作请求文本(正向 WS / 反向 WS 共用);派发到工作线程池避免阻塞 WS 读循环。 */
     fun onActionText(conn: WsConn, text: String) {
-        if (!conn.wantsActions) return
-        val reply = handleActionJson(text)
-        if (reply != null) conn.sendText(reply.toString())
+        if (!conn.wantsActions || conn.closed) return
+        try {
+            actionExecutor.execute {
+                try {
+                    if (conn.closed) return@execute
+                    val reply = handleActionJson(text)
+                    if (reply != null && !conn.closed) conn.sendText(reply.toString())
+                } catch (t: Throwable) {
+                    PicoLog.w("ws action dispatch failed: " + t.message)
+                }
+            }
+        } catch (_: Throwable) {
+            PicoLog.w("ws action queue full on " + conn.tag)
+            val echo = try { JSONObject(text).opt("echo") } catch (_: Throwable) { null }
+            val err = Ob.failed(10001, "action executor busy")
+            if (echo != null) err.put("echo", echo)
+            if (!conn.closed) conn.sendText(err.toString())
+        }
     }
 
     // ---------------- HTTP ----------------

@@ -16,26 +16,42 @@ import java.util.concurrent.atomic.AtomicLong
 object NickStore {
 
     private const val CAP = 2000
+    private const val NEGATIVE_TTL_MS = 30_000L
+    private const val NEGATIVE_CAP = 2000
 
-    private val cache = HashMap<String, String>()
+    private val cache = object : LinkedHashMap<String, String>(256, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean = size > CAP
+    }
+    private val negCache = object : LinkedHashMap<String, Long>(128, 0.75f, false) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Long>?): Boolean = size > NEGATIVE_CAP
+    }
     private val hits = AtomicLong()
     private val misses = AtomicLong()
 
     fun of(uid: String?): String {
         if (uid.isNullOrEmpty()) return ""
+        val now = System.currentTimeMillis()
         synchronized(cache) {
             cache[uid]?.let {
                 hits.incrementAndGet()
                 return it
             }
+            negCache[uid]?.let { failedAt ->
+                if (now - failedAt < NEGATIVE_TTL_MS) {
+                    misses.incrementAndGet()
+                    return ""
+                }
+                negCache.remove(uid)
+            }
         }
         val found = lookup(uid)
         if (found.isEmpty()) {
             misses.incrementAndGet()
+            synchronized(cache) { negCache[uid] = System.currentTimeMillis() }
             return ""
         }
         synchronized(cache) {
-            if (cache.size >= CAP) cache.clear()
+            negCache.remove(uid)
             cache[uid] = found
         }
         return found
@@ -45,8 +61,8 @@ object NickStore {
     fun feed(uid: String?, name: String?) {
         if (uid.isNullOrEmpty() || name.isNullOrEmpty()) return
         synchronized(cache) {
+            negCache.remove(uid)
             if (cache.containsKey(uid)) return
-            if (cache.size >= CAP) cache.clear()
             cache[uid] = name
         }
     }

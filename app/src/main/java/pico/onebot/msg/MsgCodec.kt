@@ -205,7 +205,15 @@ object MsgCodec {
 
         T_GREY_TIP -> null // 灰条(撤回提示/拍一拍)走 notice,不进 message
 
-        else -> null
+        else -> {
+            val md = e.markdownElement?.content
+            if (!md.isNullOrEmpty()) {
+                seg("text", JSONObject().put("text", md))
+            } else {
+                PicoLog.w("unmapped msg element type=" + e.elementType + " msgId=" + (ctx?.msgId ?: 0L))
+                null
+            }
+        }
     }
 
     /**
@@ -485,18 +493,31 @@ object MsgCodec {
         return NickStore.of(rec.senderUid)
     }
 
-    fun toMessageBody(rec: MsgRecord): JSONObject {
+    fun toMessageBody(rec: MsgRecord): JSONObject? {
         UinUidStore.feed(rec.senderUid, rec.senderUin)
         if (rec.chatType == 1) UinUidStore.feed(rec.peerUid, rec.peerUin)
 
         val segments = toSegments(rec.elements, rec)
-        // senderUin 为 0 且 uid 映射还没热时,至少认得出"是我自己发的",
-        // 否则自发消息会带着 user_id=0 出去,上游框架无从判断。
-        val senderUin = if (rec.senderUin > 0) rec.senderUin else {
-            val mapped = UinUidStore.uin(rec.senderUid)
-            if (mapped > 0) mapped
-            else if (!rec.senderUid.isNullOrEmpty() && rec.senderUid == KernelGate.selfUid()) KernelGate.selfUin()
-            else 0L
+        if (segments.length() == 0) return null
+        // senderUin 为 0 且 uid 映射还没热时,至少认得出"是我自己发的"或私聊对端,
+        // 否则消息会带着 user_id=0 出去,上游框架无从判断甚至丢弃。
+        val senderUin = when {
+            rec.senderUin > 0L -> rec.senderUin
+            else -> {
+                val mapped = UinUidStore.uin(rec.senderUid)
+                when {
+                    mapped > 0L -> mapped
+                    !rec.senderUid.isNullOrEmpty() && rec.senderUid == KernelGate.selfUid() -> KernelGate.selfUin()
+                    rec.chatType != 2 && rec.peerUin > 0L && !rec.senderUid.isNullOrEmpty() && rec.senderUid == rec.peerUid -> {
+                        UinUidStore.feed(rec.senderUid, rec.peerUin)
+                        rec.peerUin
+                    }
+                    else -> {
+                        PicoLog.w("sender uin unresolved msgId=" + rec.msgId + " chat=" + rec.chatType)
+                        0L
+                    }
+                }
+            }
         }
         val peerUin = if (rec.peerUin > 0) rec.peerUin else UinUidStore.uin(rec.peerUid)
         val entry = MsgIdStore.assign(

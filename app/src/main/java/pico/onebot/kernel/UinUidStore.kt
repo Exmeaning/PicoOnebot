@@ -5,6 +5,9 @@ import pico.onebot.core.Config
 import pico.onebot.core.PicoLog
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -16,14 +19,24 @@ import java.util.concurrent.atomic.AtomicLong
  */
 object UinUidStore {
 
+    private const val NEGATIVE_TTL_MS = 30_000L
+    private const val NEGATIVE_CAP = 2000
+
     private val uidToUin = ConcurrentHashMap<String, Long>()
     private val uinToUid = ConcurrentHashMap<Long, String>()
+    private val negUidMiss = ConcurrentHashMap<String, Long>()
+    private val negUinMiss = ConcurrentHashMap<Long, Long>()
 
     private val hits = AtomicLong()
     private val misses = AtomicLong()
 
     private var file: File? = null
-    private var dirty = 0
+    private val dirty = AtomicInteger()
+    private val saveScheduled = AtomicBoolean(false)
+    private val saveLock = Any()
+    private val ioExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "pico-uinuid-io").apply { isDaemon = true }
+    }
 
     fun load() {
         val f = File(Config.dataDir, "uinuid.json")
@@ -45,9 +58,14 @@ object UinUidStore {
 
     fun feed(uid: String?, uin: Long, persist: Boolean = true) {
         if (uid.isNullOrEmpty() || uin <= 0) return
+        negUidMiss.remove(uid)
+        negUinMiss.remove(uin)
         val known = uidToUin.put(uid, uin)
         uinToUid[uin] = uid
-        if (persist && known == null && ++dirty >= 50) save()
+        if (persist && known == null && dirty.incrementAndGet() >= 50) {
+            dirty.set(0)
+            saveAsync()
+        }
     }
 
     /** uid → uin,缓存未命中时问内核。 */
@@ -57,14 +75,27 @@ object UinUidStore {
             hits.incrementAndGet()
             return it
         }
+        val now = System.currentTimeMillis()
+        negUidMiss[uid]?.let { failedAt ->
+            if (now - failedAt < NEGATIVE_TTL_MS) {
+                misses.incrementAndGet()
+                return 0
+            }
+            negUidMiss.remove(uid, failedAt)
+        }
         misses.incrementAndGet()
         val svc = KernelGate.profileService() ?: return 0
         return try {
             val map = svc.getUinByUid("", arrayListOf(uid))
             val uin = map?.get(uid) ?: 0L
-            if (uin > 0) feed(uid, uin)
+            if (uin > 0) {
+                feed(uid, uin)
+            } else {
+                recordUidMiss(uid, now)
+            }
             uin
         } catch (t: Throwable) {
+            recordUidMiss(uid, now)
             PicoLog.d("getUinByUid failed: " + t.message)
             0
         }
@@ -77,16 +108,50 @@ object UinUidStore {
             hits.incrementAndGet()
             return it
         }
+        val now = System.currentTimeMillis()
+        negUinMiss[uin]?.let { failedAt ->
+            if (now - failedAt < NEGATIVE_TTL_MS) {
+                misses.incrementAndGet()
+                return ""
+            }
+            negUinMiss.remove(uin, failedAt)
+        }
         misses.incrementAndGet()
         val svc = KernelGate.profileService() ?: return ""
         return try {
             val map = svc.getUidByUin("", arrayListOf(uin))
             val uid = map?.get(uin) ?: ""
-            if (uid.isNotEmpty()) feed(uid, uin)
+            if (uid.isNotEmpty()) {
+                feed(uid, uin)
+            } else {
+                recordUinMiss(uin, now)
+            }
             uid
         } catch (t: Throwable) {
+            recordUinMiss(uin, now)
             PicoLog.d("getUidByUin failed: " + t.message)
             ""
+        }
+    }
+
+    private fun recordUidMiss(uid: String, now: Long) {
+        if (negUidMiss.size >= NEGATIVE_CAP) negUidMiss.clear()
+        negUidMiss[uid] = now
+    }
+
+    private fun recordUinMiss(uin: Long, now: Long) {
+        if (negUinMiss.size >= NEGATIVE_CAP) negUinMiss.clear()
+        negUinMiss[uin] = now
+    }
+
+    private fun saveAsync() {
+        if (!saveScheduled.compareAndSet(false, true)) return
+        ioExecutor.execute {
+            try {
+                save()
+            } finally {
+                saveScheduled.set(false)
+            }
         }
     }
 
@@ -95,16 +160,22 @@ object UinUidStore {
         .put("hits", hits.get())
         .put("misses", misses.get())
 
-    @Synchronized
     fun save() {
         val f = file ?: return
-        dirty = 0
-        try {
-            val o = JSONObject()
-            for ((uid, uin) in uidToUin) o.put(uid, uin)
-            f.writeText(o.toString())
-        } catch (t: Throwable) {
-            PicoLog.w("uid/uin cache save failed", t)
+        dirty.set(0)
+        synchronized(saveLock) {
+            try {
+                val o = JSONObject()
+                for ((uid, uin) in uidToUin) o.put(uid, uin)
+                val tmp = File(f.parentFile, f.name + ".tmp")
+                tmp.writeText(o.toString())
+                if (!tmp.renameTo(f)) {
+                    f.writeText(o.toString())
+                    tmp.delete()
+                }
+            } catch (t: Throwable) {
+                PicoLog.w("uid/uin cache save failed", t)
+            }
         }
     }
 }

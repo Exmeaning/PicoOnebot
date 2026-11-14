@@ -26,6 +26,8 @@ object MsgPipeline {
     private val recalled = LinkedHashSet<Long>()
 
 
+    private val queueLock = Any()
+
     private lateinit var queue: ArrayBlockingQueue<Job>
 
     private val enqueued = AtomicLong()
@@ -106,10 +108,10 @@ object MsgPipeline {
     private fun offer(job: Job) {
         if (!running) return
         enqueued.incrementAndGet()
-        if (!queue.offer(job)) {
-            queue.poll()
-            droppedIn.incrementAndGet()
-            queue.offer(job)
+        synchronized(queueLock) {
+            while (!queue.offer(job)) {
+                if (queue.poll() != null) droppedIn.incrementAndGet()
+            }
         }
     }
 
@@ -120,7 +122,12 @@ object MsgPipeline {
             val job = try {
                 queue.take()
             } catch (t: InterruptedException) {
-                return
+                if (!running) return
+                PicoLog.w("msgpipe interrupted while running, continuing")
+                continue
+            } catch (t: Throwable) {
+                PicoLog.w("msgpipe take failed", t)
+                continue
             }
             for (r in job.records) {
                 try {
@@ -141,13 +148,20 @@ object MsgPipeline {
             return
         }
         if (rec.msgId == 0L) noMsgId.incrementAndGet()
-        if (!markSeen(rec.msgId)) return
+        if (seenContains(rec.msgId)) return
 
         val isSelf = isSelfSent(rec)
-        if (isSelf && !Config.reportSelfMessage) return
+        if (isSelf && !Config.reportSelfMessage) {
+            markSeen(rec.msgId)
+            return
+        }
         PicoLog.d((if (isSelf) "self " else "recv ") + digest(rec))
 
-        val body = MsgCodec.toMessageBody(rec)
+        val body = MsgCodec.toMessageBody(rec) ?: run {
+            droppedJunk.incrementAndGet()
+            PicoLog.d("drop empty decoded record " + digest(rec))
+            return
+        }
         val event = Ob.event(if (isSelf) "message_sent" else "message")
         val keys = body.keys()
         while (keys.hasNext()) {
@@ -163,6 +177,7 @@ object MsgPipeline {
                 if (target > 0) event.put("target_id", target)
             }
         }
+        if (!markSeen(rec.msgId)) return
         converted.incrementAndGet()
         pico.onebot.core.Counters.onRecv()
         EventBus.post(event)
@@ -188,8 +203,8 @@ object MsgPipeline {
             EventBus.post(event)
             return
         }
-        // 未被去重闸放行过的更新(例如离线消息先 update 后 add)也要能成为 message
-        if (!seenContains(rec.msgId) && rec.elements != null && rec.elements.isNotEmpty()) {
+        // 未被去重闸放行过的更新(例如离线消息先 update 后 add,或初始空记录后续补齐)也要能成为 message
+        if (rec.recallTime <= 0 && !seenContains(rec.msgId) && (rec.elements?.size ?: 0) > 0) {
             handleIncoming(rec)
         }
     }

@@ -10,6 +10,10 @@ import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.ThreadFactory
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
@@ -27,12 +31,26 @@ object HttpReporter {
 
     private data class Target(val url: String, val token: String, val secret: String)
 
+    private class HttpStatusException(val code: Int, message: String) : java.io.IOException(message)
+
     private lateinit var queue: ArrayBlockingQueue<String>
+    private val queueLock = Any()
 
     private val posted = AtomicLong()
     private val failed = AtomicLong()
     private val dropped = AtomicLong()
     private val quickOps = AtomicLong()
+    private val quickOpSeq = AtomicInteger()
+    private val quickOpExecutor = ThreadPoolExecutor(
+        2,
+        8,
+        60L,
+        TimeUnit.SECONDS,
+        ArrayBlockingQueue(128),
+        ThreadFactory { r ->
+            Thread(r, "pico-quickop-" + quickOpSeq.incrementAndGet()).apply { isDaemon = true }
+        }
+    ).apply { allowCoreThreadTimeOut(true) }
 
     @Volatile
     private var running = false
@@ -40,21 +58,43 @@ object HttpReporter {
     @Volatile
     private var targets: List<Target> = emptyList()
 
+    private var worker: Thread? = null
+
     @Synchronized
     fun start() {
         val configured = Config.httpClients()
-        targets = (0 until configured.length()).mapNotNull { i ->
+        val nextTargets = (0 until configured.length()).mapNotNull { i ->
             val item = configured.optJSONObject(i) ?: return@mapNotNull null
             if (!item.optBoolean("enabled", true)) return@mapNotNull null
             val url = item.optString("url", "")
             if (url.isBlank()) return@mapNotNull null
             Target(url, item.optString("token", ""), item.optString("secret", ""))
         }
-        if (running || targets.isEmpty()) return
-        queue = ArrayBlockingQueue(Config.int("post_queue_size", 1024))
+        targets = nextTargets
+        if (nextTargets.isEmpty()) {
+            stop()
+            return
+        }
+        if (running) return
+        synchronized(queueLock) {
+            if (!::queue.isInitialized) {
+                queue = ArrayBlockingQueue(Config.int("post_queue_size", 1024))
+            }
+        }
         running = true
-        Thread({ pump() }, "pico-report").apply { isDaemon = true }.start()
-        PicoLog.i("http report targets: " + targets.joinToString(", ") { it.url })
+        worker = Thread({ pump() }, "pico-report").apply { isDaemon = true; start() }
+        PicoLog.i("http report targets: " + nextTargets.joinToString(", ") { it.url })
+    }
+
+    @Synchronized
+    fun stop() {
+        running = false
+        targets = emptyList()
+        worker?.interrupt()
+        worker = null
+        synchronized(queueLock) {
+            if (::queue.isInitialized) queue.clear()
+        }
     }
 
     /** 当前真正会收到事件的上报地址数量。 */
@@ -65,11 +105,14 @@ object HttpReporter {
 
     /** 事件分发线程调用:只入队。队列满时丢**最老的**,保证新事件优先送达。 */
     fun offer(text: String) {
-        if (!running) return
-        if (!queue.offer(text)) {
-            queue.poll()
-            dropped.incrementAndGet()
-            queue.offer(text)
+        if (!running || targets.isEmpty()) return
+        synchronized(queueLock) {
+            if (!running || targets.isEmpty() || !::queue.isInitialized) return
+            if (!queue.offer(text)) {
+                queue.poll()
+                dropped.incrementAndGet()
+                queue.offer(text)
+            }
         }
     }
 
@@ -81,15 +124,57 @@ object HttpReporter {
                 return
             }
             for (target in targets) {
-                try {
-                    val reply = postOnce(target, text)
-                    posted.incrementAndGet()
-                    if (!reply.isNullOrBlank()) applyQuickOperation(text, reply)
-                } catch (t: Throwable) {
+                if (!running) return
+                postWithRetry(target, text)
+            }
+        }
+    }
+
+    private fun postWithRetry(target: Target, text: String) {
+        val backoffs = longArrayOf(200L, 500L)
+        var attempt = 0
+        while (true) {
+            try {
+                val reply = postOnce(target, text)
+                posted.incrementAndGet()
+                if (!reply.isNullOrBlank()) dispatchQuickOp(text, reply)
+                return
+            } catch (e: HttpStatusException) {
+                if (e.code in 400..499 || attempt >= backoffs.size || !running) {
+                    failed.incrementAndGet()
+                    PicoLog.w("report to ${target.url} failed: " + e.message)
+                    return
+                }
+                PicoLog.d("report to ${target.url} retry #${attempt + 1}: " + e.message)
+            } catch (t: Throwable) {
+                if (t !is java.io.IOException || attempt >= backoffs.size || !running) {
                     failed.incrementAndGet()
                     PicoLog.w("report to ${target.url} failed: " + t.javaClass.simpleName + " " + t.message)
+                    return
+                }
+                PicoLog.d("report to ${target.url} retry #${attempt + 1}: " + t.javaClass.simpleName + " " + t.message)
+            }
+            try {
+                Thread.sleep(backoffs[attempt++])
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                failed.incrementAndGet()
+                return
+            }
+        }
+    }
+
+    private fun dispatchQuickOp(eventText: String, replyText: String) {
+        try {
+            quickOpExecutor.execute {
+                try {
+                    applyQuickOperation(eventText, replyText)
+                } catch (t: Throwable) {
+                    PicoLog.w("quick op failed: " + t.message)
                 }
             }
+        } catch (_: Throwable) {
+            PicoLog.w("quick op queue full, dropping quick operation")
         }
     }
 
@@ -114,7 +199,7 @@ object HttpReporter {
             val code = conn.responseCode
             val stream = if (code in 200..299) conn.inputStream else conn.errorStream
             val resp = stream?.use { read(it) } ?: ""
-            if (code !in 200..299) throw java.io.IOException("HTTP $code " + resp.take(200))
+            if (code !in 200..299) throw HttpStatusException(code, "HTTP $code " + resp.take(200))
             return resp
         } finally {
             conn.disconnect()

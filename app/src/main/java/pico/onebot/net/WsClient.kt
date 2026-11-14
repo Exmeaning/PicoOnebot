@@ -60,26 +60,36 @@ class WsClient(
         var backoff = minBackoff
         val maxBackoff = Config.long("reverse_reconnect_max_ms", 60000).coerceAtLeast(minBackoff)
         while (running) {
+            var establishedAt = 0L
+            var failed = false
             try {
-                connectOnce()
+                establishedAt = connectOnce()
                 backoff = minBackoff
             } catch (t: Throwable) {
+                failed = true
                 if (running) PicoLog.w("reverse ws $url failed: " + t.javaClass.simpleName + " " + t.message)
             } finally {
                 try { socket?.close() } catch (_: Throwable) { }
                 socket = null
             }
             if (!running) return
+            val lastedMs = if (establishedAt > 0L) System.currentTimeMillis() - establishedAt else 0L
+            val sleepMs = if (!failed && lastedMs >= 5_000L) {
+                200L
+            } else {
+                val cur = backoff
+                backoff = minOf(backoff * 2, maxBackoff)
+                cur
+            }
             try {
-                Thread.sleep(backoff)
+                Thread.sleep(sleepMs)
             } catch (t: InterruptedException) {
                 return
             }
-            backoff = minOf(backoff * 2, maxBackoff)
         }
     }
 
-    private fun connectOnce() {
+    private fun connectOnce(): Long {
         val uri = URI(url)
         val secure = uri.scheme.equals("wss", true)
         if (secure) throw UnsupportedOperationException("wss 暂未支持,请用 ws:// 或在前面挂反代")
@@ -89,9 +99,10 @@ class WsClient(
 
         val sock = Socket()
         socket = sock
-        if (!running) return
+        if (!running) return 0L
         sock.connect(java.net.InetSocketAddress(uri.host, port), 10000)
         sock.tcpNoDelay = true
+        sock.keepAlive = true
         sock.soTimeout = 10000
 
         val keyBytes = ByteArray(16)
@@ -132,11 +143,11 @@ class WsClient(
         }
 
         val c = WsConn(sock, ins, out, "rws:$url", WsConn.Role.BOTH, true, configId)
+        val establishedAt = System.currentTimeMillis()
         conn = c
-        connectedAt = System.currentTimeMillis()
+        connectedAt = establishedAt
         try {
-            if (!running) return
-            sock.soTimeout = 0
+            if (!running) return establishedAt
             Transport.add(c)
             c.loop { text -> server.onActionText(c, text) }
         } finally {
@@ -145,5 +156,6 @@ class WsClient(
             conn = null
             connectedAt = 0
         }
+        return establishedAt
     }
 }

@@ -5,6 +5,8 @@ import org.json.JSONObject
 import pico.onebot.core.Config
 import pico.onebot.core.PicoLog
 import java.io.File
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * OneBot 的 `message_id` 是 int32,NT 的消息标识是 `msgId`(u64)+ `msgSeq` + 会话。
@@ -48,6 +50,11 @@ object MsgIdStore {
     private var counter = 1
     private var dirty = 0
     private var file: File? = null
+    private val saveScheduled = AtomicBoolean(false)
+    private val saveLock = Any()
+    private val ioExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "pico-msgid-io").apply { isDaemon = true }
+    }
 
     fun load() {
         val f = File(Config.dataDir, "msgid.json")
@@ -78,10 +85,13 @@ object MsgIdStore {
 
     @Synchronized
     fun assign(msgId: Long, msgSeq: Long, chatType: Int, peerUid: String, senderUin: Long, time: Long): Entry {
-        byMsgId[msgId]?.let { return it }
+        if (msgId != 0L) byMsgId[msgId]?.let { return it }
         val e = Entry(nextId(), msgId, msgSeq, chatType, peerUid, senderUin, time)
         put(e)
-        if (++dirty >= 50) save()
+        if (++dirty >= 50) {
+            dirty = 0
+            saveAsync()
+        }
         return e
     }
 
@@ -89,7 +99,7 @@ object MsgIdStore {
     fun byMessageId(messageId: Int): Entry? = byMessageId[messageId]
 
     @Synchronized
-    fun byMsgId(msgId: Long): Entry? = byMsgId[msgId]
+    fun byMsgId(msgId: Long): Entry? = if (msgId == 0L) null else byMsgId[msgId]
 
     @Synchronized
     fun bySeq(chatType: Int, peerUid: String, msgSeq: Long): Entry? =
@@ -100,34 +110,65 @@ object MsgIdStore {
 
     private fun put(e: Entry) {
         byMessageId[e.messageId] = e
-        byMsgId[e.msgId] = e
+        if (e.msgId != 0L) byMsgId[e.msgId] = e
         if (e.msgSeq != 0L) bySeq[seqKey(e.chatType, e.peerUid, e.msgSeq)] = e
-        if (e.messageId >= counter) counter = e.messageId + 1
+        if (e.messageId >= counter) counter = if (e.messageId == Int.MAX_VALUE) 1 else e.messageId + 1
         while (byMessageId.size > CAP) {
             val it = byMessageId.entries.iterator()
             if (!it.hasNext()) break
             val oldest = it.next().value
             it.remove()
-            byMsgId.remove(oldest.msgId)
-            if (oldest.msgSeq != 0L) bySeq.remove(seqKey(oldest.chatType, oldest.peerUid, oldest.msgSeq))
+            if (oldest.msgId != 0L) byMsgId.remove(oldest.msgId)
+            if (oldest.msgSeq != 0L) {
+                val sk = seqKey(oldest.chatType, oldest.peerUid, oldest.msgSeq)
+                if (bySeq[sk] === oldest) bySeq.remove(sk)
+            }
         }
     }
 
     private fun nextId(): Int {
-        if (counter == Int.MAX_VALUE) counter = 1
-        return counter++
+        while (byMessageId.containsKey(counter) || counter <= 0) {
+            counter = if (counter >= Int.MAX_VALUE) 1 else counter + 1
+        }
+        val id = counter
+        counter = if (counter >= Int.MAX_VALUE) 1 else counter + 1
+        return id
+    }
+
+    private fun saveAsync() {
+        if (!saveScheduled.compareAndSet(false, true)) return
+        ioExecutor.execute {
+            try {
+                save()
+            } finally {
+                saveScheduled.set(false)
+            }
+        }
     }
 
     @Synchronized
+    private fun snapshot(): Pair<Int, List<Entry>> {
+        dirty = 0
+        return counter to ArrayList(byMessageId.values)
+    }
+
     fun save() {
         val f = file ?: return
-        dirty = 0
-        try {
-            val arr = JSONArray()
-            for (e in byMessageId.values) arr.put(e.toJson())
-            f.writeText(JSONObject().put("counter", counter).put("entries", arr).toString())
-        } catch (t: Throwable) {
-            PicoLog.w("msgid store save failed", t)
+        val (curCounter, entries) = snapshot()
+        synchronized(saveLock) {
+            try {
+                val arr = JSONArray()
+                for (e in entries) arr.put(e.toJson())
+                val payload = JSONObject().put("counter", curCounter).put("entries", arr).toString()
+                val tmp = File(f.parentFile, f.name + ".tmp")
+                tmp.writeText(payload)
+                if (!tmp.renameTo(f)) {
+                    f.writeText(payload)
+                    tmp.delete()
+                }
+            } catch (t: Throwable) {
+                PicoLog.w("msgid store save failed", t)
+            }
         }
     }
 }
