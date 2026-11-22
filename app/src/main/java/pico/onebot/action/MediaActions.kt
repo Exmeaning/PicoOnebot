@@ -77,7 +77,7 @@ object MediaActions {
             .put("path", f.absolutePath)
             .put("file_name", ref.fileName)
             .put("file_size", f.length())
-            .put("url", baseUrl() + MediaFiles.publish(f))
+            .put("url", mediaUrl(MediaFiles.publish(f)))
 
         // 小文件顺手给 base64,省掉上游再发一次 HTTP;大文件不给,否则一条应答几十兆
         val limit = Config.long("media_base64_limit", 4L * 1024 * 1024)
@@ -93,13 +93,33 @@ object MediaActions {
     }
 
     /**
-     * 对外可达的基地址。配置里没显式给就自己找一个**非回环**网卡地址 ——
-     * 写死 127.0.0.1 的话返回的 URL 只有容器自己能用,等于没用。
+     * 对外可达的基地址。
+     *
+     * 优先级:显式 `media_base_url` → 真实在听的 OneBot 监听 → 回环兜底。
+     * 老实现固定用 `Config.port`(第一个正向 WS 配置项),纯反向 WS/纯 HTTP 部署下
+     * 那个端口根本没人监听,返回的 URL 必然连不上。
      */
     fun baseUrl(): String {
         val configured = Config.str("media_base_url", "")
         if (configured.isNotEmpty()) return configured.trimEnd('/')
-        return "http://" + localAddress() + ":" + Config.port
+        val endpoint = pico.onebot.PicoBoot.activeOnebotEndpoint()
+        val port = endpoint?.first ?: Config.port
+        return "http://" + localAddress() + ":" + port
+    }
+
+    /**
+     * `/media/<token>` 的完整 URL。
+     *
+     * `/media/` 在 OneBot 端口上是**需要鉴权**的(`HttpServer.serveHttp`),而老实现
+     * 直接把不带凭证的路径返回给上游 → 配了 token 的部署必然 401。这里把该监听项的
+     * token 作为 `access_token` 查询参数带上,保证上游拿到的 URL 真能下载。
+     */
+    private fun mediaUrl(tokenPath: String): String {
+        // media_base_url 只改"主机前缀"(例如反代地址),文件仍由本进程的 HttpServer 提供,
+        // 所以鉴权规则是一样的:只要该监听项配了 token,就必须带上。
+        val token = pico.onebot.PicoBoot.activeOnebotEndpoint()?.second ?: ""
+        return if (token.isEmpty()) baseUrl() + tokenPath
+        else baseUrl() + tokenPath + "?access_token=" + java.net.URLEncoder.encode(token, "UTF-8")
     }
 
     private fun localAddress(): String {

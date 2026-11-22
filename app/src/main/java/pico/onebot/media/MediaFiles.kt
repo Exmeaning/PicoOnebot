@@ -26,6 +26,7 @@ import java.util.concurrent.atomic.AtomicLong
 object MediaFiles {
 
     private const val MAX_DOWNLOAD = 100L * 1024 * 1024
+    private const val PUBLISH_CAP = 2048
 
     private val tokens = ConcurrentHashMap<String, File>()
     private val resolved = AtomicLong()
@@ -119,10 +120,27 @@ object MediaFiles {
 
     // ---------------- 本地文件 → 可访问 URL ----------------
 
-    /** @return `/media/<token>`,由 HttpServer 提供;调用方拼上 host:port。 */
+    private val tokenRng = java.security.SecureRandom()
+
+    /**
+     * 发布一个可下载的媒体句柄。
+     *
+     * token 必须是**不可预测**的能力值:早期实现用 `md5(绝对路径)+长度`,而路径形如
+     * `media/out/url-<md5>.<ext>`,在开源仓库里完全可推,等于谁都能枚举下载。
+     *
+     * @return `/media/<token>`,由 HttpServer 提供;调用方拼上 host:port。
+     */
     fun publish(f: File): String {
-        val token = md5Str(f.absolutePath) + "-" + f.length()
+        val raw = ByteArray(16).also(tokenRng::nextBytes)
+        val token = hex(raw)
         tokens[token] = f
+        // 同一文件重复发布会不断堆积 token,按总量截断
+        while (tokens.size > PUBLISH_CAP) {
+            val oldest = tokens.keys.iterator()
+            if (!oldest.hasNext()) break
+            oldest.next()
+            oldest.remove()
+        }
         return "/media/" + token
     }
 
@@ -144,8 +162,6 @@ object MediaFiles {
     }
 
     fun md5Bytes(b: ByteArray): String = hex(MessageDigest.getInstance("MD5").digest(b))
-
-    private fun md5Str(s: String): String = md5Bytes(s.toByteArray(Charsets.UTF_8))
 
     private fun hex(b: ByteArray): String {
         val sb = StringBuilder(b.size * 2)
