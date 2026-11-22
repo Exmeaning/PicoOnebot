@@ -21,18 +21,30 @@ object WsFrame {
 
     private const val MAX_PAYLOAD = 32L * 1024 * 1024
 
+    /**
+     * 单条消息(分片累积后)的上限。`MAX_PAYLOAD` 只约束**单帧**,
+     * 对端持续发 CONT 帧就能无限占堆 —— 安卓堆只有几百兆,撑爆就是把宿主 QQ 带崩。
+     */
+    const val MAX_MESSAGE = 32L * 1024 * 1024
+
     private val rng = Random()
 
     class Frame(val opcode: Int, val payload: ByteArray, val fin: Boolean)
 
+    /**
+     * @param requireMask 读到的帧是否**必须**带掩码位。
+     *   服务端读客户端帧时必须为 true(RFC 6455 §5.1),否则不符合规范的对端
+     *   会被静默当成正常连接用下去;客户端读服务端帧时必须为 false。
+     */
     @Throws(IOException::class)
-    fun read(ins: InputStream): Frame {
+    fun read(ins: InputStream, requireMask: Boolean = false): Frame {
         val b0 = ins.read()
         if (b0 < 0) throw EOFException("stream closed")
         val b1 = readByte(ins)
         val fin = (b0 and 0x80) != 0
         val opcode = b0 and 0x0F
         val masked = (b1 and 0x80) != 0
+        if (requireMask && !masked) throw IOException("protocol error: client frame without mask")
         var len = (b1 and 0x7F).toLong()
         if (len == 126L) {
             len = ((readByte(ins).toLong() shl 8) or readByte(ins).toLong())

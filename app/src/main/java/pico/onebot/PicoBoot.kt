@@ -69,6 +69,41 @@ object PicoBoot {
     /** 上一次重载时这个配置项的失败原因,没有就是 null。 */
     fun bindError(id: String): String? = synchronized(this) { bindErrorById[id] }
 
+    /**
+     * 当前真正在 listening 的 OneBot 端口与它的 token。
+     *
+     * 媒体外链必须指向一个**真实有服务**的端口:老实现用 `Config.port`(第一个启用的
+     * 正向 WS 配置项),纯反向 WS / 纯 HTTP 上报部署下那个端口根本没人监听,上游取图
+     * 直接 connection refused。
+     *
+     * 选择顺序:**非回环监听优先**。两个监听项并存时(例如 `127.0.0.1:3001` 无 token
+     * + `0.0.0.0:3002` 有 token),先前按插入序取第一个会得到只在回环上可达的端口,
+     * 拼出的 `http://<LAN_IP>:3001/...` 从别的机器根本连不上。
+     *
+     * @return (host, port, token);没有任何 OneBot 监听时返回 null。
+     */
+    fun activeOnebotEndpoint(): Triple<String, Int, String>? = synchronized(this) {
+        var loopback: Triple<String, Int, String>? = null
+        for ((id, server) in listenerById) {
+            if (!server.running) continue
+            val token = Config.wsServers().let { arr ->
+                (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }.firstOrNull { it.optString("id") == id }
+            }?.optString("token", "")
+                ?: Config.httpServers().let { arr ->
+                    (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }.firstOrNull { it.optString("id") == id }
+                }?.optString("token", "")
+                ?: ""
+            val candidate = Triple(server.host, server.port, token)
+            if (!Config.isLoopbackHost(server.host)) return@synchronized candidate
+            if (loopback == null) loopback = candidate
+        }
+        loopback
+    }
+
+    /** 媒体外链是否真的可用:要么配了 media_base_url,要么有在听的 OneBot 端口。 */
+    fun mediaUrlAvailable(): Boolean =
+        Config.str("media_base_url", "").isNotEmpty() || activeOnebotEndpoint() != null
+
     /** [reloadNetwork] 的结果:如实告诉调用方到底起来了什么。 */
     class ReloadResult(
         val errors: List<String>,
@@ -184,7 +219,19 @@ object PicoBoot {
             val host = o.optString("host", "0.0.0.0")
             val port = o.optInt("port", 3001)
             val token = o.optString("token", "")
-            val hs = HttpServer(host, port, HttpServer.Role.ONEBOT, token, id)
+            // 非回环 + 空 token 意味着任何人都能调 /api/pico 改配置、读 token、
+            // 触发 logout。这里必须拒绝监听,而不是像以前那样只打一条 warn 就照常起。
+            if (!Config.isLoopbackHost(host) && token.isBlank()) {
+                errors.add("正向 WS $host:$port: 非回环监听必须配置 Access Token(已拒绝监听)")
+                bindErrorById[id] = "缺少 Access Token,已拒绝监听"
+                PicoLog.e("onebot server refused on $host:$port: missing access token")
+                continue
+            }
+            val hs = HttpServer(
+                host, port, HttpServer.Role.ONEBOT, token, id,
+                allowCors = o.optBoolean("cors", true),
+                allowWebSocket = o.optBoolean("websocket", true)
+            )
             try {
                 hs.start()
                 onebotServers.add(hs)
@@ -208,7 +255,18 @@ object PicoBoot {
                 continue
             }
             val token = o.optString("token", "")
-            val hs = HttpServer(host, port, HttpServer.Role.ONEBOT, token, id)
+            if (!Config.isLoopbackHost(host) && token.isBlank()) {
+                errors.add("HTTP $host:$port: 非回环监听必须配置 Access Token(已拒绝监听)")
+                bindErrorById[id] = "缺少 Access Token,已拒绝监听"
+                PicoLog.e("http server refused on $host:$port: missing access token")
+                continue
+            }
+            // httpServers 项:cors / websocket 两个开关在配置里存在,必须真的生效
+            val hs = HttpServer(
+                host, port, HttpServer.Role.ONEBOT, token, id,
+                allowCors = o.optBoolean("cors", true),
+                allowWebSocket = o.optBoolean("websocket", false)
+            )
             try {
                 hs.start()
                 onebotServers.add(hs)

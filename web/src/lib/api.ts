@@ -76,6 +76,7 @@ function defaultConfig(): AppConfig {
       logLevel: "info", forwardMode: "merge_one",
       forwardMergeHeader: "〔合并转发〕", mediaBaseUrl: "", mediaBase64Limit: 4194304,
       sendRatePerSec: 5, kernelCallTimeoutMs: 30000,
+      heartbeat: 5000, messageFormat: "array", reportSelfMessage: true,
     },
   };
 }
@@ -111,6 +112,12 @@ export const api = {
   initializeWebuiPassword: (token: string) =>
     http<{ ok: boolean; message?: string }>("/api/webui/token", {
       method: "PUT", body: JSON.stringify({ token }),
+    }),
+
+  /** 修改已初始化的控制台密码。成功后所有会话失效,需要重新登录。 */
+  changeWebuiPassword: (current: string, token: string) =>
+    http<{ ok: boolean; message?: string; sessionsRevoked?: boolean }>("/api/webui/token", {
+      method: "PUT", body: JSON.stringify({ current, token }),
     }),
 
   /** 让 QQ 退出登录、回到扫码页(与 WebUI 会话登出不同)。 */

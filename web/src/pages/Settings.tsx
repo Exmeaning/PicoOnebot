@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { Palette, Check, Save, RotateCcw, SlidersHorizontal, ShieldCheck, Wand2, ChevronDown } from "lucide-react";
-import { Button, Card, CardHeader, Field, Input, PageHeader, Select, useToast, Badge } from "../components/ui";
+import { Button, Card, CardHeader, Field, Input, PageHeader, Select, Toggle, useToast, Badge } from "../components/ui";
 import { THEME_PRESETS, useTheme } from "../store/theme";
-import { api, getBaseUrl, setBaseUrl } from "../lib/api";
-import type { AppConfig, ForwardMode, GeneralConfig, LogLevel, WebuiConfig } from "../lib/types";
+import { api, getBaseUrl, setBaseUrl, setToken } from "../lib/api";
+import type { AppConfig, ForwardMode, GeneralConfig, LogLevel, MessageFormat, WebuiConfig } from "../lib/types";
 import { cn } from "../utils/cn";
 
 export function Settings() {
@@ -202,6 +202,18 @@ export function Settings() {
                 <Field label="base64 内联上限（字节）" hint="超过则改用外链，不塞进事件">
                   <Input type="number" className="font-mono" value={g.mediaBase64Limit} onChange={(e) => set("mediaBase64Limit", Number(e.target.value))} />
                 </Field>
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <Field label="心跳间隔（毫秒）" hint="0 为关闭心跳；对所有连接生效">
+                    <Input type="number" min={0} step={1000} value={Number(g.heartbeat)} onChange={(e) => set("heartbeat", Number(e.target.value))} />
+                  </Field>
+                  <Field label="消息格式" hint="对所有连接生效">
+                    <Select value={g.messageFormat} onChange={(e) => set("messageFormat", e.target.value as MessageFormat)}>
+                      <option value="array">消息段数组 (array)</option>
+                      <option value="string">CQ 码字符串 (string)</option>
+                    </Select>
+                  </Field>
+                </div>
+                <Toggle label="上报自身消息" desc="把 Bot 自己发送的消息也作为事件推送；对所有连接生效" checked={Boolean(g.reportSelfMessage)} onChange={(v) => set("reportSelfMessage", v)} />
               </>
             )}
           </div>
@@ -222,6 +234,7 @@ export function Settings() {
                   </Field>
                 </div>
               ) : null}
+              {cfg?.webui.passwordInitialized ? <ChangePasswordInline /> : null}
               <Field label="后端地址（仅本浏览器）" hint="控制台连接的 PicoOnebot API 地址">
                 <div className="flex gap-2 min-w-0">
                   <Input className="font-mono text-xs min-w-0 flex-1" value={base} onChange={(e) => setBase(e.target.value)} />
@@ -242,6 +255,70 @@ export function Settings() {
 
         </div>
       </div>
+    </div>
+  );
+}
+
+/** 修改控制台密码:需要当前密码,成功后所有会话失效需重新登录。 */
+function ChangePasswordInline() {
+  const toast = useToast();
+  const [current, setCurrent] = useState("");
+  const [next, setNext] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const message =
+    next.length > 0 && next.trim().length < 8
+      ? "新密码至少 8 位"
+      : next.trim() === "picopico"
+        ? "不能继续使用初始密码"
+        : next.length > 0 && next !== confirm
+          ? "两次输入的新密码不一致"
+          : "";
+
+  const submit = async () => {
+    if (!current) {
+      toast.push("error", "请输入当前密码");
+      return;
+    }
+    if (message) {
+      toast.push("error", message);
+      return;
+    }
+    setBusy(true);
+    try {
+      const r = await api.changeWebuiPassword(current, next.trim());
+      if (!r.ok) throw new Error(r.message || "修改失败");
+      toast.push("success", "密码已修改，请用新密码重新登录");
+      setCurrent(""); setNext(""); setConfirm("");
+      // 后端已经吊销所有会话:先清掉本地 token,免得重载首屏拿旧 token
+      // 再打一次必然 401 的请求。
+      setToken("");
+      setTimeout(() => window.location.reload(), 1200);
+    } catch (e) {
+      toast.push("error", (e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="space-y-3 rounded-2xl bg-pico-softer p-4">
+      <p className="text-xs font-bold text-pico-ink">修改控制台密码</p>
+      <div className="grid gap-3 sm:grid-cols-3">
+        <Field label="当前密码">
+          <Input type="password" autoComplete="current-password" value={current} onChange={(e) => setCurrent(e.target.value)} />
+        </Field>
+        <Field label="新密码" hint={message && next.length > 0 ? message : "至少 8 位"}>
+          <Input type="password" autoComplete="new-password" value={next} onChange={(e) => setNext(e.target.value)} />
+        </Field>
+        <Field label="确认新密码">
+          <Input type="password" autoComplete="new-password" value={confirm} onChange={(e) => setConfirm(e.target.value)} />
+        </Field>
+      </div>
+      <Button variant="soft" loading={busy} disabled={!current || !next || !!message} onClick={submit}>
+        修改密码
+      </Button>
     </div>
   );
 }

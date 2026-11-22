@@ -171,7 +171,8 @@ object InfoActions {
         UinUidStore.feed(m.uid, m.uin)
         val card = m.cardName ?: ""
         val nick = m.nick ?: ""
-        NickStore.feed(m.uid, if (card.isNotEmpty()) card else nick)
+        // 群名片是弱来源(只对某个群成立),不该覆盖好友备注
+        NickStore.feedIfAbsent(m.uid, if (card.isNotEmpty()) card else nick)
         return JSONObject()
             .put("group_id", groupCode)
             .put("user_id", if (m.uin > 0) m.uin else UinUidStore.uin(m.uid))

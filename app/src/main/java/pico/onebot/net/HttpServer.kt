@@ -35,7 +35,11 @@ class HttpServer(
     /** ONEBOT 角色的鉴权口令；WEBUI 角色使用 Config 中的密码派生值校验。 */
     private val serverToken: String = "",
     /** 起这个监听的网络配置项 id,接进来的连接都挂在它名下。 */
-    val configId: String = ""
+    val configId: String = "",
+    /** 是否回 `Access-Control-Allow-Origin: *`(连接项里的 cors 开关)。 */
+    val allowCors: Boolean = true,
+    /** 是否接受 WebSocket 升级(连接项里的 websocket 开关)。 */
+    val allowWebSocket: Boolean = true
 ) {
 
     enum class Role { ONEBOT, WEBUI }
@@ -43,6 +47,7 @@ class HttpServer(
     private companion object {
         const val WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
         const val HTTP_READ_TIMEOUT_MS = 30_000
+        const val MAX_BODY_BYTES = 16 * 1024 * 1024
         val actionThreadSeq = AtomicInteger()
         val actionExecutor = ThreadPoolExecutor(
             2,
@@ -65,8 +70,18 @@ class HttpServer(
 
     fun start() {
         val s = ServerSocket()
-        s.reuseAddress = true
-        s.bind(InetSocketAddress(InetAddress.getByName(host), port))
+        try {
+            s.reuseAddress = true
+            s.bind(InetSocketAddress(InetAddress.getByName(host), port))
+        } catch (t: Throwable) {
+            // bind 失败时这个 ServerSocket 还没交给任何人,不关就会泄漏 FD。
+            // 热重载时端口被占是常见情况,一次次重试会累积成真问题。
+            try {
+                s.close()
+            } catch (ignored: Throwable) {
+            }
+            throw t
+        }
         server = s
         running = true
         Thread({ acceptLoop(s) }, "pico-http-accept").apply { isDaemon = true }.start()
@@ -125,6 +140,12 @@ class HttpServer(
             val query = if (qIdx >= 0) parseQuery(rawPath.substring(qIdx + 1)) else HashMap()
 
             val upgrade = headers["upgrade"]?.lowercase()
+            if (upgrade == "websocket" && role == Role.ONEBOT && !allowWebSocket) {
+                // 连接项显式关掉了 WebSocket:该端口只提供 HTTP API。
+                writeText(out, 400, "text/plain", "websocket disabled for this listener")
+                sock.close()
+                return
+            }
             if (upgrade == "websocket") {
                 if (role == Role.WEBUI) {
                     if (path.trimEnd('/') != "/api/logs/stream" || !WebApi.authorized(headers, query)) {
@@ -280,6 +301,7 @@ class HttpServer(
 
     // ---------------- HTTP ----------------
 
+    @Suppress("UNUSED_PARAMETER")
     private fun serveHttp(
         sock: Socket,
         out: OutputStream,
@@ -291,7 +313,9 @@ class HttpServer(
     ) {
         try {
             if (path.startsWith("/api/pico")) {
-                if (!authorized(headers, query)) {
+                // 管理接口比普通 action 敏感得多(能改配置、读密钥、踢下线)。
+                // 即使监听项被误配成空 token,也不允许无凭证访问。
+                if (serverToken.isBlank() || !authorized(headers, query)) {
                     writeText(out, 401, "application/json", Ob.failed(1403, "unauthorized").toString())
                     return
                 }
@@ -332,8 +356,8 @@ class HttpServer(
                 return
             }
 
-            if (method == "GET" && serveStatic(out, path)) return
-
+            // OneBot 端口不提供 WebUI 静态文件:那是控制台资产,不该暴露给
+            // 任何能连上 3001 的对端(而且这里没有控制台的鉴权语义)。
             writeText(out, 404, "application/json", Ob.failed(1404, "unknown action or path: $path").toString())
         } finally {
             try {
@@ -352,7 +376,11 @@ class HttpServer(
         val dir = Config.webuiDir
         if (dir.isDirectory) {
             val f = File(dir, rel)
-            if (f.canonicalPath.startsWith(dir.canonicalPath) && f.isFile) {
+            // 必须带分隔符:只用 startsWith(dir) 会让同前缀的兄弟目录
+            // (webui2/、webui-backup/) 通过 `../webui2/x` 被读到。
+            val root = try { dir.canonicalPath } catch (_: Throwable) { return false }
+            val target = try { f.canonicalPath } catch (_: Throwable) { return false }
+            if (target.startsWith(root + File.separator) && f.isFile) {
                 writeBytes(out, 200, mimeOfStatic(rel), f.readBytes())
                 return true
             }
@@ -412,12 +440,59 @@ class HttpServer(
         return query["access_token"] == token
     }
 
+    /**
+     * 读请求体。
+     *
+     * `Transfer-Encoding: chunked` 必须处理:很多 HTTP 客户端(以及一切没预先
+     * 算好长度的流式 POST)只用 chunked,不发 Content-Length。旧实现直接当
+     * "空 body" 返回,这类请求的 JSON 参数会被整个丢掉,表现为"调用方明明传了
+     * group_id,却收到参数缺失"。
+     */
     private fun readBody(ins: InputStream, headers: Map<String, String>): ByteArray {
+        val te = headers["transfer-encoding"]?.lowercase() ?: ""
+        if (te.contains("chunked")) return readChunkedBody(ins)
         val len = headers["content-length"]?.toIntOrNull() ?: return ByteArray(0)
-        if (len <= 0 || len > 16 * 1024 * 1024) return ByteArray(0)
+        if (len <= 0 || len > MAX_BODY_BYTES) return ByteArray(0)
         val buf = ByteArray(len)
         WsFrame.readFully(ins, buf)
         return buf
+    }
+
+    /**
+     * 解析 chunked 编码(只支持不带 chunk-extension 的常见形式)。
+     *
+     * 畸形长度必须**报错**,不能静默收尾:旧实现的 `?: break` 会把"读到一半就断"
+     * 当成正常结束交给调用方,JSON 参数缺一半却看起来像请求成功;`size <= 0`
+     * 还会把 `-1` 这种负数当成合法的 0 块结束标记。
+     */
+    private fun readChunkedBody(ins: InputStream): ByteArray {
+        val out = java.io.ByteArrayOutputStream()
+        while (true) {
+            val sizeLine = WsFrame.readLine(ins) ?: throw java.io.IOException("chunked body truncated: missing size line")
+            // 允许 "1a;ext=1" 这种形式,只取分号前的长度
+            val hex = sizeLine.substringBefore(';').trim()
+            val size = hex.toLongOrNull(16)
+                ?: throw java.io.IOException("chunked body malformed: bad chunk size '$hex'")
+            // 负数(如 "-1")不是合法的 0 块结束标记;超出上限的块长度也一并拒绝
+            if (size < 0 || size > MAX_BODY_BYTES) {
+                throw java.io.IOException("chunked body malformed: bad chunk size '$hex'")
+            }
+            if (size == 0L) {
+                // 末尾 0 块后面还有一个空行(可能带 trailer),吞掉即可
+                while (true) {
+                    val trailer = WsFrame.readLine(ins) ?: throw java.io.IOException("chunked body truncated: missing trailer terminator")
+                    if (trailer.isEmpty()) break
+                }
+                break
+            }
+            if (out.size() + size > MAX_BODY_BYTES) throw java.io.IOException("chunked body too large")
+            val chunk = ByteArray(size.toInt())
+            WsFrame.readFully(ins, chunk)
+            out.write(chunk)
+            // 块尾的 CRLF 也必须存在,否则说明流被截断
+            if (WsFrame.readLine(ins) == null) throw java.io.IOException("chunked body truncated: missing chunk terminator")
+        }
+        return out.toByteArray()
     }
 
     private fun parseQuery(q: String): HashMap<String, String> {
@@ -457,7 +532,7 @@ class HttpServer(
                 .append("Content-Type: ").append(mimeOf(f.name)).append("\r\n")
                 .append("Content-Length: ").append(f.length()).append("\r\n")
                 .append("Content-Disposition: inline; filename=\"").append(f.name).append("\"\r\n")
-                .append("Access-Control-Allow-Origin: *\r\n")
+                .apply { if (allowCors) append("Access-Control-Allow-Origin: *\r\n") }
                 .append("Connection: close\r\n\r\n")
                 .toString()
             out.write(head.toByteArray(Charsets.UTF_8))
@@ -494,7 +569,7 @@ class HttpServer(
                 .append("HTTP/1.1 ").append(code).append(if (code == 200) " OK" else " ERR").append("\r\n")
                 .append("Content-Type: ").append(type).append("\r\n")
                 .append("Content-Length: ").append(body.size).append("\r\n")
-                .append("Access-Control-Allow-Origin: *\r\n")
+                .apply { if (allowCors) append("Access-Control-Allow-Origin: *\r\n") }
                 .append("Connection: close\r\n\r\n")
                 .toString()
             out.write(head.toByteArray(Charsets.UTF_8))

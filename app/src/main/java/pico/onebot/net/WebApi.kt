@@ -19,7 +19,6 @@ import java.io.File
 import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
 import java.security.SecureRandom
-import java.util.concurrent.ConcurrentHashMap
 
 /**
  * WebUI 后端(端口 6099 的 `/api/…`)。契约见 docs/design §5.1,前端 `web/src/lib/api.ts` 为准。
@@ -31,7 +30,15 @@ import java.util.concurrent.ConcurrentHashMap
 object WebApi {
 
     private const val MAX_EDIT_BYTES = 1024 * 1024L
-    private val sessions = ConcurrentHashMap.newKeySet<String>()
+    private const val SESSION_CAP = 64
+
+    /**
+     * 进程内会话令牌。用 LinkedHashMap(插入序)而不是并发 Set:
+     * 达到上限时要淘汰**最老**的那条,不能像旧实现那样 clear() 全体
+     * —— 那会把当前正在用的会话也踢掉,所有人都得重新登录。
+     */
+    private val sessions = LinkedHashMap<String, Unit>(64, 0.75f, false)
+    private val sessionsLock = Any()
     private val secureRandom = SecureRandom()
     private val fileWriteLock = Any()
 
@@ -90,10 +97,10 @@ object WebApi {
     fun authorized(headers: Map<String, String>, query: Map<String, String>): Boolean {
         val auth = headers["authorization"] ?: ""
         val credential = if (auth.startsWith("Bearer ")) auth.substring(7) else auth
-        if (credential.isNotEmpty() && (sessions.contains(credential) || Config.verifyWebuiPassword(credential))) return true
+        if (credential.isNotEmpty() && (hasSession(credential) || Config.verifyWebuiPassword(credential))) return true
         val queryCredential = query["token"] ?: return false
         return queryCredential.isNotEmpty() &&
-            (sessions.contains(queryCredential) || Config.verifyWebuiPassword(queryCredential))
+            (hasSession(queryCredential) || Config.verifyWebuiPassword(queryCredential))
     }
 
     private fun login(body: ByteArray): Response {
@@ -102,7 +109,7 @@ object WebApi {
         } catch (t: Throwable) {
             ""
         }
-        if (token.isNotEmpty() && sessions.contains(token)) {
+        if (token.isNotEmpty() && hasSession(token)) {
             return loginResponse(token)
         }
         if (token.isNotEmpty() && Config.verifyWebuiPassword(token)) {
@@ -121,18 +128,36 @@ object WebApi {
         )
 
     private fun newSession(): String {
-        if (sessions.size >= 64) sessions.clear()
         val bytes = ByteArray(32).also { secureRandom.nextBytes(it) }
         val session = Base64.encodeToString(bytes, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
-        sessions.add(session)
+        synchronized(sessionsLock) {
+            while (sessions.size >= SESSION_CAP) {
+                val oldest = sessions.keys.iterator()
+                if (!oldest.hasNext()) break
+                oldest.next()
+                oldest.remove()
+            }
+            sessions[session] = Unit
+        }
         return session
+    }
+
+    private fun hasSession(token: String): Boolean = synchronized(sessionsLock) { sessions.containsKey(token) }
+
+    private fun dropSession(token: String) {
+        if (token.isEmpty()) return
+        synchronized(sessionsLock) { sessions.remove(token) }
+    }
+
+    private fun clearSessions() {
+        synchronized(sessionsLock) { sessions.clear() }
     }
 
     private fun logout(headers: Map<String, String>, query: Map<String, String>): Response {
         val auth = headers["authorization"] ?: ""
         val credential = if (auth.startsWith("Bearer ")) auth.substring(7) else auth
-        if (credential.isNotEmpty()) sessions.remove(credential)
-        query["token"]?.let { sessions.remove(it) }
+        dropSession(credential)
+        query["token"]?.let { dropSession(it) }
         return Response(200, JSONObject().put("ok", true))
     }
 
@@ -257,7 +282,16 @@ object WebApi {
     private fun putConfig(body: ByteArray): Response = synchronized(fileWriteLock) {
         val patch = JSONObject(String(body, Charsets.UTF_8))
         val candidate = patch.optJSONObject("network") ?: Config.network()
-        val errors = Config.validateNetwork(candidate)
+        val errors = Config.validateNetwork(candidate).toMutableList()
+        // webui 监听参数直接决定下一次启动能不能连上控制台。清空端口输入框在前端
+        // 会变成 Number("") == 0,写进去就要手改配置文件才能救回来。
+        patch.optJSONObject("webui")?.let { w ->
+            if (w.has("host") && w.optString("host").isBlank()) errors.add("控制台监听地址不能为空")
+            if (w.has("port")) {
+                val p = w.optInt("port", -1)
+                if (p !in 1..65535) errors.add("控制台端口必须在 1-65535 之间")
+            }
+        }
         if (errors.isNotEmpty()) {
             return Response(
                 400,
@@ -491,12 +525,32 @@ object WebApi {
     }
 
     private fun setToken(body: ByteArray): Response {
-        val token = JSONObject(String(body, Charsets.UTF_8)).optString("token", "").trim()
+        val req = try {
+            JSONObject(String(body, Charsets.UTF_8))
+        } catch (_: Throwable) {
+            return Response(400, JSONObject().put("ok", false).put("message", "请求内容不是合法 JSON"))
+        }
+        val token = req.optString("token", "").trim()
         if (token.length < 8) {
             return Response(400, JSONObject().put("ok", false).put("message", "控制台密码至少 8 位"))
         }
         if (token == Config.DEFAULT_WEBUI_PASSWORD) {
             return Response(400, JSONObject().put("ok", false).put("message", "不能继续使用初始密码"))
+        }
+        // 已初始化 = 修改,必须校验旧密码;未初始化 = 首次设置。
+        // 旧实现把两种情况都堵死,导致忘记密码后只能手改配置文件。
+        if (Config.webuiPasswordInitialized) {
+            val current = req.optString("current", "")
+            if (current.isEmpty()) {
+                return Response(400, JSONObject().put("ok", false).put("message", "修改密码需要提供当前密码"))
+            }
+            if (!Config.changeWebuiPassword(current, token)) {
+                return Response(403, JSONObject().put("ok", false).put("message", "当前密码不正确"))
+            }
+            // 改密后让所有已签发的会话失效,旧浏览器需重新登录
+            clearSessions()
+            PicoLog.i("webui password changed")
+            return Response(200, JSONObject().put("ok", true).put("sessionsRevoked", true))
         }
         if (!Config.initializeWebuiPassword(token)) {
             return Response(409, JSONObject().put("ok", false).put("message", "控制台密码已设置，不允许再次修改"))

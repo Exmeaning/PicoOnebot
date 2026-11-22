@@ -53,7 +53,10 @@ object MediaRefStore {
         // 上游有时把扩展名去掉或加上,再试一次
         val bare = key.substringBeforeLast('.')
         if (bare != key) map[bare]?.let { return it }
-        return map.entries.firstOrNull { it.key.startsWith(bare) }?.value
+        // 不再做前缀模糊匹配:element_id 很短(如 "3"),startsWith 会命中
+        // 任何以它开头的 md5,让 get_image 返回**另一个**媒体而不是明确报错。
+        // 宁可返回 null 让调用方看到 "该媒体不在记录里"。
+        return null
     }
 
     @Synchronized

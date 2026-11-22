@@ -57,8 +57,27 @@ object NickStore {
         return found
     }
 
-    /** 喂进已知的名字(例如群消息里内核已经给了 sendMemberName),省一次内核查询。 */
+    /**
+     * 权威来源写入(好友列表、备注/昵称变更回调、群成员信息):**覆盖旧值**。
+     *
+     * 早期实现是"已有值就 return",于是 `onNickUpdated` / `onBuddyRemarkUpdated`
+     * 这类明确的名字变更被静默丢弃,用户在 QQ 里改名后机器人一直叫旧名字。
+     */
     fun feed(uid: String?, name: String?) {
+        if (uid.isNullOrEmpty() || name.isNullOrEmpty()) return
+        synchronized(cache) {
+            negCache.remove(uid)
+            cache[uid] = name
+        }
+    }
+
+    /**
+     * 弱来源写入(逐条消息里的 sendMemberName 等):只在没值时补齐。
+     *
+     * 群名片会和好友备注打架 —— 一条群消息里的卡片名不该覆盖备注。真正的
+     * 变更交给 [feed] 那条路径。
+     */
+    fun feedIfAbsent(uid: String?, name: String?) {
         if (uid.isNullOrEmpty() || name.isNullOrEmpty()) return
         synchronized(cache) {
             negCache.remove(uid)

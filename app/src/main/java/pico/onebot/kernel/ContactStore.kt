@@ -34,6 +34,9 @@ object ContactStore {
     private val groups = ConcurrentHashMap<Long, GroupSimpleInfo>()
     private val groupDetails = ConcurrentHashMap<Long, GroupDetailInfo>()
 
+    /** 监听器推回来的完整好友信息(带 uin/昵称),比纯 uid 列表好用,作为补充来源。 */
+    private val buddyRich = ConcurrentHashMap<String, Friend>()
+
     /** 等"下一次群列表回填"的人。用列表是因为可能有多个 action 同时在等。 */
     private val groupWaiters = CopyOnWriteArrayList<Promise<Boolean>>()
     private val detailWaiters = ConcurrentHashMap<Long, CopyOnWriteArrayList<Promise<Boolean>>>()
@@ -41,6 +44,24 @@ object ContactStore {
     @Volatile
     var groupListLoaded = false
         private set
+
+    /**
+     * 清空所有名册缓存。**换号 / 被踢下线时必须调用**:
+     * 这些表是"当前登录账号的视角",留着上一个人的数据会让
+     * `get_group_list` / `get_friend_list` / `get_group_info` 串号返回错误内容,
+     * 而 `groupListLoaded == true` 还会让 `groups(refresh=false)` 短路,
+     * 连"重新向内核要一次"都不做。
+     */
+    fun reset() {
+        groups.clear()
+        groupDetails.clear()
+        buddyRich.clear()
+        groupListLoaded = false
+        releaseAll(groupWaiters)
+        for (bucket in detailWaiters.values) releaseAll(bucket)
+        detailWaiters.clear()
+        PicoLog.i("contact store reset")
+    }
 
     fun onGroupListUpdate(updateType: Any?, list: ArrayList<*>?) {
         if (list == null) return
@@ -68,7 +89,7 @@ object ContactStore {
         for (v in m.values) {
             val mi = v as? MemberInfo ?: continue
             UinUidStore.feed(mi.uid, mi.uin)
-            NickStore.feed(mi.uid, if (!mi.cardName.isNullOrEmpty()) mi.cardName else mi.nick)
+            NickStore.feedIfAbsent(mi.uid, if (!mi.cardName.isNullOrEmpty()) mi.cardName else mi.nick)
         }
     }
 
@@ -130,9 +151,6 @@ object ContactStore {
     // ---------------- 好友 ----------------
 
     class Friend(val uid: String, val uin: Long, val nick: String, val remark: String)
-
-    /** 监听器推回来的完整好友信息(带 uin/昵称),比纯 uid 列表好用,作为补充来源。 */
-    private val buddyRich = ConcurrentHashMap<String, Friend>()
 
     fun onBuddyListChange(list: ArrayList<*>?) {
         if (list == null) return

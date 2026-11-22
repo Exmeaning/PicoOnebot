@@ -261,11 +261,12 @@ object HttpReporter {
         if (isGroup) params.put("group_id", event.optLong("group_id")) else params.put("user_id", event.optLong("user_id"))
 
         // at_sender 只在群里有意义,并且要在**已有内容前面**插,不能整条替换掉
-        if (isGroup && op.optBoolean("at_sender", false)) {
+        val atUserId = event.optLong("user_id")
+        if (isGroup && op.optBoolean("at_sender", false) && atUserId > 0) {
             val segs = JSONArray()
                 .put(
                     JSONObject().put("type", "at")
-                        .put("data", JSONObject().put("qq", event.optLong("user_id").toString()))
+                        .put("data", JSONObject().put("qq", atUserId.toString()))
                 )
                 .put(JSONObject().put("type", "text").put("data", JSONObject().put("text", " ")))
             for (s in pico.onebot.msg.MsgCodec.normalize(reply)) segs.put(s)

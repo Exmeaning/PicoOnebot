@@ -102,7 +102,9 @@ object Transport {
     fun peers(ownerId: String): Int =
         if (ownerId.isEmpty()) 0 else conns.count { !it.closed && it.ownerId == ownerId }
 
-    fun describe(): List<String> = conns.map { it.tag + "(" + it.role + ")" }
+    fun describe(): List<String> = conns.map {
+        it.tag + "(" + it.role + (if (it.overflowCount() > 0) ", overflow=" + it.overflowCount() else "") + ")"
+    }
 
     fun closeAll() {
         for (c in conns) c.close()

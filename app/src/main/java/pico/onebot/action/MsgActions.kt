@@ -31,7 +31,8 @@ object MsgActions {
     private const val CHAT_PRIVATE = 1
     private const val CHAT_GROUP = 2
 
-    private val limiter by lazy { RateLimiter(Config.sendRatePerSec) }
+    // 取值器而非值:WebUI 改发送速率后立刻生效,不必重启
+    private val limiter by lazy { RateLimiter { Config.sendRatePerSec } }
 
     fun register() {
         ActionRouter.register("send_msg") { p ->
@@ -145,7 +146,16 @@ object MsgActions {
 
         // 落库记录用来拿 msgSeq;拿不到也不算失败(消息已被内核接受)
         val record: MsgRecord? = recordPromise.await(5000)
+        // 但**异步投递失败**必须在这里结账:onSendMsgError 会把 recordPromise 用 null 完成,
+        // 与"超时"不可区分。只看回调就回 ok,等于向上游谎报发送成功。
+        val failure = SendTracker.takeFailure(msgId)
         SendTracker.forget(msgId)
+        if (failure != null) {
+            return Ob.failed(
+                Ob.RC_KERNEL_ERROR,
+                "内核受理后投递失败 code=" + failure.code + " " + failure.msg
+            )
+        }
         val entry = MsgIdStore.assign(
             msgId,
             record?.msgSeq ?: 0L,

@@ -38,10 +38,8 @@ export interface WsServer {
   host: string;
   port: number;
   token: string;
-  heartbeat: number;
-  messageFormat: "array" | "string";
-  reportSelfMessage: boolean;
-  debug: boolean;
+  cors: boolean;
+  websocket: boolean;
 }
 
 export interface WsClient {
@@ -50,11 +48,7 @@ export interface WsClient {
   enabled: boolean;
   url: string;
   token: string;
-  heartbeat: number;
   reconnectInterval: number;
-  messageFormat: "array" | "string";
-  reportSelfMessage: boolean;
-  debug: boolean;
 }
 
 export interface HttpServer {
@@ -66,8 +60,6 @@ export interface HttpServer {
   token: string;
   cors: boolean;
   websocket: boolean;
-  messageFormat: "array" | "string";
-  debug: boolean;
 }
 
 export interface HttpClient {
@@ -77,10 +69,6 @@ export interface HttpClient {
   url: string;
   token: string;
   secret: string;
-  heartbeat: number;
-  messageFormat: "array" | "string";
-  reportSelfMessage: boolean;
-  debug: boolean;
 }
 
 export interface NetworkConfig {
@@ -92,6 +80,9 @@ export interface NetworkConfig {
 
 export type ForwardMode = "merge_one" | "separate" | "silent";
 
+/** 进程级消息格式:对全部连接生效(不是每条连接各自的开关)。 */
+export type MessageFormat = "array" | "string";
+
 export interface GeneralConfig {
   logLevel: LogLevel;
   forwardMode: ForwardMode;
@@ -100,6 +91,12 @@ export interface GeneralConfig {
   mediaBase64Limit: number;
   sendRatePerSec: number;
   kernelCallTimeoutMs: number;
+  /** 心跳间隔(ms),0 为关闭。进程级。 */
+  heartbeat: number;
+  /** 消息格式。进程级。 */
+  messageFormat: MessageFormat;
+  /** 是否把 Bot 自身发送的消息也作为事件推送。进程级。 */
+  reportSelfMessage: boolean;
 }
 
 export interface WebuiConfig {

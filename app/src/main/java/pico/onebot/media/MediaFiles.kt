@@ -10,7 +10,6 @@ import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -26,8 +25,17 @@ import java.util.concurrent.atomic.AtomicLong
 object MediaFiles {
 
     private const val MAX_DOWNLOAD = 100L * 1024 * 1024
+    private const val PUBLISH_CAP = 2048
 
-    private val tokens = ConcurrentHashMap<String, File>()
+    /**
+     * token -> 文件,**按插入顺序**淘汰。
+     *
+     * 必须是 `LinkedHashMap` 而不是 `ConcurrentHashMap`:后者的迭代顺序是无序的,
+     * 取 `keys.iterator().next()` 可能正好挑中刚刚生成的 token 自己删掉 → 上游拿到
+     * URL 立刻 404。容量只有 2048,访问频度是"每个文件发布一次",加锁足够。
+     */
+    private val tokens = LinkedHashMap<String, File>()
+    private val tokensLock = Any()
     private val resolved = AtomicLong()
     private val fetched = AtomicLong()
 
@@ -119,14 +127,36 @@ object MediaFiles {
 
     // ---------------- 本地文件 → 可访问 URL ----------------
 
-    /** @return `/media/<token>`,由 HttpServer 提供;调用方拼上 host:port。 */
+    private val tokenRng = java.security.SecureRandom()
+
+    /**
+     * 发布一个可下载的媒体句柄。
+     *
+     * token 必须是**不可预测**的能力值:早期实现用 `md5(绝对路径)+长度`,而路径形如
+     * `media/out/url-<md5>.<ext>`,在开源仓库里完全可推,等于谁都能枚举下载。
+     *
+     * @return `/media/<token>`,由 HttpServer 提供;调用方拼上 host:port。
+     */
     fun publish(f: File): String {
-        val token = md5Str(f.absolutePath) + "-" + f.length()
-        tokens[token] = f
+        val raw = ByteArray(16).also(tokenRng::nextBytes)
+        val token = hex(raw)
+        synchronized(tokensLock) {
+            tokens[token] = f
+            // 同一文件重复发布会不断堆积 token,按**插入序**截断最老的。
+            // 刚插入的这条位于队尾,不会被自己淘汰 —— 这正是旧实现使用
+            // ConcurrentHashMap 无序迭代时踩到的问题。
+            while (tokens.size > PUBLISH_CAP) {
+                val oldest = tokens.keys.iterator()
+                if (!oldest.hasNext()) break
+                oldest.next()
+                oldest.remove()
+            }
+        }
         return "/media/" + token
     }
 
-    fun lookup(token: String): File? = tokens[token]?.takeIf { it.isFile }
+    fun lookup(token: String): File? =
+        synchronized(tokensLock) { tokens[token] }?.takeIf { it.isFile }
 
     // ---------------- 工具 ----------------
 
@@ -144,8 +174,6 @@ object MediaFiles {
     }
 
     fun md5Bytes(b: ByteArray): String = hex(MessageDigest.getInstance("MD5").digest(b))
-
-    private fun md5Str(s: String): String = md5Bytes(s.toByteArray(Charsets.UTF_8))
 
     private fun hex(b: ByteArray): String {
         val sb = StringBuilder(b.size * 2)
@@ -217,5 +245,5 @@ object MediaFiles {
     fun stats(): JSONObject = JSONObject()
         .put("resolved", resolved.get())
         .put("downloaded", fetched.get())
-        .put("published", tokens.size)
+        .put("published", synchronized(tokensLock) { tokens.size })
 }
