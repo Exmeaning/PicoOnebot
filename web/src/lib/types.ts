@@ -38,10 +38,8 @@ export interface WsServer {
   host: string;
   port: number;
   token: string;
-  heartbeat: number;
-  messageFormat: "array" | "string";
-  reportSelfMessage: boolean;
-  debug: boolean;
+  cors: boolean;
+  websocket: boolean;
 }
 
 export interface WsClient {
@@ -50,11 +48,7 @@ export interface WsClient {
   enabled: boolean;
   url: string;
   token: string;
-  heartbeat: number;
   reconnectInterval: number;
-  messageFormat: "array" | "string";
-  reportSelfMessage: boolean;
-  debug: boolean;
 }
 
 export interface HttpServer {
@@ -66,8 +60,6 @@ export interface HttpServer {
   token: string;
   cors: boolean;
   websocket: boolean;
-  messageFormat: "array" | "string";
-  debug: boolean;
 }
 
 export interface HttpClient {
@@ -77,10 +69,6 @@ export interface HttpClient {
   url: string;
   token: string;
   secret: string;
-  heartbeat: number;
-  messageFormat: "array" | "string";
-  reportSelfMessage: boolean;
-  debug: boolean;
 }
 
 export interface NetworkConfig {

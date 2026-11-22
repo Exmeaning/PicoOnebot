@@ -83,10 +83,9 @@ object Config {
                     .put("host", v1.optString("host", "0.0.0.0"))
                     .put("port", v1.optInt("port", 3001))
                     .put("token", v1.optString("access_token", ""))
-                    .put("heartbeat", v1.optLong("heartbeat_interval", 5000))
-                    .put("messageFormat", v1.optString("message_format", "array"))
-                    .put("reportSelfMessage", v1.optBoolean("report_self_message", true))
-                    .put("debug", false)
+                    // v1 的这些是进程级语义,归入 general(见下方 general 段)
+                    .put("cors", true)
+                    .put("websocket", true)
             )
         }
 
@@ -96,11 +95,7 @@ object Config {
                 JSONObject()
                     .put("id", newId()).put("name", "反向 WS").put("enabled", true)
                     .put("url", url).put("token", v1.optString("access_token", ""))
-                    .put("heartbeat", v1.optLong("heartbeat_interval", 5000))
                     .put("reconnectInterval", v1.optLong("reverse_reconnect_min_ms", 3000))
-                    .put("messageFormat", v1.optString("message_format", "array"))
-                    .put("reportSelfMessage", v1.optBoolean("report_self_message", true))
-                    .put("debug", false)
             )
         }
 
@@ -111,10 +106,6 @@ object Config {
                     .put("id", newId()).put("name", "HTTP 上报").put("enabled", true)
                     .put("url", url).put("token", v1.optString("access_token", ""))
                     .put("secret", v1.optString("post_secret", ""))
-                    .put("heartbeat", 0)
-                    .put("messageFormat", v1.optString("message_format", "array"))
-                    .put("reportSelfMessage", v1.optBoolean("report_self_message", true))
-                    .put("debug", false)
             )
         }
 
@@ -142,6 +133,10 @@ object Config {
                 .put("event_queue_size", v1.optInt("event_queue_size", 8192))
                 .put("kernel_probe_delay_ms", v1.optLong("kernel_probe_delay_ms", 5000))
                 .put("webui_dir", v1.optString("webui_dir", "webui"))
+                // v1 的进程级行为字段,原样带过来(此前误放在每条连接里)
+                .put("heartbeat", v1.optLong("heartbeat_interval", 5000))
+                .put("messageFormat", v1.optString("message_format", "array"))
+                .put("reportSelfMessage", v1.optBoolean("report_self_message", true))
         )
         return v2
     }
@@ -161,6 +156,9 @@ object Config {
         if (!net.has("httpServers")) net.put("httpServers", JSONArray())
         if (!net.has("httpClients")) net.put("httpClients", JSONArray())
         fillConnectionIds(net)
+        // 老配置没有这两个开关:按"保持既有行为"补默认值 —— WebSocket 一直开着,
+        // CORS 一直回 *,否则升级后行为会莫名其妙地变。
+        fillConnectionFlags(net)
 
         val g = root.optJSONObject("general") ?: JSONObject().also { root.put("general", it) }
         if (!g.has("logLevel")) g.put("logLevel", "info")
@@ -604,6 +602,27 @@ object Config {
                 }
             }
         }
+    }
+
+    /**
+     * 补齐监听项的 `cors` / `websocket` 开关。
+     *
+     * 老配置里没有这两个字段。缺省必须与**升级前实际行为**一致,否则用户在
+     * 没做任何操作的情况下会发现 CORS 头没了、或者 WS 连不上:
+     *   - wsServers:两者一直开启
+     *   - httpServers:CORS 一直开启;WS 升级此前也是接受的(同一 HttpServer)
+     */
+    private fun fillConnectionFlags(net: JSONObject) {
+        fun fill(key: String, cors: Boolean, websocket: Boolean) {
+            val arr = net.optJSONArray(key) ?: return
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                if (!o.has("cors")) o.put("cors", cors)
+                if (!o.has("websocket")) o.put("websocket", websocket)
+            }
+        }
+        fill("wsServers", cors = true, websocket = true)
+        fill("httpServers", cors = true, websocket = true)
     }
 
     private fun newId(): String = java.lang.Long.toHexString(

@@ -220,7 +220,11 @@ object PicoBoot {
                 PicoLog.e("onebot server refused on $host:$port: missing access token")
                 continue
             }
-            val hs = HttpServer(host, port, HttpServer.Role.ONEBOT, token, id)
+            val hs = HttpServer(
+                host, port, HttpServer.Role.ONEBOT, token, id,
+                allowCors = o.optBoolean("cors", true),
+                allowWebSocket = o.optBoolean("websocket", true)
+            )
             try {
                 hs.start()
                 onebotServers.add(hs)
@@ -250,7 +254,12 @@ object PicoBoot {
                 PicoLog.e("http server refused on $host:$port: missing access token")
                 continue
             }
-            val hs = HttpServer(host, port, HttpServer.Role.ONEBOT, token, id)
+            // httpServers 项:cors / websocket 两个开关在配置里存在,必须真的生效
+            val hs = HttpServer(
+                host, port, HttpServer.Role.ONEBOT, token, id,
+                allowCors = o.optBoolean("cors", true),
+                allowWebSocket = o.optBoolean("websocket", false)
+            )
             try {
                 hs.start()
                 onebotServers.add(hs)

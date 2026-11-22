@@ -35,7 +35,11 @@ class HttpServer(
     /** ONEBOT 角色的鉴权口令；WEBUI 角色使用 Config 中的密码派生值校验。 */
     private val serverToken: String = "",
     /** 起这个监听的网络配置项 id,接进来的连接都挂在它名下。 */
-    val configId: String = ""
+    val configId: String = "",
+    /** 是否回 `Access-Control-Allow-Origin: *`(连接项里的 cors 开关)。 */
+    val allowCors: Boolean = true,
+    /** 是否接受 WebSocket 升级(连接项里的 websocket 开关)。 */
+    val allowWebSocket: Boolean = true
 ) {
 
     enum class Role { ONEBOT, WEBUI }
@@ -136,6 +140,12 @@ class HttpServer(
             val query = if (qIdx >= 0) parseQuery(rawPath.substring(qIdx + 1)) else HashMap()
 
             val upgrade = headers["upgrade"]?.lowercase()
+            if (upgrade == "websocket" && role == Role.ONEBOT && !allowWebSocket) {
+                // 连接项显式关掉了 WebSocket:该端口只提供 HTTP API。
+                writeText(out, 400, "text/plain", "websocket disabled for this listener")
+                sock.close()
+                return
+            }
             if (upgrade == "websocket") {
                 if (role == Role.WEBUI) {
                     if (path.trimEnd('/') != "/api/logs/stream" || !WebApi.authorized(headers, query)) {
@@ -510,7 +520,7 @@ class HttpServer(
                 .append("Content-Type: ").append(mimeOf(f.name)).append("\r\n")
                 .append("Content-Length: ").append(f.length()).append("\r\n")
                 .append("Content-Disposition: inline; filename=\"").append(f.name).append("\"\r\n")
-                .append("Access-Control-Allow-Origin: *\r\n")
+                .apply { if (allowCors) append("Access-Control-Allow-Origin: *\r\n") }
                 .append("Connection: close\r\n\r\n")
                 .toString()
             out.write(head.toByteArray(Charsets.UTF_8))
@@ -547,7 +557,7 @@ class HttpServer(
                 .append("HTTP/1.1 ").append(code).append(if (code == 200) " OK" else " ERR").append("\r\n")
                 .append("Content-Type: ").append(type).append("\r\n")
                 .append("Content-Length: ").append(body.size).append("\r\n")
-                .append("Access-Control-Allow-Origin: *\r\n")
+                .apply { if (allowCors) append("Access-Control-Allow-Origin: *\r\n") }
                 .append("Connection: close\r\n\r\n")
                 .toString()
             out.write(head.toByteArray(Charsets.UTF_8))

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Plus, Pencil, Trash2, Save, RotateCcw, Radio, Cable, Globe, SendHorizontal, Copy } from "lucide-react";
-import { Badge, Button, Card, Empty, Field, Input, Modal, PageHeader, Select, Toggle, useToast } from "../components/ui";
+import { Badge, Button, Card, Empty, Field, Input, Modal, PageHeader, Toggle, useToast } from "../components/ui";
 import { api } from "../lib/api";
 import type { AppConfig, HttpClient, HttpServer, NetworkConfig, WsClient, WsServer } from "../lib/types";
 import { fmtApplied } from "../lib/format";
@@ -19,16 +19,16 @@ const KINDS: { key: Kind; label: string; desc: string; icon: typeof Radio }[] = 
 const uid = () => Math.random().toString(36).slice(2, 10);
 
 function blank(kind: Kind): AnyConn {
-  const base = { id: uid(), name: "", enabled: true, messageFormat: "array" as const, debug: false };
+  const base = { id: uid(), name: "", enabled: true };
   switch (kind) {
     case "wsServers":
-      return { ...base, name: "新的正向 WS", host: "", port: 3001, token: "", heartbeat: 30000, reportSelfMessage: false };
+      return { ...base, name: "新的正向 WS", host: "", port: 3001, token: "", cors: true, websocket: true };
     case "wsClients":
-      return { ...base, name: "新的反向 WS", url: "", token: "", heartbeat: 30000, reconnectInterval: 5000, reportSelfMessage: false };
+      return { ...base, name: "新的反向 WS", url: "", token: "", reconnectInterval: 5000 };
     case "httpServers":
       return { ...base, name: "新的 HTTP 服务", host: "", port: 3000, token: "", cors: true, websocket: false };
     case "httpClients":
-      return { ...base, name: "新的 HTTP 上报", url: "", token: "", secret: "", heartbeat: 30000, reportSelfMessage: false };
+      return { ...base, name: "新的 HTTP 上报", url: "", token: "", secret: "" };
   }
 }
 
@@ -231,8 +231,6 @@ export function Network() {
                     <div className="flex flex-wrap items-center gap-2">
                       <p className="text-sm font-extrabold text-pico-ink">{c.name || "未命名"}</p>
                       <Badge tone={c.enabled ? "green" : "gray"}>{c.enabled ? "已启用" : "已停用"}</Badge>
-                      <Badge tone="pink">{c.messageFormat === "array" ? "消息段数组" : "CQ 码字符串"}</Badge>
-                      {c.debug ? <Badge tone="amber">Debug</Badge> : null}
                     </div>
                     <button
                       className="mt-1 flex items-center gap-1.5 font-mono text-[11px] text-pico-muted hover:text-pico-deep"
@@ -354,29 +352,15 @@ function ConnEditor({ kind, item, isNew, onClose, onSubmit }: { kind: Kind; item
           </Field>
         ) : null}
 
-        {"heartbeat" in draft ? (
-          <Field label="心跳间隔 (ms)" hint="进程级设置，见「偏好设置 → 运行参数」">
-            <Input className="font-mono" type="number" min={0} step={1000} value={Number(d.heartbeat)} disabled />
-          </Field>
-        ) : null}
         {"reconnectInterval" in draft ? (
           <Field label="重连间隔 (ms)">
             <Input className="font-mono" type="number" min={500} step={500} value={Number(d.reconnectInterval)} onChange={(e) => set("reconnectInterval", Number(e.target.value))} />
           </Field>
         ) : null}
 
-        <Field label="消息格式" hint="进程级设置，见「偏好设置 → 运行参数」">
-          <Select value={draft.messageFormat} disabled>
-            <option value="array">消息段数组 (array)</option>
-            <option value="string">CQ 码字符串 (string)</option>
-          </Select>
-        </Field>
-
         <div className="space-y-1 rounded-2xl bg-pico-softer p-3 sm:col-span-2">
-          {"reportSelfMessage" in draft ? <Toggle label="上报自身消息" desc="进程级设置，见「偏好设置 → 运行参数」" checked={Boolean(d.reportSelfMessage)} onChange={() => undefined} /> : null}
           {"cors" in draft ? <Toggle label="允许跨域 (CORS)" desc="浏览器直接调用 API 时需要" checked={Boolean(d.cors)} onChange={(v) => set("cors", v)} /> : null}
           {"websocket" in draft ? <Toggle label="同端口启用 WebSocket" desc="HTTP 与 WS 共用一个端口" checked={Boolean(d.websocket)} onChange={(v) => set("websocket", v)} /> : null}
-          <Toggle label="调试模式" desc="上报事件附带原始 NT 消息结构" checked={draft.debug} onChange={(v) => set("debug", v)} />
           <Toggle label="启用此连接" checked={draft.enabled} onChange={(v) => set("enabled", v)} />
         </div>
         {validationError ? <p className="text-xs font-bold text-rose-600 sm:col-span-2">{validationError}</p> : null}
