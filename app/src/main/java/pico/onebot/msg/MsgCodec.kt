@@ -406,9 +406,21 @@ object MsgCodec {
             spec.startsWith("file://") || spec.startsWith("/")
         if (!looksLikeLocator) {
             val ref = MediaRefStore.get(spec)
-            if (ref != null && ref.localPath.isNotEmpty()) {
-                val f = java.io.File(ref.localPath)
-                if (f.isFile) return f
+            if (ref != null) {
+                // 本地已落地的优先
+                if (ref.localPath.isNotEmpty()) {
+                    val f = java.io.File(ref.localPath)
+                    if (f.isFile) return f
+                }
+                // 落在别处/已被清理时,直链是唯一还能用的来源(合并转发内的媒体
+                // 尤其如此 —— 内层 msgId 定位不到,只有 rkey 直链能下到原文件)。
+                if (ref.url.isNotEmpty()) {
+                    try {
+                        return MediaFiles.resolve(ref.url, ref.fileName)
+                    } catch (t: Throwable) {
+                        PicoLog.w("media ref url fallback failed for " + ref.fileName, t)
+                    }
+                }
             }
         }
         return MediaFiles.resolve(spec, data.optString("name", ""))

@@ -43,6 +43,7 @@ class HttpServer(
     private companion object {
         const val WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
         const val HTTP_READ_TIMEOUT_MS = 30_000
+        const val MAX_BODY_BYTES = 16 * 1024 * 1024
         val actionThreadSeq = AtomicInteger()
         val actionExecutor = ThreadPoolExecutor(
             2,
@@ -429,12 +430,47 @@ class HttpServer(
         return query["access_token"] == token
     }
 
+    /**
+     * 读请求体。
+     *
+     * `Transfer-Encoding: chunked` 必须处理:很多 HTTP 客户端(以及一切没预先
+     * 算好长度的流式 POST)只用 chunked,不发 Content-Length。旧实现直接当
+     * "空 body" 返回,这类请求的 JSON 参数会被整个丢掉,表现为"调用方明明传了
+     * group_id,却收到参数缺失"。
+     */
     private fun readBody(ins: InputStream, headers: Map<String, String>): ByteArray {
+        val te = headers["transfer-encoding"]?.lowercase() ?: ""
+        if (te.contains("chunked")) return readChunkedBody(ins)
         val len = headers["content-length"]?.toIntOrNull() ?: return ByteArray(0)
-        if (len <= 0 || len > 16 * 1024 * 1024) return ByteArray(0)
+        if (len <= 0 || len > MAX_BODY_BYTES) return ByteArray(0)
         val buf = ByteArray(len)
         WsFrame.readFully(ins, buf)
         return buf
+    }
+
+    /** 解析 chunked 编码(只支持不带 chunk-extension 的常见形式)。 */
+    private fun readChunkedBody(ins: InputStream): ByteArray {
+        val out = java.io.ByteArrayOutputStream()
+        while (true) {
+            val sizeLine = WsFrame.readLine(ins) ?: break
+            // 允许 "1a;ext=1" 这种形式,只取分号前的长度
+            val hex = sizeLine.substringBefore(';').trim()
+            val size = hex.toIntOrNull(16) ?: break
+            if (size <= 0) {
+                // 末尾 0 块后面还有一个空行(可能带 trailer),吞掉即可
+                while (true) {
+                    val trailer = WsFrame.readLine(ins) ?: break
+                    if (trailer.isEmpty()) break
+                }
+                break
+            }
+            if (out.size() + size > MAX_BODY_BYTES) throw java.io.IOException("chunked body too large")
+            val chunk = ByteArray(size)
+            WsFrame.readFully(ins, chunk)
+            out.write(chunk)
+            WsFrame.readLine(ins) // 块尾的 CRLF
+        }
+        return out.toByteArray()
     }
 
     private fun parseQuery(q: String): HashMap<String, String> {
