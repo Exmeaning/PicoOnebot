@@ -257,7 +257,16 @@ object WebApi {
     private fun putConfig(body: ByteArray): Response = synchronized(fileWriteLock) {
         val patch = JSONObject(String(body, Charsets.UTF_8))
         val candidate = patch.optJSONObject("network") ?: Config.network()
-        val errors = Config.validateNetwork(candidate)
+        val errors = Config.validateNetwork(candidate).toMutableList()
+        // webui 监听参数直接决定下一次启动能不能连上控制台。清空端口输入框在前端
+        // 会变成 Number("") == 0,写进去就要手改配置文件才能救回来。
+        patch.optJSONObject("webui")?.let { w ->
+            if (w.has("host") && w.optString("host").isBlank()) errors.add("控制台监听地址不能为空")
+            if (w.has("port")) {
+                val p = w.optInt("port", -1)
+                if (p !in 1..65535) errors.add("控制台端口必须在 1-65535 之间")
+            }
+        }
         if (errors.isNotEmpty()) {
             return Response(
                 400,

@@ -355,8 +355,8 @@ function ConnEditor({ kind, item, isNew, onClose, onSubmit }: { kind: Kind; item
         ) : null}
 
         {"heartbeat" in draft ? (
-          <Field label="心跳间隔 (ms)" hint="0 为关闭心跳">
-            <Input className="font-mono" type="number" min={0} step={1000} value={Number(d.heartbeat)} onChange={(e) => set("heartbeat", Number(e.target.value))} />
+          <Field label="心跳间隔 (ms)" hint="进程级设置，见「偏好设置 → 运行参数」">
+            <Input className="font-mono" type="number" min={0} step={1000} value={Number(d.heartbeat)} disabled />
           </Field>
         ) : null}
         {"reconnectInterval" in draft ? (
@@ -365,15 +365,15 @@ function ConnEditor({ kind, item, isNew, onClose, onSubmit }: { kind: Kind; item
           </Field>
         ) : null}
 
-        <Field label="消息格式">
-          <Select value={draft.messageFormat} onChange={(e) => set("messageFormat", e.target.value)}>
+        <Field label="消息格式" hint="进程级设置，见「偏好设置 → 运行参数」">
+          <Select value={draft.messageFormat} disabled>
             <option value="array">消息段数组 (array)</option>
             <option value="string">CQ 码字符串 (string)</option>
           </Select>
         </Field>
 
         <div className="space-y-1 rounded-2xl bg-pico-softer p-3 sm:col-span-2">
-          {"reportSelfMessage" in draft ? <Toggle label="上报自身消息" desc="把 Bot 自己发送的消息也作为事件推送" checked={Boolean(d.reportSelfMessage)} onChange={(v) => set("reportSelfMessage", v)} /> : null}
+          {"reportSelfMessage" in draft ? <Toggle label="上报自身消息" desc="进程级设置，见「偏好设置 → 运行参数」" checked={Boolean(d.reportSelfMessage)} onChange={() => undefined} /> : null}
           {"cors" in draft ? <Toggle label="允许跨域 (CORS)" desc="浏览器直接调用 API 时需要" checked={Boolean(d.cors)} onChange={(v) => set("cors", v)} /> : null}
           {"websocket" in draft ? <Toggle label="同端口启用 WebSocket" desc="HTTP 与 WS 共用一个端口" checked={Boolean(d.websocket)} onChange={(v) => set("websocket", v)} /> : null}
           <Toggle label="调试模式" desc="上报事件附带原始 NT 消息结构" checked={draft.debug} onChange={(v) => set("debug", v)} />

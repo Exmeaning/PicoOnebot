@@ -76,6 +76,7 @@ function defaultConfig(): AppConfig {
       logLevel: "info", forwardMode: "merge_one",
       forwardMergeHeader: "〔合并转发〕", mediaBaseUrl: "", mediaBase64Limit: 4194304,
       sendRatePerSec: 5, kernelCallTimeoutMs: 30000,
+      heartbeat: 5000, messageFormat: "array", reportSelfMessage: true,
     },
   };
 }

@@ -92,6 +92,9 @@ export interface NetworkConfig {
 
 export type ForwardMode = "merge_one" | "separate" | "silent";
 
+/** 进程级消息格式:对全部连接生效(不是每条连接各自的开关)。 */
+export type MessageFormat = "array" | "string";
+
 export interface GeneralConfig {
   logLevel: LogLevel;
   forwardMode: ForwardMode;
@@ -100,6 +103,12 @@ export interface GeneralConfig {
   mediaBase64Limit: number;
   sendRatePerSec: number;
   kernelCallTimeoutMs: number;
+  /** 心跳间隔(ms),0 为关闭。进程级。 */
+  heartbeat: number;
+  /** 消息格式。进程级。 */
+  messageFormat: MessageFormat;
+  /** 是否把 Bot 自身发送的消息也作为事件推送。进程级。 */
+  reportSelfMessage: boolean;
 }
 
 export interface WebuiConfig {

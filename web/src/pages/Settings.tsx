@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { Palette, Check, Save, RotateCcw, SlidersHorizontal, ShieldCheck, Wand2, ChevronDown } from "lucide-react";
-import { Button, Card, CardHeader, Field, Input, PageHeader, Select, useToast, Badge } from "../components/ui";
+import { Button, Card, CardHeader, Field, Input, PageHeader, Select, Toggle, useToast, Badge } from "../components/ui";
 import { THEME_PRESETS, useTheme } from "../store/theme";
 import { api, getBaseUrl, setBaseUrl } from "../lib/api";
-import type { AppConfig, ForwardMode, GeneralConfig, LogLevel, WebuiConfig } from "../lib/types";
+import type { AppConfig, ForwardMode, GeneralConfig, LogLevel, MessageFormat, WebuiConfig } from "../lib/types";
 import { cn } from "../utils/cn";
 
 export function Settings() {
@@ -202,6 +202,18 @@ export function Settings() {
                 <Field label="base64 内联上限（字节）" hint="超过则改用外链，不塞进事件">
                   <Input type="number" className="font-mono" value={g.mediaBase64Limit} onChange={(e) => set("mediaBase64Limit", Number(e.target.value))} />
                 </Field>
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <Field label="心跳间隔（毫秒）" hint="0 为关闭心跳；对所有连接生效">
+                    <Input type="number" min={0} step={1000} value={Number(g.heartbeat)} onChange={(e) => set("heartbeat", Number(e.target.value))} />
+                  </Field>
+                  <Field label="消息格式" hint="对所有连接生效">
+                    <Select value={g.messageFormat} onChange={(e) => set("messageFormat", e.target.value as MessageFormat)}>
+                      <option value="array">消息段数组 (array)</option>
+                      <option value="string">CQ 码字符串 (string)</option>
+                    </Select>
+                  </Field>
+                </div>
+                <Toggle label="上报自身消息" desc="把 Bot 自己发送的消息也作为事件推送；对所有连接生效" checked={Boolean(g.reportSelfMessage)} onChange={(v) => set("reportSelfMessage", v)} />
               </>
             )}
           </div>
