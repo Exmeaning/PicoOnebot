@@ -33,7 +33,6 @@ class WsConn(
         const val PENDING_CAPACITY = 1024
         const val PING_INTERVAL_MS = 20_000L
         const val READ_IDLE_TIMEOUT_MS = 60_000
-        const val DROP_LOG_INTERVAL_MS = 5_000L
     }
 
     private val writeLock = Object()
@@ -41,7 +40,6 @@ class WsConn(
     private val notEmpty = queueLock.newCondition()
     private val pending = ArrayDeque<String>(PENDING_CAPACITY)
     private val droppedEvents = AtomicLong()
-    private val lastDropLogAt = AtomicLong()
     private val writer = Thread({ writeLoop() }, "pico-ws-send").apply { isDaemon = true }
 
     @Volatile
@@ -60,29 +58,40 @@ class WsConn(
     val wantsEvents: Boolean get() = role == Role.EVENT || role == Role.BOTH
     val wantsActions: Boolean get() = role == Role.API || role == Role.BOTH
 
+    /** 因发送队列溢出而被迫关闭的次数(每条连接累计)。 */
+    fun overflowCount(): Long = droppedEvents.get()
+
+    /**
+     * 入队一条待发文本。
+     *
+     * 队列满时**不再"丢最老却返回 true"** —— 那会让 [Transport.broadcast] 误以为投递成功,
+     * 既不写重连回放缓冲,也不告诉任何人某条事件已经没了。这里按 docs/config/network.md
+     * 承诺的语义处理:关掉这条慢连接,由对端重连后从回放缓冲补齐。
+     *
+     * @return true 已入队;false 连接已关闭或已因队列溢出被关闭(本轮未投递)。
+     */
     fun sendText(text: String): Boolean {
-        var droppedOldest = false
+        var overflowed = false
         queueLock.lock()
         try {
             if (closed) return false
             if (pending.size >= PENDING_CAPACITY) {
-                pending.removeFirst()
-                droppedOldest = true
+                overflowed = true
+            } else {
+                pending.addLast(text)
+                notEmpty.signal()
+                return true
             }
-            pending.addLast(text)
-            notEmpty.signal()
         } finally {
             queueLock.unlock()
         }
-        if (droppedOldest) {
-            val totalDropped = droppedEvents.incrementAndGet()
-            val now = System.currentTimeMillis()
-            val prev = lastDropLogAt.get()
-            if (now - prev >= DROP_LOG_INTERVAL_MS && lastDropLogAt.compareAndSet(prev, now)) {
-                PicoLog.w("ws send queue full on $tag; dropped oldest event (totalDropped=$totalDropped)")
-            }
+        // close() 自己会拿 queueLock,必须放到锁外
+        if (overflowed) {
+            droppedEvents.incrementAndGet()
+            PicoLog.w("ws send queue overflow on $tag; closing slow peer (totalOverflow=" + droppedEvents.get() + ")")
+            close()
         }
-        return true
+        return false
     }
 
     private fun writeLoop() {
