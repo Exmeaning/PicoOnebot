@@ -26,7 +26,14 @@ object ContactListeners {
     @Volatile
     private var buddyListenerId: Long = 0
 
-    val registered: Boolean get() = groupListenerId != 0L || buddyListenerId != 0L
+    /**
+     * **两个都注册成功**才算就绪。
+     *
+     * 用 || 会让"群监听成功、好友监听失败"的情况被当成已完成:`KernelGate.probe` 的
+     * `!registered` 条件从此永远为假,失败的那个监听器终身不再重试,好友或群名册
+     * 永久缺失且没有任何自愈路径。
+     */
+    val registered: Boolean get() = groupListenerId != 0L && buddyListenerId != 0L
 
     /** 幂等:已注册过就直接返回。调用时机是 KernelGate 探测到 ONLINE 之后。 */
     fun register() {

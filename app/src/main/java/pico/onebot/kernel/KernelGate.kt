@@ -179,6 +179,8 @@ object KernelGate {
                 .onFailure { PicoLog.d("removeKernelMsgListener($oldId) ignored: ${it.message}") }
         }
         ContactListeners.reset()
+        // 名册是"当前账号的视角",不清就会在换号后把上一个人的群/好友返回给上游
+        ContactStore.reset()
         setState(State.LOGGED_OUT)
         wakeWatch()
     }
