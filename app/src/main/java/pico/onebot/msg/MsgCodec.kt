@@ -71,7 +71,13 @@ object MsgCodec {
                 t.atType == AT_ALL -> seg("at", JSONObject().put("qq", "all"))
                 t.atType != AT_NONE -> {
                     val uin = if (t.atUid > 0) t.atUid else UinUidStore.uin(t.atNtUid)
-                    seg("at", JSONObject().put("qq", uin.toString()).put("name", t.content ?: ""))
+                    // uin 解析不出来时**绝不能**下发 "0":发送侧会把 "0" 当成 @全体,
+                    // 上游原样回传一次普通的 @某人 就会变成 @全体成员。降级成纯文本。
+                    if (uin <= 0) {
+                        seg("text", JSONObject().put("text", t.content ?: "@"))
+                    } else {
+                        seg("at", JSONObject().put("qq", uin.toString()).put("name", t.content ?: ""))
+                    }
                 }
                 else -> seg("text", JSONObject().put("text", t.content ?: ""))
             }
@@ -426,11 +432,14 @@ object MsgCodec {
         val e = MsgElement()
         e.elementType = T_TEXT
         val t = TextElement()
-        if (qq == "all" || qq == "0") {
+        // 只有 "all" 才是 @全体。历史实现把 qq="0" 也当 @全体,而上游完全可能
+        // 因为「收不到 uin」而回传 qq="0"(旧版本接收侧就会这么发),那等于静默全员 @。
+        if (qq == "all") {
             t.atType = AT_ALL
             t.content = "@全体成员"
         } else {
             val uin = qq.toLongOrNull() ?: 0L
+            if (uin <= 0) throw UnsupportedSegment("at(qq 非法: $qq)")
             val uid = UinUidStore.uid(uin)
             if (uid.isEmpty()) throw UnsupportedSegment("at(uid 未知: $qq)")
             t.atType = AT_ONE
