@@ -65,8 +65,18 @@ class HttpServer(
 
     fun start() {
         val s = ServerSocket()
-        s.reuseAddress = true
-        s.bind(InetSocketAddress(InetAddress.getByName(host), port))
+        try {
+            s.reuseAddress = true
+            s.bind(InetSocketAddress(InetAddress.getByName(host), port))
+        } catch (t: Throwable) {
+            // bind 失败时这个 ServerSocket 还没交给任何人,不关就会泄漏 FD。
+            // 热重载时端口被占是常见情况,一次次重试会累积成真问题。
+            try {
+                s.close()
+            } catch (ignored: Throwable) {
+            }
+            throw t
+        }
         server = s
         running = true
         Thread({ acceptLoop(s) }, "pico-http-accept").apply { isDaemon = true }.start()
@@ -280,6 +290,7 @@ class HttpServer(
 
     // ---------------- HTTP ----------------
 
+    @Suppress("UNUSED_PARAMETER")
     private fun serveHttp(
         sock: Socket,
         out: OutputStream,
@@ -334,8 +345,8 @@ class HttpServer(
                 return
             }
 
-            if (method == "GET" && serveStatic(out, path)) return
-
+            // OneBot 端口不提供 WebUI 静态文件:那是控制台资产,不该暴露给
+            // 任何能连上 3001 的对端(而且这里没有控制台的鉴权语义)。
             writeText(out, 404, "application/json", Ob.failed(1404, "unknown action or path: $path").toString())
         } finally {
             try {
@@ -354,7 +365,11 @@ class HttpServer(
         val dir = Config.webuiDir
         if (dir.isDirectory) {
             val f = File(dir, rel)
-            if (f.canonicalPath.startsWith(dir.canonicalPath) && f.isFile) {
+            // 必须带分隔符:只用 startsWith(dir) 会让同前缀的兄弟目录
+            // (webui2/、webui-backup/) 通过 `../webui2/x` 被读到。
+            val root = try { dir.canonicalPath } catch (_: Throwable) { return false }
+            val target = try { f.canonicalPath } catch (_: Throwable) { return false }
+            if (target.startsWith(root + File.separator) && f.isFile) {
                 writeBytes(out, 200, mimeOfStatic(rel), f.readBytes())
                 return true
             }
