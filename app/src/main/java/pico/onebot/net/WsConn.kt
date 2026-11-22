@@ -147,12 +147,24 @@ class WsConn(
         } finally {
             queueLock.unlock()
         }
+        // 尽力发一个 CLOSE 帧(状态码 1000 正常关闭),让对端按正常关闭处理
+        // 而不是只看到 TCP 断开、记成 1006 异常关闭。失败无所谓,反正要关了。
+        try {
+            synchronized(writeLock) {
+                WsFrame.write(out, WsFrame.OP_CLOSE, closePayload(1000), maskOut)
+            }
+        } catch (ignored: Throwable) {
+        }
         try {
             socket.close()
         } catch (ignored: Throwable) {
         }
         writer.interrupt()
     }
+
+    /** RFC 6455 §5.5.1:关闭帧负载是 2 字节大端状态码。 */
+    private fun closePayload(code: Int): ByteArray =
+        byteArrayOf(((code shr 8) and 0xFF).toByte(), (code and 0xFF).toByte())
 
     /**
      * 阻塞读循环:处理分片、ping/pong、close;每条完整文本回调一次。
@@ -161,24 +173,36 @@ class WsConn(
     fun loop(onText: (String) -> Unit) {
         val acc = ByteArrayOutputStream()
         var accOpcode = -1
+        // maskOut=true 说明本端是反向 WS 的客户端,读的是服务端帧(不带掩码);
+        // 否则本端是服务端,读客户端帧时必须带掩码。
+        val requireMask = !maskOut
         try {
             while (!closed) {
-                val f = WsFrame.read(ins)
+                val f = WsFrame.read(ins, requireMask)
                 when (f.opcode) {
                     WsFrame.OP_PING -> if (!writeFrame(WsFrame.OP_PONG, f.payload)) return
                     WsFrame.OP_PONG -> Unit
                     WsFrame.OP_CLOSE -> return
                     WsFrame.OP_TEXT, WsFrame.OP_BIN -> {
                         if (f.fin) {
+                            // 分片未结束时收到新的 TEXT/BIN 是协议错误,不能把已累积的内容
+                            // 丢掉继续跑(那会静默产出拼接错乱的文本)。
+                            if (accOpcode != -1) throw java.io.IOException("protocol error: new message while fragment open")
                             if (f.opcode == WsFrame.OP_TEXT) onText(String(f.payload, Charsets.UTF_8))
                         } else {
+                            if (accOpcode != -1) throw java.io.IOException("protocol error: new fragment start while fragment open")
                             acc.reset()
                             acc.write(f.payload)
                             accOpcode = f.opcode
                         }
                     }
                     WsFrame.OP_CONT -> {
+                        // 没有起始分片就来 CONT 也是协议错误
+                        if (accOpcode == -1) throw java.io.IOException("protocol error: continuation without start")
                         acc.write(f.payload)
+                        if (acc.size() > WsFrame.MAX_MESSAGE) {
+                            throw java.io.IOException("protocol error: fragmented message exceeds " + WsFrame.MAX_MESSAGE)
+                        }
                         if (f.fin) {
                             if (accOpcode == WsFrame.OP_TEXT) {
                                 onText(String(acc.toByteArray(), Charsets.UTF_8))

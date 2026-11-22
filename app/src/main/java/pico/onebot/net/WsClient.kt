@@ -7,6 +7,7 @@ import pico.onebot.kernel.KernelGate
 import java.io.BufferedInputStream
 import java.net.Socket
 import java.net.URI
+import java.security.MessageDigest
 import java.security.SecureRandom
 
 /**
@@ -21,6 +22,10 @@ class WsClient(
     /** 对应的网络配置项 id,WebUI 按它回报这条反向连接的真实状态。 */
     private val configId: String = ""
 ) {
+
+    private companion object {
+        const val WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+    }
 
     @Volatile
     private var running = false
@@ -133,13 +138,30 @@ class WsClient(
 
         val ins = BufferedInputStream(sock.getInputStream(), 8192)
         val status = WsFrame.readLine(ins) ?: throw java.io.EOFException("no handshake response")
-        if (!status.contains("101")) {
+        // 必须精确匹配状态码:用 contains("101") 时,
+        // "404 Not Found (see /docs/101-x)" 这类状态行也会被判成握手成功。
+        val statusCode = status.split(" ").getOrNull(1)?.toIntOrNull() ?: -1
+        if (statusCode != 101) {
             sock.close()
             throw java.io.IOException("handshake rejected: $status")
         }
+        var acceptHeader: String? = null
         while (true) {
             val line = WsFrame.readLine(ins) ?: break
             if (line.isEmpty()) break
+            val idx = line.indexOf(':')
+            if (idx > 0 && line.substring(0, idx).trim().equals("Sec-WebSocket-Accept", ignoreCase = true)) {
+                acceptHeader = line.substring(idx + 1).trim()
+            }
+        }
+        // RFC 6455 §4.1:客户端必须校验 Accept 摘要,否则可能把非 WS 对端当成 WS
+        val expectedAccept = Base64.encodeToString(
+            MessageDigest.getInstance("SHA-1").digest((key + WS_GUID).toByteArray(Charsets.UTF_8)),
+            Base64.NO_WRAP
+        )
+        if (acceptHeader != null && acceptHeader != expectedAccept) {
+            sock.close()
+            throw java.io.IOException("handshake rejected: bad Sec-WebSocket-Accept")
         }
 
         val c = WsConn(sock, ins, out, "rws:$url", WsConn.Role.BOTH, true, configId)
