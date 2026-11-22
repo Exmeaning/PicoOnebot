@@ -1,12 +1,23 @@
 package momoi.plugin.apkmixin
 
+import com.android.tools.smali.dexlib2.Opcode
+import com.android.tools.smali.dexlib2.ReferenceType
 import com.android.tools.smali.dexlib2.ValueType
+import com.android.tools.smali.dexlib2.builder.MutableMethodImplementation
+import com.android.tools.smali.dexlib2.builder.instruction.BuilderInstruction10x
 import com.android.tools.smali.dexlib2.iface.ClassDef
 import com.android.tools.smali.dexlib2.iface.DexFile
+import com.android.tools.smali.dexlib2.iface.Method
+import com.android.tools.smali.dexlib2.iface.MethodImplementation
+import com.android.tools.smali.dexlib2.iface.instruction.Instruction
+import com.android.tools.smali.dexlib2.iface.instruction.ReferenceInstruction
+import com.android.tools.smali.dexlib2.iface.reference.MethodReference
 import com.android.tools.smali.dexlib2.iface.value.TypeEncodedValue
 import com.android.tools.smali.dexlib2.immutable.ImmutableDexFile
+import com.android.tools.smali.dexlib2.immutable.ImmutableMethodImplementation
 import com.android.tools.smali.dexlib2.rewriter.DexFileRewriter
 import com.android.tools.smali.dexlib2.rewriter.DexRewriter
+import com.android.tools.smali.dexlib2.rewriter.MethodRewriter
 import com.android.tools.smali.dexlib2.rewriter.Rewriter
 import com.android.tools.smali.dexlib2.rewriter.RewriterModule
 import com.android.tools.smali.dexlib2.rewriter.Rewriters
@@ -28,7 +39,9 @@ import org.gradle.api.Project
 import java.io.File
 import java.io.FileNotFoundException
 import java.io.IOException
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.ZipFile
 import kotlin.getValue
 
@@ -185,7 +198,10 @@ class MixinProcessor(
     }
 
     private fun writeDexOutput(trgDex: DexFile, newDex: DexFile, modifiedClasses: Map<String, ClassDef>, targetZipFile: ZipFile) {
-        val rewriter = createDexRewriter(newDex, modifiedClasses)
+        val stripVibrationCalls = PERMISSION_VIBRATE in extension.removeUsesPermissions
+        val strippedVibrationMethods = ConcurrentHashMap<String, Int>()
+        val strippedVibrationCalls = AtomicInteger(0)
+        val rewriter = createDexRewriter(newDex, modifiedClasses, stripVibrationCalls, strippedVibrationMethods, strippedVibrationCalls)
         lifecycle("Writing dex...")
         val stopWatchWriteDex = Stopwatch.createStarted()
         val namer = BasicDexFileNamer()
@@ -204,6 +220,10 @@ class MixinProcessor(
             /* maxDexPoolSize = */ DexIO.DEFAULT_MAX_DEX_POOL_SIZE,
             /* logger = */ null
         )
+
+        if (stripVibrationCalls) {
+            lifecycle("Stripped ${strippedVibrationCalls.get()} vibration call(s) across ${strippedVibrationMethods.size} method(s)")
+        }
 
         stopWatchWriteDex.stop()
         lifecycle("Dex written in ${stopWatchWriteDex.elapsed(TimeUnit.MILLISECONDS)}ms")
@@ -230,7 +250,13 @@ class MixinProcessor(
         lifecycle("Mixin apk written in ${stopWatchZipToApk.elapsed(TimeUnit.MILLISECONDS)}ms")
     }
 
-    private fun createDexRewriter(newClassesDex: DexFile, modifiedClasses: Map<String, ClassDef>): DexRewriter {
+    private fun createDexRewriter(
+        newClassesDex: DexFile,
+        modifiedClasses: Map<String, ClassDef>,
+        stripVibrationCalls: Boolean,
+        strippedVibrationMethods: ConcurrentHashMap<String, Int>,
+        strippedVibrationCalls: AtomicInteger
+    ): DexRewriter {
         return DexRewriter(object : RewriterModule() {
             override fun getDexFileRewriter(rewriters: Rewriters): Rewriter<DexFile?> {
                 return object : DexFileRewriter(rewriters) {
@@ -251,6 +277,61 @@ class MixinProcessor(
                     }
                 }
             }
+
+            override fun getMethodRewriter(rewriters: Rewriters): Rewriter<Method> {
+                if (!stripVibrationCalls) return super.getMethodRewriter(rewriters)
+                return object : MethodRewriter(rewriters) {
+                    override fun rewrite(value: Method): Method {
+                        val impl = value.implementation ?: return super.rewrite(value)
+                        if (impl.instructions.none(::isVibrationCall)) return super.rewrite(value)
+                        val baseImpl = rewriters.methodImplementationRewriter.rewrite(impl)
+                        val mutable = MutableMethodImplementation(baseImpl)
+                        val targetIndices = mutable.instructions.withIndex()
+                            .filter { isVibrationCall(it.value) }
+                            .map { it.index }
+                        if (targetIndices.isEmpty()) return super.rewrite(value)
+                        for (index in targetIndices) {
+                            mutable.replaceInstruction(index, BuilderInstruction10x(Opcode.NOP))
+                        }
+                        val frozenImpl: MethodImplementation = ImmutableMethodImplementation.of(mutable) ?: mutable
+                        val methodKey = "${value.definingClass}->${value.name}(${value.parameterTypes.joinToString("")})${value.returnType}"
+                        if (strippedVibrationMethods.putIfAbsent(methodKey, targetIndices.size) == null) {
+                            strippedVibrationCalls.addAndGet(targetIndices.size)
+                            info("Stripped ${targetIndices.size} vibration call(s) in $methodKey")
+                        }
+                        return object : RewrittenMethod(value) {
+                            override fun getImplementation(): MethodImplementation = frozenImpl
+                        }
+                    }
+                }
+            }
         })
+    }
+
+    private fun isVibrationCall(instruction: Instruction): Boolean {
+        if (instruction !is ReferenceInstruction || instruction.referenceType != ReferenceType.METHOD) {
+            return false
+        }
+        when (instruction.opcode) {
+            Opcode.INVOKE_VIRTUAL,
+            Opcode.INVOKE_VIRTUAL_RANGE,
+            Opcode.INVOKE_SUPER,
+            Opcode.INVOKE_SUPER_RANGE,
+            Opcode.INVOKE_DIRECT,
+            Opcode.INVOKE_DIRECT_RANGE -> Unit
+            else -> return false
+        }
+        val ref = instruction.reference as? MethodReference ?: return false
+        if (ref.returnType != "V") return false
+        return when (ref.definingClass) {
+            "Landroid/os/Vibrator;",
+            "Landroid/os/VibratorManager;" -> ref.name == "vibrate" || ref.name == "cancel"
+            "Landroid/app/NotificationChannel;" -> ref.name == "enableVibration" || ref.name == "setVibrationPattern"
+            else -> false
+        }
+    }
+
+    companion object {
+        private const val PERMISSION_VIBRATE = "android.permission.VIBRATE"
     }
 }

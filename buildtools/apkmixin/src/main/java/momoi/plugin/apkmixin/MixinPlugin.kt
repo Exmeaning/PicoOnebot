@@ -10,6 +10,7 @@ import org.gradle.api.Plugin
 import org.gradle.api.Project
 import org.gradle.api.file.FileCollection
 import org.gradle.api.file.RegularFile
+import org.gradle.api.tasks.Input
 import org.gradle.api.tasks.InputFile
 import org.gradle.api.tasks.InputFiles
 import org.gradle.api.tasks.OutputFile
@@ -84,6 +85,7 @@ class MixinPlugin : Plugin<Project> {
         ManifestPatcher.patch(
             project.outputDir(extension).child(extension.output.unsignedFileName),
             extension.usesPermissions,
+            extension.removeUsesPermissions,
             extension.accessibilityServiceClass,
             extension.accessibilityServiceLabel
         )
@@ -160,6 +162,10 @@ abstract class MixinApkTask: DefaultTask() {
 
     @get:InputFile
     abstract var targetAppFile: RegularFile
+
+    @get:Input
+    val removeUsesPermissions: Set<String>
+        get() = extension.removeUsesPermissions
 
     @get:OutputFile
     val outputMixinFile: RegularFile = project.layout.projectDirectory.dir(extension.output.outputDir).file(extension.output.mixinApkFileName)

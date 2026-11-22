@@ -8,7 +8,7 @@ import pxb.android.axml.NodeVisitor
 import java.io.File
 import java.util.zip.ZipFile
 
-/** Adds manifest entries that ManifestEditor cannot express through its CLI. */
+/** Patches manifest entries that ManifestEditor cannot express through its CLI. */
 internal object ManifestPatcher {
     private const val ANDROID_NS = "http://schemas.android.com/apk/res/android"
     private const val ATTR_LABEL = 0x01010001
@@ -19,10 +19,11 @@ internal object ManifestPatcher {
     fun patch(
         apk: File,
         usesPermissions: Set<String>,
+        removeUsesPermissions: Set<String> = emptySet(),
         accessibilityServiceClass: String,
         accessibilityServiceLabel: String
     ) {
-        if (usesPermissions.isEmpty() && accessibilityServiceClass.isBlank()) return
+        if (usesPermissions.isEmpty() && removeUsesPermissions.isEmpty() && accessibilityServiceClass.isBlank()) return
 
         val manifestBytes = ZipFile(apk).use { zip ->
             val entry = zip.getEntry("AndroidManifest.xml")
@@ -35,6 +36,13 @@ internal object ManifestPatcher {
             ?: error("manifest root is missing from ${apk.name}")
         val application = manifest.children.firstOrNull { it.name == "application" }
             ?: error("application node is missing from ${apk.name}")
+
+        if (removeUsesPermissions.isNotEmpty()) {
+            manifest.children.removeAll { node ->
+                (node.name == "uses-permission" || node.name == "uses-permission-sdk-23") &&
+                    node.androidName() in removeUsesPermissions
+            }
+        }
 
         for (permission in usesPermissions) {
             if (manifest.children.any { it.name == "uses-permission" && it.androidName() == permission }) continue

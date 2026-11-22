@@ -61,6 +61,7 @@ apkMixin {
     targetApk = "source.apk"
     applicationLabel = "PicoOnebot"
     usesPermissions.add("android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS")
+    removeUsesPermissions.add("android.permission.VIBRATE")
     accessibilityServiceClass = "pico.onebot.keepalive.PicoKeepAliveService"
     accessibilityServiceLabel = "PicoOnebot 保活服务"
     useProcessorCountAsThreadCount = project.properties["useProcessorCountAsThreadCount"] == "true"

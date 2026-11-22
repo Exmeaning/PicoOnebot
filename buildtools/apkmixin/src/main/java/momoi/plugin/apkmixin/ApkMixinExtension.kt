@@ -19,6 +19,8 @@ open class ApkMixinExtension {
     var applicationLabel = ""
     /** Permissions appended to the host manifest after the injected dex is merged. */
     val usesPermissions: MutableSet<String> = linkedSetOf()
+    /** Permissions removed from the host manifest after the injected dex is merged. */
+    val removeUsesPermissions: MutableSet<String> = linkedSetOf()
     /** Optional accessibility service implemented by the injected dex. */
     var accessibilityServiceClass = ""
     var accessibilityServiceLabel = ""
