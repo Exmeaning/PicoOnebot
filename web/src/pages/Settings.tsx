@@ -234,6 +234,7 @@ export function Settings() {
                   </Field>
                 </div>
               ) : null}
+              {cfg?.webui.passwordInitialized ? <ChangePasswordInline /> : null}
               <Field label="后端地址（仅本浏览器）" hint="控制台连接的 PicoOnebot API 地址">
                 <div className="flex gap-2 min-w-0">
                   <Input className="font-mono text-xs min-w-0 flex-1" value={base} onChange={(e) => setBase(e.target.value)} />
@@ -254,6 +255,67 @@ export function Settings() {
 
         </div>
       </div>
+    </div>
+  );
+}
+
+/** 修改控制台密码:需要当前密码,成功后所有会话失效需重新登录。 */
+function ChangePasswordInline() {
+  const toast = useToast();
+  const [current, setCurrent] = useState("");
+  const [next, setNext] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const message =
+    next.length > 0 && next.trim().length < 8
+      ? "新密码至少 8 位"
+      : next === "picopico"
+        ? "不能继续使用初始密码"
+        : next.length > 0 && next !== confirm
+          ? "两次输入的新密码不一致"
+          : "";
+
+  const submit = async () => {
+    if (!current) {
+      toast.push("error", "请输入当前密码");
+      return;
+    }
+    if (message) {
+      toast.push("error", message);
+      return;
+    }
+    setBusy(true);
+    try {
+      const r = await api.changeWebuiPassword(current, next.trim());
+      if (!r.ok) throw new Error(r.message || "修改失败");
+      toast.push("success", "密码已修改，请用新密码重新登录");
+      setCurrent(""); setNext(""); setConfirm("");
+      setTimeout(() => window.location.reload(), 1200);
+    } catch (e) {
+      toast.push("error", (e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="space-y-3 rounded-2xl bg-pico-softer p-4">
+      <p className="text-xs font-bold text-pico-ink">修改控制台密码</p>
+      <div className="grid gap-3 sm:grid-cols-3">
+        <Field label="当前密码">
+          <Input type="password" autoComplete="current-password" value={current} onChange={(e) => setCurrent(e.target.value)} />
+        </Field>
+        <Field label="新密码" hint={message && next.length > 0 ? message : "至少 8 位"}>
+          <Input type="password" autoComplete="new-password" value={next} onChange={(e) => setNext(e.target.value)} />
+        </Field>
+        <Field label="确认新密码">
+          <Input type="password" autoComplete="new-password" value={confirm} onChange={(e) => setConfirm(e.target.value)} />
+        </Field>
+      </div>
+      <Button variant="soft" loading={busy} disabled={!current || !next || !!message} onClick={submit}>
+        修改密码
+      </Button>
     </div>
   );
 }

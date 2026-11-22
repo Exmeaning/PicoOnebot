@@ -114,6 +114,12 @@ export const api = {
       method: "PUT", body: JSON.stringify({ token }),
     }),
 
+  /** 修改已初始化的控制台密码。成功后所有会话失效,需要重新登录。 */
+  changeWebuiPassword: (current: string, token: string) =>
+    http<{ ok: boolean; message?: string; sessionsRevoked?: boolean }>("/api/webui/token", {
+      method: "PUT", body: JSON.stringify({ current, token }),
+    }),
+
   /** 让 QQ 退出登录、回到扫码页(与 WebUI 会话登出不同)。 */
   accountLogout: () => http<{ ok: boolean }>("/api/account/logout", { method: "POST" }),
 

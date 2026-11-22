@@ -244,12 +244,30 @@ object Config {
         }
     }
 
-    /** 只允许首次初始化；后续不提供修改或从配置文件找回明文密码的入口。 */
+    /** 首次初始化密码。已初始化后必须走 [changeWebuiPassword](需旧密码)。 */
     @Synchronized
     fun initializeWebuiPassword(password: String): Boolean {
         if (webuiPasswordInitialized) return false
         val w = root.optJSONObject("webui") ?: JSONObject().also { root.put("webui", it) }
         storePasswordHash(w, password)
+        save()
+        return true
+    }
+
+    /**
+     * 修改已初始化的密码,**必须验证旧密码**。
+     *
+     * docs/config/webui.md 承诺可在控制台修改密码,而实现原先只允许首次设置,
+     * 忘记密码后没有任何自救路径(配置文件里只有 PBKDF2 派生值)。
+     *
+     * @return true 已修改;false 旧密码不正确或尚未初始化(后者应走 initialize)。
+     */
+    @Synchronized
+    fun changeWebuiPassword(currentPassword: String, newPassword: String): Boolean {
+        if (!webuiPasswordInitialized) return false
+        if (!verifyWebuiPassword(currentPassword)) return false
+        val w = root.optJSONObject("webui") ?: return false
+        storePasswordHash(w, newPassword)
         save()
         return true
     }
