@@ -10,7 +10,6 @@ import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -28,7 +27,15 @@ object MediaFiles {
     private const val MAX_DOWNLOAD = 100L * 1024 * 1024
     private const val PUBLISH_CAP = 2048
 
-    private val tokens = ConcurrentHashMap<String, File>()
+    /**
+     * token -> 文件,**按插入顺序**淘汰。
+     *
+     * 必须是 `LinkedHashMap` 而不是 `ConcurrentHashMap`:后者的迭代顺序是无序的,
+     * 取 `keys.iterator().next()` 可能正好挑中刚刚生成的 token 自己删掉 → 上游拿到
+     * URL 立刻 404。容量只有 2048,访问频度是"每个文件发布一次",加锁足够。
+     */
+    private val tokens = LinkedHashMap<String, File>()
+    private val tokensLock = Any()
     private val resolved = AtomicLong()
     private val fetched = AtomicLong()
 
@@ -133,18 +140,23 @@ object MediaFiles {
     fun publish(f: File): String {
         val raw = ByteArray(16).also(tokenRng::nextBytes)
         val token = hex(raw)
-        tokens[token] = f
-        // 同一文件重复发布会不断堆积 token,按总量截断
-        while (tokens.size > PUBLISH_CAP) {
-            val oldest = tokens.keys.iterator()
-            if (!oldest.hasNext()) break
-            oldest.next()
-            oldest.remove()
+        synchronized(tokensLock) {
+            tokens[token] = f
+            // 同一文件重复发布会不断堆积 token,按**插入序**截断最老的。
+            // 刚插入的这条位于队尾,不会被自己淘汰 —— 这正是旧实现使用
+            // ConcurrentHashMap 无序迭代时踩到的问题。
+            while (tokens.size > PUBLISH_CAP) {
+                val oldest = tokens.keys.iterator()
+                if (!oldest.hasNext()) break
+                oldest.next()
+                oldest.remove()
+            }
         }
         return "/media/" + token
     }
 
-    fun lookup(token: String): File? = tokens[token]?.takeIf { it.isFile }
+    fun lookup(token: String): File? =
+        synchronized(tokensLock) { tokens[token] }?.takeIf { it.isFile }
 
     // ---------------- 工具 ----------------
 
@@ -233,5 +245,5 @@ object MediaFiles {
     fun stats(): JSONObject = JSONObject()
         .put("resolved", resolved.get())
         .put("downloaded", fetched.get())
-        .put("published", tokens.size)
+        .put("published", synchronized(tokensLock) { tokens.size })
 }

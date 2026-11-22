@@ -185,6 +185,9 @@ object SystemActions {
             .put("msgid_store", JSONObject().put("size", MsgIdStore.size()))
             .put("send_pending", SendTracker.pending())
             .put("media_files", pico.onebot.media.MediaFiles.stats())
+            // 媒体外链是否真的可用(配了 media_base_url,或有在听的 OneBot 端口)。
+            // 纯反向 WS 部署下这曾经是"取图 URL 静默不可用"的最可能来源,放到诊断里可见。
+            .put("media_url_available", PicoBoot.mediaUrlAvailable())
             .put("media_download", JSONObject(pico.onebot.media.MediaDownloader.stats() as Map<*, *>))
             .put("media_refs", pico.onebot.media.MediaRefStore.size())
             .put("nick_cache", pico.onebot.kernel.NickStore.stats())

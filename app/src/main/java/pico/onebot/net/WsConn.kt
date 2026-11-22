@@ -33,13 +33,28 @@ class WsConn(
         const val PENDING_CAPACITY = 1024
         const val PING_INTERVAL_MS = 20_000L
         const val READ_IDLE_TIMEOUT_MS = 60_000
+
+        /**
+         * "尽力发 CLOSE 帧"允许占用的最长时间。
+         *
+         * 这个上限是死锁防线,不是性能调优:`sendText()` 队列溢出时是在
+         * [Transport.broadcast] 的锁内调用 [close] 的,而慢连接的写线程正
+         * 持有写锁卡在 socket 写上。close() 若在这里无限等待,整个事件广播
+         * (含其它健康连接)都会跟着停摆。
+         */
+        const val CLOSE_FRAME_TIMEOUT_MS = 100L
     }
 
-    private val writeLock = Object()
+    /**
+     * 串行化对 `out` 的写。用 [ReentrantLock] 而不是 `synchronized`,
+     * 是为了让 [close] 能 [ReentrantLock.tryLock] —— 见 close() 的注释。
+     */
+    private val writeLock = ReentrantLock()
     private val queueLock = ReentrantLock()
     private val notEmpty = queueLock.newCondition()
     private val pending = ArrayDeque<String>(PENDING_CAPACITY)
     private val droppedEvents = AtomicLong()
+    private val closeRequested = java.util.concurrent.atomic.AtomicBoolean(false)
     private val writer = Thread({ writeLoop() }, "pico-ws-send").apply { isDaemon = true }
 
     @Volatile
@@ -85,13 +100,21 @@ class WsConn(
         } finally {
             queueLock.unlock()
         }
-        // close() 自己会拿 queueLock,必须放到锁外
+        // close() 自己会拿 queueLock,必须放到锁外;而且这里常常是在
+        // Transport.broadcast() 持锁期间被调到的,所以关连接的动作要挪到
+        // 后台线程,不能让广播线程陪着等写锁(见 close() 里的注释)。
         if (overflowed) {
             droppedEvents.incrementAndGet()
             PicoLog.w("ws send queue overflow on $tag; closing slow peer (totalOverflow=" + droppedEvents.get() + ")")
-            close()
+            closeAsync()
         }
         return false
+    }
+
+    /** 把一个可能阻塞的 [close] 挪到后台线程;重复调用只生效一次。 */
+    private fun closeAsync() {
+        if (!closeRequested.compareAndSet(false, true)) return
+        Thread({ close() }, "pico-ws-close").apply { isDaemon = true }.start()
     }
 
     private fun writeLoop() {
@@ -126,8 +149,11 @@ class WsConn(
 
     private fun writeFrame(opcode: Int, payload: ByteArray): Boolean {
         return try {
-            synchronized(writeLock) {
+            writeLock.lock()
+            try {
                 WsFrame.write(out, opcode, payload, maskOut)
+            } finally {
+                writeLock.unlock()
             }
             true
         } catch (t: Throwable) {
@@ -149,12 +175,23 @@ class WsConn(
         }
         // 尽力发一个 CLOSE 帧(状态码 1000 正常关闭),让对端按正常关闭处理
         // 而不是只看到 TCP 断开、记成 1006 异常关闭。失败无所谓,反正要关了。
+        //
+        // 必须 tryLock 且限时:慢连接(半开 TCP / 对端不读)的典型形态就是写线程
+        // 正持有 writeLock 阻塞在 socket 写上,而 close() 恰是在 Transport.broadcast()
+        // 持锁期间由 sendText() 溢出路径调进来的。这里若无条件等锁,socket.close()
+        // 永远轮不到执行,广播锁就跟着永远拿不回来 —— 全部连接一起卡死。
+        // 拿不到锁就跳过 CLOSE 帧,直接关 socket 让写线程自己失败退出。
         try {
-            synchronized(writeLock) {
-                WsFrame.write(out, WsFrame.OP_CLOSE, closePayload(1000), maskOut)
+            if (writeLock.tryLock(CLOSE_FRAME_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                try {
+                    WsFrame.write(out, WsFrame.OP_CLOSE, closePayload(1000), maskOut)
+                } finally {
+                    writeLock.unlock()
+                }
             }
         } catch (ignored: Throwable) {
         }
+        // 先关 socket:这一步会唤醒卡在底层写/读上的线程,且本身不拿任何锁
         try {
             socket.close()
         } catch (ignored: Throwable) {

@@ -76,9 +76,14 @@ object PicoBoot {
      * 正向 WS 配置项),纯反向 WS / 纯 HTTP 上报部署下那个端口根本没人监听,上游取图
      * 直接 connection refused。
      *
-     * @return (port, token);没有任何 OneBot 监听时返回 null。
+     * 选择顺序:**非回环监听优先**。两个监听项并存时(例如 `127.0.0.1:3001` 无 token
+     * + `0.0.0.0:3002` 有 token),先前按插入序取第一个会得到只在回环上可达的端口,
+     * 拼出的 `http://<LAN_IP>:3001/...` 从别的机器根本连不上。
+     *
+     * @return (host, port, token);没有任何 OneBot 监听时返回 null。
      */
-    fun activeOnebotEndpoint(): Pair<Int, String>? = synchronized(this) {
+    fun activeOnebotEndpoint(): Triple<String, Int, String>? = synchronized(this) {
+        var loopback: Triple<String, Int, String>? = null
         for ((id, server) in listenerById) {
             if (!server.running) continue
             val token = Config.wsServers().let { arr ->
@@ -88,9 +93,11 @@ object PicoBoot {
                     (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }.firstOrNull { it.optString("id") == id }
                 }?.optString("token", "")
                 ?: ""
-            return@synchronized server.port to token
+            val candidate = Triple(server.host, server.port, token)
+            if (!Config.isLoopbackHost(server.host)) return@synchronized candidate
+            if (loopback == null) loopback = candidate
         }
-        null
+        loopback
     }
 
     /** 媒体外链是否真的可用:要么配了 media_base_url,要么有在听的 OneBot 端口。 */

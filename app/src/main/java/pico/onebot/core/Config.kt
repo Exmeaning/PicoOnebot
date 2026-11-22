@@ -178,9 +178,41 @@ object Config {
         if (!g.has("webui_dir")) g.put("webui_dir", "webui")
         // 进程级行为(原先误放在每条连接里,见 heartbeatInterval 的注释)。
         // 只在缺失时写入,不覆盖旧配置里已有的值。
-        if (!g.has("heartbeat")) g.put("heartbeat", 5000)
-        if (!g.has("reportSelfMessage")) g.put("reportSelfMessage", true)
-        if (!g.has("messageFormat")) g.put("messageFormat", "array")
+        //
+        // 注意:写入前必须先把老连接项里的同名值迁过来。否则 fillDefaults() 每次启动
+        // 都无条件补默认值,general 里就"永远有值",general*OrServer 的 primaryWsServer()
+        // 回落分支成了死代码 —— 老 v2 用户在 wsServers[0] 配的 heartbeat /
+        // messageFormat:"string" / reportSelfMessage:false 会被静默覆盖成默认值。
+        if (!g.has("heartbeat")) {
+            g.put("heartbeat", legacyServerField("heartbeat") { it.optLong("heartbeat", 5000) } ?: 5000)
+        }
+        if (!g.has("reportSelfMessage")) {
+            g.put("reportSelfMessage", legacyServerField("reportSelfMessage") { it.optBoolean("reportSelfMessage", true) } ?: true)
+        }
+        if (!g.has("messageFormat")) {
+            g.put("messageFormat", legacyServerField("messageFormat") { it.optString("messageFormat", "array") } ?: "array")
+        }
+    }
+
+    /**
+     * 从旧连接项里取一个即将迁移到 `general` 的字段。
+     *
+     * 老配置把 heartbeat / messageFormat / reportSelfMessage 写在每条连接项里;
+     * 现在统一到 general 级,迁移时按"第一个显式写了该字段的启用项"取值,
+     * 找不到则返回 null 由调用方兜默认值。
+     */
+    private fun <T> legacyServerField(key: String, read: (JSONObject) -> T): T? {
+        val arr = wsServers()
+        // 优先看启用的连接项(与 primaryWsServer 的语义一致),再兜所有项
+        var fallback: T? = null
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            if (!o.has(key)) continue
+            val value = read(o)
+            if (o.optBoolean("enabled", true)) return value
+            if (fallback == null) fallback = value
+        }
+        return fallback
     }
 
     @Synchronized
@@ -452,7 +484,16 @@ object Config {
                 val old = byId[item.optString("id", "")] ?: continue
                 for (field in arrayOf("token", "secret")) {
                     if (item.optString(field, "") == REDACTED_MASK) {
-                        item.put(field, old.optString(field, ""))
+                        // 只有原本就有密文时才还原。否则用户给一个**本来没密码**的连接项
+                        // 填 "***" 会被还原成空串(看起来像"设置成功了"),而且会掩盖
+                        // 一个真实的输入错误 —— 这里保留客户端给的值并记一条日志,
+                        // 让它至少是可见的,而不是静默变成空凭证。
+                        val oldValue = old.optString(field, "")
+                        if (oldValue.isNotEmpty()) {
+                            item.put(field, oldValue)
+                        } else {
+                            PicoLog.w("connection " + item.optString("id", "?") + ": '" + field + "' 是掩码且无可还原的旧值,按原样保存")
+                        }
                     }
                 }
             }

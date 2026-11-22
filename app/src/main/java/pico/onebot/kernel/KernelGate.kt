@@ -145,6 +145,11 @@ object KernelGate {
         if (cached != null && cached !== live) {
             onSessionLost("session_replaced")
         }
+        // 会话在本轮探测期间被作废(被踢下线 / 换号替换):上面拿到的 live 快照
+        // 已经过期,不能再写 sessionRef,更不能把状态从 LOGGED_OUT 推回
+        // SESSION_READY / LOGGED_IN —— 那会出现一段假 ONLINE 窗口,动作打到
+        // 已登出的会话上,直到下一轮 200ms 轮询才纠正回来。
+        if (sessionEpoch != epochAtStart) return
         if (sessionRef !== live) sessionRef = live
 
         if (state == State.INIT || state == State.TRANSPORT_UP || state == State.LOGGED_OUT) {
@@ -152,6 +157,8 @@ object KernelGate {
         }
 
         val uin = readSelfUin()
+        // 读 uin 期间同样可能被踢:先校验再写缓存,避免把失效会话的 uin 留在缓存里
+        if (sessionEpoch != epochAtStart) return
         if (uin <= 0) return
         selfUinCache = uin
         if (state == State.SESSION_READY) setState(State.LOGGED_IN)

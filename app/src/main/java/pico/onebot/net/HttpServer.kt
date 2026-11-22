@@ -458,27 +458,39 @@ class HttpServer(
         return buf
     }
 
-    /** 解析 chunked 编码(只支持不带 chunk-extension 的常见形式)。 */
+    /**
+     * 解析 chunked 编码(只支持不带 chunk-extension 的常见形式)。
+     *
+     * 畸形长度必须**报错**,不能静默收尾:旧实现的 `?: break` 会把"读到一半就断"
+     * 当成正常结束交给调用方,JSON 参数缺一半却看起来像请求成功;`size <= 0`
+     * 还会把 `-1` 这种负数当成合法的 0 块结束标记。
+     */
     private fun readChunkedBody(ins: InputStream): ByteArray {
         val out = java.io.ByteArrayOutputStream()
         while (true) {
-            val sizeLine = WsFrame.readLine(ins) ?: break
+            val sizeLine = WsFrame.readLine(ins) ?: throw java.io.IOException("chunked body truncated: missing size line")
             // 允许 "1a;ext=1" 这种形式,只取分号前的长度
             val hex = sizeLine.substringBefore(';').trim()
-            val size = hex.toIntOrNull(16) ?: break
-            if (size <= 0) {
+            val size = hex.toLongOrNull(16)
+                ?: throw java.io.IOException("chunked body malformed: bad chunk size '$hex'")
+            // 负数(如 "-1")不是合法的 0 块结束标记;超出上限的块长度也一并拒绝
+            if (size < 0 || size > MAX_BODY_BYTES) {
+                throw java.io.IOException("chunked body malformed: bad chunk size '$hex'")
+            }
+            if (size == 0L) {
                 // 末尾 0 块后面还有一个空行(可能带 trailer),吞掉即可
                 while (true) {
-                    val trailer = WsFrame.readLine(ins) ?: break
+                    val trailer = WsFrame.readLine(ins) ?: throw java.io.IOException("chunked body truncated: missing trailer terminator")
                     if (trailer.isEmpty()) break
                 }
                 break
             }
             if (out.size() + size > MAX_BODY_BYTES) throw java.io.IOException("chunked body too large")
-            val chunk = ByteArray(size)
+            val chunk = ByteArray(size.toInt())
             WsFrame.readFully(ins, chunk)
             out.write(chunk)
-            WsFrame.readLine(ins) // 块尾的 CRLF
+            // 块尾的 CRLF 也必须存在,否则说明流被截断
+            if (WsFrame.readLine(ins) == null) throw java.io.IOException("chunked body truncated: missing chunk terminator")
         }
         return out.toByteArray()
     }

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Palette, Check, Save, RotateCcw, SlidersHorizontal, ShieldCheck, Wand2, ChevronDown } from "lucide-react";
 import { Button, Card, CardHeader, Field, Input, PageHeader, Select, Toggle, useToast, Badge } from "../components/ui";
 import { THEME_PRESETS, useTheme } from "../store/theme";
-import { api, getBaseUrl, setBaseUrl } from "../lib/api";
+import { api, getBaseUrl, setBaseUrl, setToken } from "../lib/api";
 import type { AppConfig, ForwardMode, GeneralConfig, LogLevel, MessageFormat, WebuiConfig } from "../lib/types";
 import { cn } from "../utils/cn";
 
@@ -270,7 +270,7 @@ function ChangePasswordInline() {
   const message =
     next.length > 0 && next.trim().length < 8
       ? "新密码至少 8 位"
-      : next === "picopico"
+      : next.trim() === "picopico"
         ? "不能继续使用初始密码"
         : next.length > 0 && next !== confirm
           ? "两次输入的新密码不一致"
@@ -291,6 +291,9 @@ function ChangePasswordInline() {
       if (!r.ok) throw new Error(r.message || "修改失败");
       toast.push("success", "密码已修改，请用新密码重新登录");
       setCurrent(""); setNext(""); setConfirm("");
+      // 后端已经吊销所有会话:先清掉本地 token,免得重载首屏拿旧 token
+      // 再打一次必然 401 的请求。
+      setToken("");
       setTimeout(() => window.location.reload(), 1200);
     } catch (e) {
       toast.push("error", (e as Error).message);

@@ -154,14 +154,16 @@ class WsClient(
                 acceptHeader = line.substring(idx + 1).trim()
             }
         }
-        // RFC 6455 §4.1:客户端必须校验 Accept 摘要,否则可能把非 WS 对端当成 WS
+        // RFC 6455 §4.1:客户端必须校验 Accept 摘要,否则可能把非 WS 对端当成 WS。
+        // 响应里**缺少**这个头同样是握手失败 —— 曾写成
+        // `acceptHeader != null && acceptHeader != expected`,省略该头的 101 响应会被放行。
         val expectedAccept = Base64.encodeToString(
             MessageDigest.getInstance("SHA-1").digest((key + WS_GUID).toByteArray(Charsets.UTF_8)),
             Base64.NO_WRAP
         )
-        if (acceptHeader != null && acceptHeader != expectedAccept) {
+        if (acceptHeader != expectedAccept) {
             sock.close()
-            throw java.io.IOException("handshake rejected: bad Sec-WebSocket-Accept")
+            throw java.io.IOException("handshake rejected: bad or missing Sec-WebSocket-Accept")
         }
 
         val c = WsConn(sock, ins, out, "rws:$url", WsConn.Role.BOTH, true, configId)
