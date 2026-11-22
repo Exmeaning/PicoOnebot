@@ -89,7 +89,7 @@ object ContactStore {
         for (v in m.values) {
             val mi = v as? MemberInfo ?: continue
             UinUidStore.feed(mi.uid, mi.uin)
-            NickStore.feed(mi.uid, if (!mi.cardName.isNullOrEmpty()) mi.cardName else mi.nick)
+            NickStore.feedIfAbsent(mi.uid, if (!mi.cardName.isNullOrEmpty()) mi.cardName else mi.nick)
         }
     }
 

@@ -495,7 +495,8 @@ object MsgCodec {
         )
         val direct = candidates.firstOrNull { !it.isNullOrEmpty() }
         if (direct != null) {
-            NickStore.feed(rec.senderUid, direct)
+            // 逐条消息里的名字是弱来源:群名片不该盖掉好友备注,只在没值时补齐
+            NickStore.feedIfAbsent(rec.senderUid, direct)
             return direct
         }
         // 私聊记录三个名字字段全是空(peerName 也是)—— 只能回查好友表。

@@ -31,7 +31,8 @@ object MsgActions {
     private const val CHAT_PRIVATE = 1
     private const val CHAT_GROUP = 2
 
-    private val limiter by lazy { RateLimiter(Config.sendRatePerSec) }
+    // 取值器而非值:WebUI 改发送速率后立刻生效,不必重启
+    private val limiter by lazy { RateLimiter { Config.sendRatePerSec } }
 
     fun register() {
         ActionRouter.register("send_msg") { p ->
