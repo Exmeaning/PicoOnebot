@@ -138,6 +138,11 @@ object PicoLoginManager {
         qrFragmentRef = WeakReference(frag)
         latestQrBytes = picBuf
         latestQrTime = System.currentTimeMillis()
+        // URL 是异步解码出来的。**先把旧值清掉**:否则解码失败时 latestQrTime
+        // 已经更新、latestQrUrl 还挂着上一张码,getOrRefreshQr 的等待条件
+        // (latestQrTime>oldTime && url 非空)会被满足,把过期 URL 当成新码返回,
+        // 而 info() 还会报 expired=false。
+        latestQrUrl = null
         isScanned = false
         isExpired = false
 

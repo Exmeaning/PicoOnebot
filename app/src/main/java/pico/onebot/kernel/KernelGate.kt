@@ -51,6 +51,17 @@ object KernelGate {
     @Volatile
     private var cachedSessionField: java.lang.reflect.Field? = null
 
+    /**
+     * 会话代数。每次 [onSessionLost] 自增,用于让正在执行的 [probe] 立刻作废。
+     *
+     * 没有它时的竞态:probe 在第 123 行通过检查后,内核线程的 onKickedOffLine
+     * 调 onSessionLost 清掉 listenerId 并置 LOGGED_OUT;probe 继续往下跑,
+     * 对已失效的 session 重新注册监听器并置 ONLINE。之后要等一个 5s 的
+     * ONLINE 轮询间隔才会发现,期间动作会打到已登出的会话上。
+     */
+    @Volatile
+    private var sessionEpoch: Long = 0
+
     private const val KERNEL_SERVICE_UTIL = "com.tencent.qqnt.msg.KernelServiceUtil"
 
     // ---------------- 状态机 ----------------
@@ -118,6 +129,7 @@ object KernelGate {
 
     /** 一次探测:会话 → 登录态 → 监听器注册。每步都可独立失败并在下一轮重试。 */
     private fun probe() {
+        val epochAtStart = sessionEpoch
         val cached = sessionRef
         val live = findSessionByReturnType()
         if (live == null || !loggedIn()) {
@@ -148,11 +160,20 @@ object KernelGate {
             val msg = msgService() ?: return
             val id = MsgListenerProxy.register(msg)
             if (id != 0L) {
+                // 注册期间可能已经被踢下线:此时 sessionRef 已被 onSessionLost 清空,
+                // 这颗监听器属于失效会话,必须立刻摘掉,也不能置 ONLINE。
+                if (sessionEpoch != epochAtStart || sessionRef == null) {
+                    PicoLog.w("probe: session lost during listener registration (id=$id), discarding")
+                    // 与 onSessionLost 里同一调用形式:摘掉这颗已属失效会话的监听器
+                    runCatching { live.msgService?.removeKernelMsgListener(id) }
+                        .onFailure { PicoLog.d("discard listener($id) ignored: ${it.message}") }
+                    return
+                }
                 listenerId = id
                 PicoLog.i("kernel msg listener registered, id=$id")
                 setState(State.ONLINE)
             }
-        } else if (state == State.LOGGED_IN) {
+        } else if (state == State.LOGGED_IN && sessionEpoch == epochAtStart) {
             setState(State.ONLINE)
         }
 
@@ -172,6 +193,8 @@ object KernelGate {
             sessionRef = null
             selfUinCache = 0
             selfUidCache = ""
+            // 让正在进行中的 probe 作废(见 sessionEpoch 的注释)
+            sessionEpoch++
         }
         PicoLog.w("session lost: $reason")
         if (oldId != 0L && oldSession != null) {
