@@ -291,7 +291,9 @@ class HttpServer(
     ) {
         try {
             if (path.startsWith("/api/pico")) {
-                if (!authorized(headers, query)) {
+                // 管理接口比普通 action 敏感得多(能改配置、读密钥、踢下线)。
+                // 即使监听项被误配成空 token,也不允许无凭证访问。
+                if (serverToken.isBlank() || !authorized(headers, query)) {
                     writeText(out, 401, "application/json", Ob.failed(1403, "unauthorized").toString())
                     return
                 }

@@ -178,6 +178,11 @@ object Config {
         if (!g.has("event_queue_size")) g.put("event_queue_size", 8192)
         if (!g.has("kernel_probe_delay_ms")) g.put("kernel_probe_delay_ms", 5000)
         if (!g.has("webui_dir")) g.put("webui_dir", "webui")
+        // 进程级行为(原先误放在每条连接里,见 heartbeatInterval 的注释)。
+        // 只在缺失时写入,不覆盖旧配置里已有的值。
+        if (!g.has("heartbeat")) g.put("heartbeat", 5000)
+        if (!g.has("reportSelfMessage")) g.put("reportSelfMessage", true)
+        if (!g.has("messageFormat")) g.put("messageFormat", "array")
     }
 
     @Synchronized
@@ -255,7 +260,11 @@ object Config {
         val previous = root
         root = JSONObject(previous.toString())
         try {
-            patch.optJSONObject("network")?.let { root.put("network", it) }
+            // 先还原 "***" 掩码,再整块替换 network —— 顺序反了就会把掩码写成真值
+            patch.optJSONObject("network")?.let { net ->
+                restoreMaskedConnectionSecrets(net)
+                root.put("network", net)
+            }
             patch.optJSONObject("general")?.let { g ->
                 // 保留不在表单里的调优项
                 val cur = root.optJSONObject("general") ?: JSONObject()
@@ -372,6 +381,12 @@ object Config {
         .put("network", JSONObject(network().toString()))
         .put("general", JSONObject(general().toString()))
 
+    /** [redactedRaw] 使用的掩码;回写时原样带回来表示"保持原值不动"。 */
+    private const val REDACTED_MASK = "***"
+
+    private val SECRET_CONNECTION_ARRAYS =
+        arrayOf("wsServers", "wsClients", "httpServers", "httpClients")
+
     fun redactedRaw(): JSONObject {
         val copy = JSONObject(root.toString())
         copy.remove("access_token")
@@ -381,7 +396,51 @@ object Config {
             remove("passwordHash")
             put("passwordInitialized", webuiPasswordInitialized)
         }
+        // 连接项里的 token / secret 与 webui 密码同级敏感:这个对象会经
+        // GET /api/pico/config 与 _pico_config 直接下发给调用方,原样返回等于把
+        // 所有 Access Token 明文交出去。
+        copy.optJSONObject("network")?.let { net ->
+            for (key in SECRET_CONNECTION_ARRAYS) {
+                val arr = net.optJSONArray(key) ?: continue
+                for (i in 0 until arr.length()) {
+                    arr.optJSONObject(i)?.apply {
+                        if (optString("token", "").isNotEmpty()) put("token", REDACTED_MASK)
+                        if (optString("secret", "").isNotEmpty()) put("secret", REDACTED_MASK)
+                    }
+                }
+            }
+        }
         return copy
+    }
+
+    /**
+     * 把 `GET /api/pico/config` 下发过的掩码原样还原成当前真值。
+     *
+     * 客户端常见的用法是"取回配置 → 改其中几项 → 整份 PUT 回来"。若不还原,
+     * 掩码 `***` 会被当成真 token 落盘,下次启动整条连接就鉴权失败了。
+     * 按连接项 `id` 对齐;新条目没有 id 匹配就保留客户端给的值。
+     */
+    private fun restoreMaskedConnectionSecrets(incoming: JSONObject) {
+        val current = network()
+        for (key in SECRET_CONNECTION_ARRAYS) {
+            val inArr = incoming.optJSONArray(key) ?: continue
+            val curArr = current.optJSONArray(key) ?: continue
+            val byId = HashMap<String, JSONObject>()
+            for (i in 0 until curArr.length()) {
+                val o = curArr.optJSONObject(i) ?: continue
+                val id = o.optString("id", "")
+                if (id.isNotEmpty()) byId[id] = o
+            }
+            for (i in 0 until inArr.length()) {
+                val item = inArr.optJSONObject(i) ?: continue
+                val old = byId[item.optString("id", "")] ?: continue
+                for (field in arrayOf("token", "secret")) {
+                    if (item.optString(field, "") == REDACTED_MASK) {
+                        item.put(field, old.optString(field, ""))
+                    }
+                }
+            }
+        }
     }
 
     // ---------------- 兼容访问器(签名不变) ----------------
@@ -390,9 +449,44 @@ object Config {
     val host: String get() = primaryWsServer().optString("host", "0.0.0.0")
     val port: Int get() = primaryWsServer().optInt("port", 3001)
     val accessToken: String get() = primaryWsServer().optString("token", "")
-    val heartbeatInterval: Long get() = primaryWsServer().optLong("heartbeat", 5000)
-    val reportSelfMessage: Boolean get() = primaryWsServer().optBoolean("reportSelfMessage", true)
-    val messageFormat: String get() = primaryWsServer().optString("messageFormat", "array")
+
+    /**
+     * 以下三项是**进程级**行为,不是连接级。
+     *
+     * WebUI 曾把它们渲染在每条连接的编辑表单里,但实现只读 `primaryWsServer()`
+     * —— 反向 WS 部署下该数组为空,于是一律落默认值:关不掉自身消息上报、
+     * `messageFormat=string` 无效、`heartbeat: 0` 也关不掉。现在明确改为
+     * `general` 级配置,并回落到旧连接项里的值以兼容老配置文件。
+     */
+    val heartbeatInterval: Long
+        get() = generalLongOrServer("heartbeat", "heartbeat", 5000)
+
+    val reportSelfMessage: Boolean
+        get() = generalBoolOrServer("reportSelfMessage", "reportSelfMessage", true)
+
+    val messageFormat: String
+        get() = generalStrOrServer("messageFormat", "messageFormat", "array")
+
+    private fun generalLongOrServer(generalKey: String, serverKey: String, def: Long): Long {
+        val g = general()
+        if (g.has(generalKey)) return g.optLong(generalKey, def)
+        val s = primaryWsServer()
+        return if (s.has(serverKey)) s.optLong(serverKey, def) else def
+    }
+
+    private fun generalBoolOrServer(generalKey: String, serverKey: String, def: Boolean): Boolean {
+        val g = general()
+        if (g.has(generalKey)) return g.optBoolean(generalKey, def)
+        val s = primaryWsServer()
+        return if (s.has(serverKey)) s.optBoolean(serverKey, def) else def
+    }
+
+    private fun generalStrOrServer(generalKey: String, serverKey: String, def: String): String {
+        val g = general()
+        if (g.has(generalKey)) return g.optString(generalKey, def)
+        val s = primaryWsServer()
+        return if (s.has(serverKey)) s.optString(serverKey, def) else def
+    }
 
     val kernelTimeoutMs: Long get() = long("kernelCallTimeoutMs", 30000)
     val eventQueueSize: Int get() = int("event_queue_size", 8192)
