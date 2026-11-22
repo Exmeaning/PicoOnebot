@@ -11,6 +11,9 @@ import java.util.concurrent.ConcurrentHashMap
  */
 object SendTracker {
 
+    private const val FAILURE_CAP = 256
+    private const val FAILURE_TTL_MS = 60_000L
+
     private val waiting = ConcurrentHashMap<Long, Promise<MsgRecord>>()
 
     fun expect(msgId: Long): Promise<MsgRecord> {
@@ -47,23 +50,26 @@ object SendTracker {
         val at: Long = System.currentTimeMillis()
     }
 
-    private val failures = ConcurrentHashMap<String, SendFailure>()
-
-    private fun failKey(chatType: Int, peerUid: String) = chatType.toString() + ":" + peerUid
+    /**
+     * 按 `msgId` 索引。**不能用会话做键**:同一会话上连续两次发送时,后一次会把
+     * 前一次的失败覆盖掉,而调用方拿到的是自己那条 msgId 的结果。
+     */
+    private val failures = ConcurrentHashMap<Long, SendFailure>()
 
     fun onSendError(msgId: Long, chatType: Int, peerUid: String, code: Int, msg: String) {
         val f = SendFailure(msgId, chatType, peerUid, code, msg)
-        failures[failKey(chatType, peerUid)] = f
+        failures[msgId] = f
+        // 失败可能晚于调用方的等待窗口到达(或调用方早已超时返回),没人取走的记录
+        // 必须自己过期,否则这张表只增不减。
+        if (failures.size > FAILURE_CAP) {
+            val now = System.currentTimeMillis()
+            failures.entries.removeAll { now - it.value.at > FAILURE_TTL_MS }
+            if (failures.size > FAILURE_CAP) failures.keys.take(failures.size - FAILURE_CAP).forEach { failures.remove(it) }
+        }
         // 正在等这条 msgId 落库的调用方不该再干等到超时
         waiting.remove(msgId)?.resolve(null)
     }
 
-    /** 取走 [since] 之后、该会话上的发送失败(取走即清,避免影响下一次发送)。 */
-    fun takeFailureSince(chatType: Int, peerUid: String, since: Long): SendFailure? {
-        val k = failKey(chatType, peerUid)
-        val f = failures[k] ?: return null
-        if (f.at < since) return null
-        failures.remove(k)
-        return f
-    }
+    /** 取走这条 msgId 的异步投递失败(取走即清)。 */
+    fun takeFailure(msgId: Long): SendFailure? = if (msgId == 0L) null else failures.remove(msgId)
 }
