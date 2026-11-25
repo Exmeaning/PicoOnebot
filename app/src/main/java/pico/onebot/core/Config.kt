@@ -176,6 +176,13 @@ object Config {
         if (!g.has("event_queue_size")) g.put("event_queue_size", 8192)
         if (!g.has("kernel_probe_delay_ms")) g.put("kernel_probe_delay_ms", 5000)
         if (!g.has("webui_dir")) g.put("webui_dir", "webui")
+        if (!g.has("autoMarkRead")) g.put("autoMarkRead", true)
+        if (!g.has("readReportBatch")) g.put("readReportBatch", 10)
+        if (!g.has("readReportIntervalSec")) g.put("readReportIntervalSec", 60L)
+        if (!g.has("readReportMinGapMs")) g.put("readReportMinGapMs", 1500L)
+        if (!g.has("readReportMaxPerMin")) g.put("readReportMaxPerMin", 18)
+        if (!g.has("silenceSyncThresholdSec")) g.put("silenceSyncThresholdSec", 600L)
+        if (!g.has("silenceSyncMaxAttempts")) g.put("silenceSyncMaxAttempts", 3)
         // 进程级行为(原先误放在每条连接里,见 heartbeatInterval 的注释)。
         // 只在缺失时写入,不覆盖旧配置里已有的值。
         //
@@ -548,6 +555,17 @@ object Config {
     val kernelTimeoutMs: Long get() = long("kernelCallTimeoutMs", 30000)
     val eventQueueSize: Int get() = int("event_queue_size", 8192)
     val sendRatePerSec: Int get() = int("sendRatePerSec", 5)
+    val autoMarkRead: Boolean get() = bool("autoMarkRead", true)
+    val readReportBatch: Int get() = int("readReportBatch", 10).coerceAtLeast(1)
+    val readReportIntervalMs: Long get() = long("readReportIntervalSec", 60L).coerceAtLeast(5L) * 1000L
+    val readReportMinGapMs: Long get() = long("readReportMinGapMs", 1500L).coerceAtLeast(500L)
+    val readReportMaxPerMin: Int get() = int("readReportMaxPerMin", 18).coerceIn(1, 60)
+    val silenceSyncThresholdMs: Long
+        get() {
+            val sec = long("silenceSyncThresholdSec", 600L)
+            return if (sec <= 0L) 0L else sec.coerceAtLeast(60L) * 1000L
+        }
+    val silenceSyncMaxAttempts: Int get() = int("silenceSyncMaxAttempts", 3).coerceIn(0, 10)
     val webuiDir: File get() = File(dataDir, str("webui_dir", "webui"))
     /** WebUI 文件管理器以当前生效配置文件所在的 pico-onebot 目录为根。 */
     val fileManagerDir: File get() = file?.parentFile ?: dataDir

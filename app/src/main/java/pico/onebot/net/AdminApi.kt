@@ -2,10 +2,13 @@ package pico.onebot.net
 
 import org.json.JSONArray
 import org.json.JSONObject
+import pico.onebot.action.ActionRouter
 import pico.onebot.action.SystemActions
 import pico.onebot.core.Config
+import pico.onebot.core.Counters
 import pico.onebot.core.PicoLog
 import pico.onebot.kernel.KernelGate
+import pico.onebot.kernel.MsgWatchdog
 import pico.onebot.proto.Ob
 
 /**
@@ -55,6 +58,32 @@ object AdminApi {
 
             "/selftest" -> Ob.ok(selftest())
 
+            "/sync" -> {
+                val (ok, detail) = MsgWatchdog.triggerSyncNow("admin_api")
+                if (ok) {
+                    Ob.ok(
+                        JSONObject()
+                            .put("triggered", true)
+                            .put("sync_triggered", Counters.syncTriggered())
+                            .put("last_sync_at", Counters.lastSyncAt())
+                    )
+                } else {
+                    Ob.failed(Ob.RC_KERNEL_ERROR, "触发消息同步失败: $detail")
+                }
+            }
+
+            "/mark_read" -> {
+                val params = try {
+                    if (body.isNotEmpty()) JSONObject(String(body, Charsets.UTF_8))
+                    else JSONObject().apply {
+                        for ((k, v) in query) if (k != "access_token") put(k, v)
+                    }
+                } catch (t: Throwable) {
+                    return Ob.failed(Ob.RC_BAD_PARAM, "参数解析失败: " + t.message)
+                }
+                ActionRouter.call("mark_msg_as_read", params)
+            }
+
             else -> Ob.failed(Ob.RC_UNSUPPORTED, "unknown admin path: $subPath")
         }
     }
@@ -79,6 +108,28 @@ object AdminApi {
 
         val uid = d.optJSONObject("uid_cache") ?: JSONObject()
         check("uid_cache", true, "size=" + uid.optInt("size") + " hits=" + uid.optLong("hits") + " misses=" + uid.optLong("misses"))
+
+        val wd = d.optJSONObject("msg_watchdog") ?: JSONObject()
+        val silenceMs = wd.optLong("silence_ms", 0L)
+        val thresholdMs = Config.silenceSyncThresholdMs
+        val silenceOk = thresholdMs <= 0L || silenceMs < thresholdMs
+        check(
+            "msg_silence",
+            silenceOk,
+            "last_recv_at=" + wd.optLong("last_recv_at", 0L) +
+                " silence_ms=" + silenceMs +
+                " sync_triggered=" + wd.optLong("sync_triggered", 0L)
+        )
+
+        val rr = d.optJSONObject("read_reporter") ?: JSONObject()
+        check(
+            "read_reporter",
+            true,
+            "enabled=" + rr.optBoolean("enabled", true) +
+                " sent=" + rr.optLong("sent", 0L) +
+                " failed=" + rr.optLong("failed", 0L) +
+                " pending=" + rr.optInt("pending_messages", 0)
+        )
 
         var allOk = true
         for (i in 0 until checks.length()) {

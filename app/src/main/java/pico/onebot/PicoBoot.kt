@@ -9,7 +9,9 @@ import pico.onebot.event.EventBus
 import pico.onebot.event.MetaEvents
 import pico.onebot.kernel.KernelGate
 import pico.onebot.kernel.MsgPipeline
+import pico.onebot.kernel.MsgWatchdog
 import pico.onebot.kernel.QimeiCompat
+import pico.onebot.kernel.ReadReporter
 import pico.onebot.kernel.UinUidStore
 import pico.onebot.msg.MsgIdStore
 import pico.onebot.net.HttpServer
@@ -147,6 +149,8 @@ object PicoBoot {
 
         EventBus.start()
         MsgPipeline.start()
+        ReadReporter.start()
+        MsgWatchdog.start()
 
         SystemActions.register()
         MsgActions.register()

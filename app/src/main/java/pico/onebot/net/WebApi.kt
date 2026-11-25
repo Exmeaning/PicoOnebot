@@ -14,6 +14,7 @@ import pico.onebot.core.PicoLog
 import pico.onebot.event.MetaEvents
 import pico.onebot.kernel.ContactStore
 import pico.onebot.kernel.KernelGate
+import pico.onebot.kernel.MsgWatchdog
 import pico.onebot.kernel.PicoLoginManager
 import java.io.File
 import java.nio.ByteBuffer
@@ -179,6 +180,12 @@ object WebApi {
             .put("protocol", "OneBot 11")
             .put("msgSent", Counters.sent())
             .put("msgRecv", Counters.recv())
+            .put("lastRecvAt", Counters.lastRecvAt())
+            .put("silenceMs", MsgWatchdog.silenceMs())
+            .put("readReportsSent", Counters.readReportsSent())
+            .put("readReportsFailed", Counters.readReportsFailed())
+            .put("syncTriggered", Counters.syncTriggered())
+            .put("lastSyncAt", Counters.lastSyncAt())
             .put("memoryMb", usedMb)
             .put("cpu", 0)
             .put("friends", ContactStore.friendCount())

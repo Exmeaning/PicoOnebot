@@ -14,6 +14,7 @@ import pico.onebot.core.PicoLog
 import pico.onebot.core.Promise
 import pico.onebot.core.RateLimiter
 import pico.onebot.kernel.KernelGate
+import pico.onebot.kernel.ReadReporter
 import pico.onebot.kernel.SendTracker
 import pico.onebot.kernel.UinUidStore
 import pico.onebot.kernel.NickStore
@@ -44,6 +45,7 @@ object MsgActions {
         ActionRouter.register("delete_msg") { p -> deleteMsg(p) }
         ActionRouter.register("get_msg") { p -> getMsg(p) }
         ActionRouter.register("get_forward_msg") { p -> getForwardMsg(p) }
+        ActionRouter.register("mark_msg_as_read") { p -> markMsgAsRead(p) }
     }
 
     // ---------------- 发送 ----------------
@@ -294,5 +296,44 @@ object MsgActions {
         val rec = records.firstOrNull()
             ?: return Ob.failed(Ob.RC_KERNEL_ERROR, "内核没有返回该消息")
         return Ob.ok(MsgCodec.toMessageBody(rec))
+    }
+
+    /** 主动上报指定会话已读(发送 SsoReadedReport 推进服务端 read_msg_seq)。 */
+    private fun markMsgAsRead(p: JSONObject): JSONObject {
+        if (!KernelGate.ready) return Ob.notReady("mark_msg_as_read")
+        val groupId = p.optString("group_id", "").trim().toLongOrNull() ?: p.optLong("group_id", 0L)
+        val userId = p.optString("user_id", "").trim().toLongOrNull() ?: p.optLong("user_id", 0L)
+        val messageId = p.optString("message_id", "").trim().toIntOrNull() ?: p.optInt("message_id", 0)
+
+        val chatType: Int
+        val peerUid: String
+        when {
+            groupId > 0L -> {
+                chatType = CHAT_GROUP
+                peerUid = groupId.toString()
+            }
+            userId > 0L -> {
+                val uid = UinUidStore.uid(userId)
+                if (uid.isEmpty()) {
+                    return Ob.failed(Ob.RC_NOT_READY, "拿不到 $userId 的 uid(需要先有一次交互或好友列表同步)")
+                }
+                chatType = CHAT_PRIVATE
+                peerUid = uid
+            }
+            messageId != 0 -> {
+                val entry = MsgIdStore.byMessageId(messageId)
+                    ?: return Ob.failed(Ob.RC_BAD_PARAM, "未知 message_id: $messageId")
+                chatType = entry.chatType
+                peerUid = entry.peerUid
+            }
+            else -> return Ob.failed(Ob.RC_BAD_PARAM, "需要 group_id、user_id 或 message_id")
+        }
+
+        val (ok, detail) = ReadReporter.markReadNow(chatType, peerUid)
+        return if (ok) {
+            Ob.ok(JSONObject().put("chat_type", chatType).put("peer_uid", peerUid))
+        } else {
+            Ob.failed(Ob.RC_KERNEL_ERROR, "已读上报失败: $detail")
+        }
     }
 }

@@ -65,7 +65,7 @@ hr "7. Binder 相关内核/系统日志"
 dmesg 2>/dev/null | grep -i -m 20 'binder\|permission denied' || echo "（无）"
 
 hr "8. 应用日志（末 60 行）"
-logcat -d -t 60 -s PicoOnebot:V AndroidRuntime:E 2>/dev/null || echo "（logcat 不可用）"
+logcat -d -t 60 -s PicoOB:V AndroidRuntime:E 2>/dev/null || echo "（logcat 不可用）"
 
 echo
 echo "===== 报告结束 ====="

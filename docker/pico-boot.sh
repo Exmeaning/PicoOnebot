@@ -96,6 +96,27 @@ if pm path "$PKG" >/dev/null 2>&1; then
     pm grant "$PKG" android.permission.WRITE_EXTERNAL_STORAGE 2>/dev/null || true
 fi
 
+# ── 3b. Redroid 电源/防息屏/Doze/网络检测加固 ───────────────────────────────
+log "配置 Redroid 电源、防息屏、Doze 与 Captive Portal ..."
+# 模拟已插电满电状态：Android 的 svc power stayon 仅在系统判定已插电(ac/usb/wireless)时生效
+dumpsys battery set present 1 >/dev/null 2>&1 || true
+dumpsys battery set ac 1 >/dev/null 2>&1 || true
+dumpsys battery set status 2 >/dev/null 2>&1 || true
+dumpsys battery set level 100 >/dev/null 2>&1 || true
+# 防止虚拟屏息屏导致 Activity onStop -> QQ 切后台触发 SilenceMsgMgr 主动报静默
+svc power stayon true >/dev/null 2>&1 || true
+settings put system screen_off_timeout 2147483647 >/dev/null 2>&1 || true
+input keyevent KEYCODE_WAKEUP >/dev/null 2>&1 || true
+# 禁用 Doze 并放行 QQ 后台运行
+dumpsys deviceidle disable >/dev/null 2>&1 || true
+if pm path "$PKG" >/dev/null 2>&1; then
+    dumpsys deviceidle whitelist +"$PKG" >/dev/null 2>&1 || true
+    am set-standby-bucket "$PKG" active >/dev/null 2>&1 || true
+    cmd appops set "$PKG" RUN_ANY_IN_BACKGROUND allow >/dev/null 2>&1 || true
+fi
+# 关闭 Captive Portal 校验，避免无法访问 google.com 时持续报 ETHERNET validation failed
+settings put global captive_portal_mode 0 >/dev/null 2>&1 || true
+
 # ── 4. 启动应用 ─────────────────────────────────────────────────────────────
 log "启动应用 $PKG/$ACTIVITY ..."
 logcat -c >/dev/null 2>&1 || true

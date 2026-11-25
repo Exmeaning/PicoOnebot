@@ -4,12 +4,15 @@ import org.json.JSONArray
 import org.json.JSONObject
 import pico.onebot.PicoBoot
 import pico.onebot.core.Config
+import pico.onebot.core.Counters
 import pico.onebot.core.PicoLog
 import pico.onebot.event.EventBus
 import pico.onebot.kernel.KernelGate
 import pico.onebot.kernel.MsgListenerProxy
 import pico.onebot.kernel.MsgPipeline
+import pico.onebot.kernel.MsgWatchdog
 import pico.onebot.kernel.PicoLoginManager
+import pico.onebot.kernel.ReadReporter
 import pico.onebot.kernel.SendTracker
 import pico.onebot.kernel.UinUidStore
 import pico.onebot.msg.MsgIdStore
@@ -76,6 +79,19 @@ object SystemActions {
         ActionRouter.register("_pico_refresh_qr") {
             val refreshed = PicoLoginManager.refreshQr()
             Ob.ok(JSONObject().put("refreshed", refreshed))
+        }
+        ActionRouter.register("_pico_sync_msg") {
+            val (ok, detail) = MsgWatchdog.triggerSyncNow("action:_pico_sync_msg")
+            if (ok) {
+                Ob.ok(
+                    JSONObject()
+                        .put("triggered", true)
+                        .put("sync_triggered", Counters.syncTriggered())
+                        .put("last_sync_at", Counters.lastSyncAt())
+                )
+            } else {
+                Ob.failed(Ob.RC_KERNEL_ERROR, "触发消息同步失败: $detail")
+            }
         }
     }
 
@@ -161,6 +177,12 @@ object SystemActions {
                 .put("state", KernelGate.state.name)
                 .put("uptime_ms", System.currentTimeMillis() - PicoBoot.startedAt)
                 .put("connections", Transport.count())
+                .put("last_recv_at", Counters.lastRecvAt())
+                .put("silence_ms", MsgWatchdog.silenceMs())
+                .put("read_reports_sent", Counters.readReportsSent())
+                .put("read_reports_failed", Counters.readReportsFailed())
+                .put("sync_triggered", Counters.syncTriggered())
+                .put("last_sync_at", Counters.lastSyncAt())
                 .put("event_queue", EventBus.stats())
                 .put("msg_pipeline", MsgPipeline.stats())
             )
@@ -181,6 +203,9 @@ object SystemActions {
             .put("listener_calls", listener)
             .put("event_queue", EventBus.stats())
             .put("msg_pipeline", MsgPipeline.stats())
+            .put("read_reporter", ReadReporter.stats())
+            .put("msg_watchdog", MsgWatchdog.stats())
+            .put("recent_contacts", MsgWatchdog.recentContactSummary())
             .put("uid_cache", UinUidStore.stats())
             .put("msgid_store", JSONObject().put("size", MsgIdStore.size()))
             .put("send_pending", SendTracker.pending())

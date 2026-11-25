@@ -180,6 +180,11 @@ object MsgPipeline {
         if (!markSeen(rec.msgId)) return
         converted.incrementAndGet()
         pico.onebot.core.Counters.onRecv()
+        if (!isSelf) {
+            val peer = rec.peerUid ?: ""
+            MsgWatchdog.onInboundMessage(rec.chatType, peer, rec.msgSeq)
+            ReadReporter.onInboundMessage(rec.chatType, peer)
+        }
         EventBus.post(event)
     }
 
@@ -267,4 +272,5 @@ object MsgPipeline {
         .put("no_msgid", noMsgId.get())
         .put("pending", if (running) queue.size else 0)
         .put("dedup_size", synchronized(seen) { seen.size })
+        .put("last_recv_at", pico.onebot.core.Counters.lastRecvAt())
 }

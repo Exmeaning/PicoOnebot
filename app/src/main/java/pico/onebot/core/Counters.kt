@@ -11,10 +11,40 @@ object Counters {
 
     private val sent = AtomicLong()
     private val recv = AtomicLong()
+    private val lastRecvAtMs = AtomicLong()
+    private val readReportsSent = AtomicLong()
+    private val readReportsFailed = AtomicLong()
+    private val syncTriggered = AtomicLong()
+    private val lastSyncAtMs = AtomicLong()
 
     fun onSent() { sent.incrementAndGet() }
     fun onRecv() { recv.incrementAndGet() }
 
+    /** 仅由非自发入站消息更新,用于静默观测。 */
+    fun onInboundRecv(at: Long = System.currentTimeMillis()) {
+        while (true) {
+            val prev = lastRecvAtMs.get()
+            if (at <= prev) return
+            if (lastRecvAtMs.compareAndSet(prev, at)) return
+        }
+    }
+
+    /** 换号/会话丢失时复位入站静默起点。 */
+    fun resetLastRecvAt() { lastRecvAtMs.set(0L) }
+
+    fun onReadReportSent() { readReportsSent.incrementAndGet() }
+    fun onReadReportFailed() { readReportsFailed.incrementAndGet() }
+
+    fun onSyncTriggered(at: Long = System.currentTimeMillis()) {
+        syncTriggered.incrementAndGet()
+        lastSyncAtMs.set(at)
+    }
+
     fun sent(): Long = sent.get()
     fun recv(): Long = recv.get()
+    fun lastRecvAt(): Long = lastRecvAtMs.get()
+    fun readReportsSent(): Long = readReportsSent.get()
+    fun readReportsFailed(): Long = readReportsFailed.get()
+    fun syncTriggered(): Long = syncTriggered.get()
+    fun lastSyncAt(): Long = lastSyncAtMs.get()
 }

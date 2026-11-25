@@ -4,6 +4,7 @@ import com.tencent.qqnt.kernel.nativeinterface.IKernelBuddyService
 import com.tencent.qqnt.kernel.nativeinterface.IKernelGroupService
 import com.tencent.qqnt.kernel.nativeinterface.IKernelMsgService
 import com.tencent.qqnt.kernel.nativeinterface.IKernelProfileService
+import com.tencent.qqnt.kernel.nativeinterface.IKernelRecentContactService
 import com.tencent.qqnt.kernel.nativeinterface.IQQNTWrapperSession
 import pico.onebot.core.PicoLog
 import pico.onebot.event.MetaEvents
@@ -211,6 +212,8 @@ object KernelGate {
         ContactListeners.reset()
         // 名册是"当前账号的视角",不清就会在换号后把上一个人的群/好友返回给上游
         ContactStore.reset()
+        ReadReporter.reset()
+        MsgWatchdog.reset()
         setState(State.LOGGED_OUT)
         wakeWatch()
     }
@@ -306,6 +309,7 @@ object KernelGate {
     fun groupService(): IKernelGroupService? = safe { session()?.groupService }
     fun buddyService(): IKernelBuddyService? = safe { session()?.buddyService }
     fun profileService(): IKernelProfileService? = safe { session()?.profileService }
+    fun recentContactService(): IKernelRecentContactService? = safe { session()?.recentContactService }
 
     private fun <T> safe(block: () -> T?): T? = try {
         block()
