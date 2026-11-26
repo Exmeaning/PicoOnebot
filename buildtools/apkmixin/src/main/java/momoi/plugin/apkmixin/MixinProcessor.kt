@@ -2,7 +2,6 @@ package momoi.plugin.apkmixin
 
 import com.android.tools.smali.dexlib2.Opcode
 import com.android.tools.smali.dexlib2.ReferenceType
-import com.android.tools.smali.dexlib2.ValueType
 import com.android.tools.smali.dexlib2.builder.MutableMethodImplementation
 import com.android.tools.smali.dexlib2.builder.instruction.BuilderInstruction10x
 import com.android.tools.smali.dexlib2.iface.ClassDef
@@ -29,11 +28,11 @@ import momoi.plugin.apkmixin.utils.Smali
 import momoi.plugin.apkmixin.utils.SmaliMethod
 import momoi.plugin.apkmixin.utils.ZipUtil
 import momoi.plugin.apkmixin.utils.child
-import momoi.plugin.apkmixin.utils.info
 import momoi.plugin.apkmixin.utils.findClass
 import momoi.plugin.apkmixin.utils.getDexCount
+import momoi.plugin.apkmixin.utils.info
 import momoi.plugin.apkmixin.utils.lifecycle
-import momoi.plugin.apkmixin.utils.toClassDef
+import momoi.plugin.apkmixin.utils.toClassDefOrThrow
 import momoi.plugin.apkmixin.utils.toSmali
 import org.gradle.api.Project
 import java.io.File
@@ -43,26 +42,37 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.ZipFile
-import kotlin.getValue
 
 class MixinProcessor(
     private val project: Project,
     private val inputDexDir: File = project.layout.buildDirectory.dir("intermediates/dex/release/mergeDexRelease").get().asFile,
-    private val targetApkFile: File = project.projectDir.child("mixin").child(extension.targetApk.orEmpty()),
+    private val targetApkFile: File = project.projectDir.child("mixin").child(
+        project.extensions.getByType(ApkMixinExtension::class.java).targetApk.orEmpty()
+    ),
     private val extension: ApkMixinExtension = project.extensions.getByType(ApkMixinExtension::class.java)
 ) {
 
     fun processMixin() {
-        val (srcDex, trgDex, targetZipFile) = loadDexFiles()
+        val (srcDex, trgDex) = loadDexFiles()
+        val apiLevel = resolveApiLevel(srcDex, trgDex)
         val mixinClasses = findMixinClasses(srcDex, trgDex)
-        lifecycle("Processing Mixin...")
+        lifecycle("Processing Mixin (apiLevel=$apiLevel)...")
         val stopwatch = Stopwatch.createStarted()
-        val (newClassesDex, modifiedClasses) = processClasses(srcDex, trgDex, mixinClasses)
+        val (newClassesDex, modifiedClasses) = processClasses(srcDex, trgDex, mixinClasses, apiLevel)
         lifecycle("Mixin processed in ${stopwatch.elapsed(TimeUnit.MILLISECONDS)}ms")
-        writeDexOutput(trgDex, newClassesDex, modifiedClasses, targetZipFile)
+        ZipFile(targetApkFile).use { targetZipFile ->
+            writeDexOutput(trgDex, newClassesDex, modifiedClasses, targetZipFile)
+        }
     }
 
-    private fun loadDexFiles(): Triple<DexFile, DexFile, ZipFile> {
+    private fun resolveApiLevel(srcDex: DexFile, targetDex: DexFile): Int =
+        listOf(srcDex.opcodes.api, targetDex.opcodes.api)
+            .filter { it > 0 }
+            .maxOrNull()
+            ?.coerceAtLeast(21)
+            ?: 34
+
+    private fun loadDexFiles(): Pair<DexFile, DexFile> {
         val srcDex = MultiDexIO.readDexFile(
             /* multiDex = */ true,
             /* file = */ inputDexDir,
@@ -78,13 +88,12 @@ class MixinProcessor(
             /* opcodes = */ null,
             /* logger = */ null
         )
-        val targetZipFile = ZipFile(targetApkFile)
 
-        return Triple(srcDex, trgDex, targetZipFile)
+        return srcDex to trgDex
     }
 
     private fun findMixinClasses(srcDex: DexFile, targetDex: DexFile): Map<ClassDef, ClassDef> {
-        val mixinClasses = mutableMapOf<ClassDef, ClassDef>()
+        val mixinClasses = LinkedHashMap<ClassDef, ClassDef>()
         var mixinClassCount = 0
         srcDex.classes.forEach { srcDef ->
             if (srcDef.annotations.any { it.type == "Lmomoi/anno/mixin/Mixin;" }) {
@@ -98,9 +107,26 @@ class MixinProcessor(
                 srcDef.methods.forEach { m ->
                     m.annotations.forEach { a ->
                         if (a.type == "Lmomoi/anno/mixin/StaticHook;") {
-                            val ref = (a.elements.first().value as TypeEncodedValue).value
-                            mixinClasses[srcDef] = targetDex.findClass(ref)!!
-                            mixinClassCount++
+                            val ref = (a.elements.firstOrNull()?.value as? TypeEncodedValue)?.value
+                                ?: throw IllegalStateException(
+                                    "Malformed @StaticHook annotation on ${srcDef.type}->${m.name}"
+                                )
+                            val targetClass = targetDex.findClass(ref)
+                                ?: throw FileNotFoundException(
+                                    "Can not find @StaticHook target class $ref referenced by ${srcDef.type}->${m.name}"
+                                )
+                            val existing = mixinClasses[srcDef]
+                            if (existing != null && existing.type != targetClass.type) {
+                                throw IllegalStateException(
+                                    "Class ${srcDef.type} declares @StaticHook targeting multiple classes " +
+                                        "(${existing.type} and ${targetClass.type}); split into separate hook classes."
+                                )
+                            }
+                            if (existing == null) {
+                                mixinClasses[srcDef] = targetClass
+                                info("Found StaticHook Class: ${srcDef.type} to $ref")
+                                mixinClassCount++
+                            }
                         }
                     }
                 }
@@ -113,14 +139,15 @@ class MixinProcessor(
     private fun processClasses(
         srcDex: DexFile,
         targetDex: DexFile,
-        mixinClasses: Map<ClassDef, ClassDef>
+        mixinClasses: Map<ClassDef, ClassDef>,
+        apiLevel: Int
     ): Pair<MutableDexFile, Map<String, ClassDef>> {
         val newClassesDex = MutableDexFile()
         val changedDef = mutableMapOf<ClassDef, ClassDef>()
         val modifiedClasses = mutableMapOf<String, ClassDef>()
 
         srcDex.classes.forEach { srcDef ->
-            var content = srcDef.toSmali()
+            var content = srcDef.toSmali(apiLevel)
             mixinClasses.forEach { (rs, rt) ->
                 content = content.replace(rs.type, rt.type)
             }
@@ -128,10 +155,12 @@ class MixinProcessor(
             when {
                 !mixinClasses.containsKey(srcDef) -> {
                     if (targetDex.findClass(srcDef.type) == null) {
-                        newClassesDex.classes.add(content.toClassDef()!!)
+                        newClassesDex.classes.add(
+                            content.toClassDefOrThrow(apiLevel, classHint = srcDef.type)
+                        )
                     }
                 }
-                else -> mixinToTargetClass(srcDef, content, mixinClasses, changedDef, modifiedClasses)
+                else -> mixinToTargetClass(srcDef, content, mixinClasses, changedDef, modifiedClasses, apiLevel)
             }
         }
 
@@ -143,23 +172,33 @@ class MixinProcessor(
         content: String,
         mixinClasses: Map<ClassDef, ClassDef>,
         lastClassesMap: MutableMap<ClassDef, ClassDef>,
-        modifiedClasses: MutableMap<String, ClassDef>
+        modifiedClasses: MutableMap<String, ClassDef>,
+        apiLevel: Int
     ) {
-        val rawTrgDef = mixinClasses[srcDef]!!
+        val rawTrgDef = mixinClasses[srcDef]
+            ?: throw IllegalStateException("Missing target class mapping for mixin ${srcDef.type}")
         val trgDef = lastClassesMap[rawTrgDef] ?: rawTrgDef
         val srcSmali = Smali(content)
-        val trgSmali = Smali(trgDef.toSmali())
+        val trgSmali = Smali(trgDef.toSmali(apiLevel))
 
         processMethods(srcSmali, trgSmali)
         processFields(srcSmali, trgSmali)
 
-        val newTrgDef = trgSmali.toText().toClassDef()!!
-        lastClassesMap[trgDef] = newTrgDef
+        val newTrgDef = trgSmali.toText().toClassDefOrThrow(
+            apiLevel = apiLevel,
+            classHint = "${rawTrgDef.type} (mixin ${srcDef.type})"
+        )
+        // 必须以 rawTrgDef 为键，确保 >=3 个 Mixin 注入同一目标类时依次叠加而非覆盖丢弃前序修改
+        lastClassesMap[rawTrgDef] = newTrgDef
         modifiedClasses[newTrgDef.type] = newTrgDef
     }
 
     private fun processMethods(srcSmali: Smali, trgSmali: Smali) {
         srcSmali.methods.forEach { srcMethod ->
+            // 跳过 Mixin 类自身的默认构造/静态初始化器，避免覆写宿主类构造链
+            if (srcMethod.name == "<init>" || srcMethod.name == "<clinit>") {
+                return@forEach
+            }
             processMethodStaticHook(srcMethod)
             trgSmali.findMethod(srcMethod)?.let { trgMethod ->
                 processMethodBody(srcMethod, trgMethod, trgSmali)
@@ -169,24 +208,40 @@ class MixinProcessor(
     }
 
     private fun processMethodStaticHook(srcMethod: SmaliMethod) {
-        if (srcMethod.body.contains("Lmomoi/anno/mixin/StaticHook;")) {
+        if (srcMethod.body.contains("Lmomoi/anno/mixin/StaticHook;") && "static" !in srcMethod.modifiers) {
             srcMethod.modifiers.add("static")
         }
     }
 
     private fun processMethodBody(srcMethod: SmaliMethod, trgMethod: SmaliMethod, trgSmali: Smali) {
         if (srcMethod.body.contains("Lmomoi/anno/mixin/PrivateCall;")) {
-            srcMethod.modifiers.remove("public")
-            srcMethod.modifiers.remove("protected")
-            srcMethod.modifiers.add("private")
+            srcMethod.modifiers.removeAll(setOf("public", "protected", "private"))
+            srcMethod.modifiers.add(0, "private")
         }
-        srcMethod.body = srcMethod.body.replace("invoke-super", "invoke-virtual")
         val rawCall = trgSmali.getMethodCall(trgMethod)
+        val baseName = trgMethod.name
         var index = 0
+        var candidateName: String
         do {
-            trgMethod.name += "_${index++}"
-        } while (trgSmali.methods.filter { it.name == trgMethod.name }.size > 1)
-        srcMethod.body = srcMethod.body.replace(rawCall, trgSmali.getMethodCall(trgMethod))
+            candidateName = "${baseName}_${index++}"
+        } while (trgSmali.methods.any { it !== trgMethod && it.name == candidateName })
+        trgMethod.name = candidateName
+        val renamedCall = trgSmali.getMethodCall(trgMethod)
+
+        // 仅将当前被覆盖方法的 super 调用（invoke-super / invoke-super/range -> rawCall）
+        // 重定向到重命名后的原实现（invoke-virtual / invoke-virtual/range -> renamedCall），
+        // 避免全局字符串替换误伤其他 super 调用或字符串字面量。
+        val superCallRegex = Regex(
+            """^([ \t]*)invoke-super(/range)?([ \t]+\{[^}]*\},[ \t]*)${Regex.escape(rawCall)}([ \t]*(?:#.*)?)$""",
+            RegexOption.MULTILINE
+        )
+        srcMethod.body = superCallRegex.replace(srcMethod.body) { match ->
+            val indent = match.groupValues[1]
+            val rangeSuffix = match.groupValues[2]
+            val registers = match.groupValues[3]
+            val trailing = match.groupValues[4]
+            "${indent}invoke-virtual${rangeSuffix}${registers}${renamedCall}${trailing}"
+        }
     }
 
     private fun processFields(srcSmali: Smali, trgSmali: Smali) {
@@ -205,15 +260,23 @@ class MixinProcessor(
         lifecycle("Writing dex...")
         val stopWatchWriteDex = Stopwatch.createStarted()
         val namer = BasicDexFileNamer()
-        val outputDexDir = project.layout.buildDirectory.dir("mixinDex").get().asFile.also {
-            if (!it.isDirectory && ((it.exists() && !it.delete()) || !it.mkdirs())) {
-                throw IOException("Failed to create ${it.absolutePath}")
-            }
+        val outputDexDir = project.layout.buildDirectory.dir("mixinDex").get().asFile
+        if (outputDexDir.exists() && !outputDexDir.deleteRecursively()) {
+            throw IOException("Failed to clean ${outputDexDir.absolutePath}")
         }
-        
+        if (!outputDexDir.mkdirs()) {
+            throw IOException("Failed to create ${outputDexDir.absolutePath}")
+        }
+
+        val threadCount = if (extension.useProcessorCountAsThreadCount) {
+            Runtime.getRuntime().availableProcessors()
+        } else {
+            targetZipFile.getDexCount(namer)
+        }.coerceAtLeast(1)
+
         MultiDexIO.writeDexFile(
             /* multiDex = */ true,
-            /* threadCount = */ if (extension.useProcessorCountAsThreadCount) Runtime.getRuntime().availableProcessors() else targetZipFile.getDexCount(namer),
+            /* threadCount = */ threadCount,
             /* file = */ outputDexDir,
             /* namer = */ namer,
             /* dexFile = */ rewriter.dexFileRewriter.rewrite(trgDex),
@@ -231,18 +294,24 @@ class MixinProcessor(
         lifecycle("Zip to mixin apk...")
         val stopWatchZipToApk = Stopwatch.createStarted()
         val mixinApkFile = project.outputDir(extension).child(extension.output.mixinApkFileName)
-        if (mixinApkFile.length() != targetApkFile.length()) {
-            targetApkFile.copyTo(mixinApkFile, overwrite = true)
-        }
+        mixinApkFile.parentFile?.mkdirs()
+        // 每次从干净的宿主 APK 复制，避免残留旧构建中的多余 dex 或已移除的 extraFiles 条目
+        targetApkFile.copyTo(mixinApkFile, overwrite = true)
+
         val filesToAdd = LinkedHashMap<String, File>()
-        outputDexDir.listFiles()?.forEach { filesToAdd[it.name] = it }
-        // 额外内嵌文件(如 assets/pico/webui.html),按 zip 内路径为键
-        extension.extraFiles.forEach { (entryName, file) ->
-            if (file.isFile) {
-                filesToAdd[entryName] = file
-            } else {
-                lifecycle("extraFiles: 跳过不存在的文件 $entryName -> ${file.absolutePath}")
+        outputDexDir.listFiles()
+            ?.filter { it.isFile && it.name.endsWith(".dex") }
+            ?.sortedBy { it.name }
+            ?.forEach { filesToAdd[it.name] = it }
+
+        // 额外内嵌文件(如 assets/pico/webui.html),按 zip 内路径为键；文件缺失时快速失败
+        extension.extraFiles.entries.sortedBy { it.key }.forEach { (entryName, file) ->
+            if (!file.isFile) {
+                throw FileNotFoundException(
+                    "extraFiles entry '$entryName' is missing or not a regular file: ${file.absolutePath}"
+                )
             }
+            filesToAdd[entryName] = file
         }
         ZipUtil.addOrReplaceFilesInZip(mixinApkFile, filesToAdd)
 

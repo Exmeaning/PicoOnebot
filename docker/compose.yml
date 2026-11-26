@@ -11,8 +11,11 @@ services:
     shm_size: "1gb"
     stop_grace_period: 30s
     ports:
-      - "${PICO_WEBUI_PORT:-6099}:6099"
-      - "${PICO_ONEBOT_PORT:-3001}:3001"
+      # 安全建议：在公网或不受信任宿主机上强烈建议设置 PICO_BIND_ADDR=127.0.0.1，
+      # 并通过反向代理 (HTTPS/TLS) 或内网隧道访问；首次启动后请立即修改默认密码 (picopico)。
+      - "${PICO_BIND_ADDR:-0.0.0.0}:${PICO_WEBUI_PORT:-6099}:6099"
+      - "${PICO_BIND_ADDR:-0.0.0.0}:${PICO_ONEBOT_PORT:-3001}:3001"
+      # ADB 端口无认证，仅绑定宿主机回环地址，切勿暴露至公网
       - "127.0.0.1:${PICO_ADB_PORT:-5555}:5555"
     volumes:
       - android-data:/data

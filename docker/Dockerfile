@@ -11,11 +11,11 @@ WORKDIR /tmp
 
 # 1. Download and verify Google libndk translation layer (Android 13) for x86_64 (amd64)
 ARG NDK_HASH=68734c52556d3d7a6db34c603dd9276915c29f2f
-ARG NDK_MD5=0b2207c490fcb400aa5c87fcf0d52d38
+ARG NDK_SHA256=a142d1586c9eafb5edf62277110f2128bc03066179a6783bcaa33ee322e1cbd0
 RUN mkdir -p /stage/system \
     && if [ "$TARGETARCH" = "amd64" ] || [ -z "$TARGETARCH" ]; then \
-        curl -fL -o ndk.zip "https://github.com/supremegamers/vendor_google_proprietary_ndk_translation-prebuilt/archive/${NDK_HASH}.zip" \
-        && echo "${NDK_MD5}  ndk.zip" | md5sum -c - \
+        curl --proto '=https' --tlsv1.2 -fsSL -o ndk.zip "https://github.com/supremegamers/vendor_google_proprietary_ndk_translation-prebuilt/archive/${NDK_HASH}.zip" \
+        && echo "${NDK_SHA256}  ndk.zip" | sha256sum -c - \
         && unzip -q ndk.zip \
         && cp -r vendor_google_proprietary_ndk_translation-prebuilt-*/prebuilts/* /stage/system/; \
     fi
@@ -72,7 +72,7 @@ COPY --from=builder /stage/opt/ /opt/
 # Expose WebUI (6099), OneBot v11 (3001), ADB (5555)
 EXPOSE 6099 3001 5555
 
-# Entrypoint: Binder checks, kmsg relay to stdout, and exec /init (PID 1).
+# Entrypoint: Binder checks, kmsg relay to stdout, arch-aware libndk props, and exec /init (PID 1).
 # Must run on the static BusyBox: Android's own sh cannot start until /init has mounted /apex.
 ENTRYPOINT ["/system/bin/pico-bb/busybox", "sh", "/system/bin/pico-entrypoint.sh"]
 
@@ -80,18 +80,12 @@ ENTRYPOINT ["/system/bin/pico-bb/busybox", "sh", "/system/bin/pico-entrypoint.sh
 HEALTHCHECK --start-period=360s --interval=30s --timeout=15s --retries=3 \
     CMD ["/system/bin/pico-bb/busybox", "sh", "/system/bin/pico-health.sh"]
 
-# Default Redroid boot arguments for ARM translation and display settings
+# Default architecture-neutral Redroid display/GPU boot arguments.
+# x86_64 libndk translation properties are injected conditionally by pico-entrypoint.sh
+# only on x86_64 hosts when /system/lib64/libndk_translation.so is present.
 CMD [ \
     "androidboot.redroid_width=720", \
     "androidboot.redroid_height=1256", \
     "androidboot.redroid_dpi=320", \
-    "androidboot.redroid_gpu_mode=guest", \
-    "ro.product.cpu.abilist=x86_64,arm64-v8a,x86,armeabi-v7a,armeabi", \
-    "ro.product.cpu.abilist32=x86,armeabi-v7a,armeabi", \
-    "ro.product.cpu.abilist64=x86_64,arm64-v8a", \
-    "ro.dalvik.vm.isa.arm=x86", \
-    "ro.dalvik.vm.isa.arm64=x86_64", \
-    "ro.enable.native.bridge.exec=1", \
-    "ro.dalvik.vm.native.bridge=libndk_translation.so", \
-    "ro.ndk_translation.version=0.2.3" \
+    "androidboot.redroid_gpu_mode=guest" \
 ]

@@ -94,15 +94,37 @@ fi
 # 我们替换了 ENTRYPOINT，这两个参数必须由这里补回：缺少 androidboot.hardware=redroid 时
 # ro.hardware 不是 redroid，hwcomposer HAL 找不到 hwcomposer.redroid.so 而退出(status 1)，
 # 其 onrestart 会不断重启 surfaceflinger → zygote → 整个系统 5 秒一轮死循环，永远到不了 boot_completed。
-has_hw=0; has_qemu=0
-for boot_arg in "$@"; do
-    case "$boot_arg" in
-        androidboot.hardware=*) has_hw=1 ;;
-        qemu=*) has_qemu=1 ;;
-    esac
-done
-[ "$has_hw" = 1 ] || set -- androidboot.hardware=redroid "$@"
-[ "$has_qemu" = 1 ] || set -- qemu=1 "$@"
+has_boot_prop() {
+    _key="$1"
+    shift
+    for _arg in "$@"; do
+        case "$_arg" in
+            "${_key}="*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+has_boot_prop "androidboot.hardware" "$@" || set -- androidboot.hardware=redroid "$@"
+has_boot_prop "qemu" "$@" || set -- qemu=1 "$@"
+
+# 仅在 x86_64 架构且镜像已内置 libndk_translation.so 时注入 ARM 转译属性，
+# 避免在 linux/arm64 镜像上误覆盖原生 ABI 列表或加载不存在的转译层。
+if [ "$(uname -m)" = "x86_64" ] && [ -f /system/lib64/libndk_translation.so ]; then
+    say "检测到 x86_64 与 libndk_translation.so，自动注入 ARM 转译启动参数。"
+    for _prop in \
+        "ro.product.cpu.abilist=x86_64,arm64-v8a,x86,armeabi-v7a,armeabi" \
+        "ro.product.cpu.abilist32=x86,armeabi-v7a,armeabi" \
+        "ro.product.cpu.abilist64=x86_64,arm64-v8a" \
+        "ro.dalvik.vm.isa.arm=x86" \
+        "ro.dalvik.vm.isa.arm64=x86_64" \
+        "ro.enable.native.bridge.exec=1" \
+        "ro.dalvik.vm.native.bridge=libndk_translation.so" \
+        "ro.ndk_translation.version=0.2.3"; do
+        _key="${_prop%%=*}"
+        has_boot_prop "$_key" "$@" || set -- "$@" "$_prop"
+    done
+fi
 
 say "启动 Android init: /init $*"
 say "首次启动初始化预计耗时 2–5 分钟。"

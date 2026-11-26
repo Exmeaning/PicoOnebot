@@ -78,8 +78,8 @@ nodes_bad=""
 for n in /dev/binder /dev/hwbinder /dev/vndbinder; do
     if [ -e "$n" ]; then
         nodes_present=1
-        mode="$(stat -c %a "$n")"
-        printf '%-16s mode=%s owner=%s\n' "$n" "$mode" "$(stat -c '%U:%G' "$n")"
+        mode="$(stat -L -c %a "$n")"
+        printf '%-16s mode=%s owner=%s\n' "$n" "$mode" "$(stat -L -c '%U:%G' "$n")"
         [ "$mode" = "666" ] || nodes_bad="$nodes_bad $n"
     else
         printf '%-16s 不存在\n' "$n"

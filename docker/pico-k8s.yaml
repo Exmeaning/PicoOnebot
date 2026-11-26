@@ -1,5 +1,12 @@
 # PicoOnebot All-in-One 部署清单（Kubernetes / K3s）
 # 节点内核需支持 CONFIG_ANDROID_BINDERFS 或加载 binder_linux 模块，详见 docs/BINDER.md
+#
+# 安全提示：
+#   1. Redroid 需要 privileged: true 挂载 binderfs，请部署在隔离节点并关闭 ServiceAccount Token 自动挂载。
+#   2. 容器内 Redroid adbd 监听 TCP 5555（无认证 root shell），切勿通过 Service 暴露 5555，
+#      强烈建议在支持 NetworkPolicy 的集群（Calico/Cilium/kube-router）中启用文末的 NetworkPolicy 封锁 5555。
+#   3. WebUI 初始密码为 picopico，生产环境建议将 Service 改为 ClusterIP 并通过 TLS Ingress/VPN 暴露，
+#      首次启动后立即修改默认控制台密码。
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -19,11 +26,14 @@ spec:
       labels:
         app: pico-onebot
     spec:
+      # 禁用默认 Kubernetes API 凭据自动挂载，缩小特权容器的横向渗透面
+      automountServiceAccountToken: false
       containers:
       - name: pico-onebot
         image: ghcr.io/exmeaning/pico-onebot:latest
         imagePullPolicy: Always
         securityContext:
+          # Redroid 挂载 binderfs 与管理 Android 系统节点所需
           privileged: true
         env:
         # 将 /dev/kmsg 核心系统日志转发至 stdout
@@ -34,18 +44,36 @@ spec:
           name: webui
         - containerPort: 3001
           name: onebot
-        - containerPort: 5555
-          name: adb
-        # 首次启动需完成 Android 系统与应用初始化
+        # 注意：切勿声明或暴露 ADB 端口 5555（无认证 root 调试端口）
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "1Gi"
+          limits:
+            cpu: "2"
+            memory: "4Gi"
+        # 首次启动需完成 Android 系统与应用初始化（最长等待约 8 分钟）
         startupProbe:
           tcpSocket:
             port: 6099
           periodSeconds: 10
+          timeoutSeconds: 5
           failureThreshold: 48
         readinessProbe:
           tcpSocket:
             port: 6099
           periodSeconds: 20
+          timeoutSeconds: 5
+          failureThreshold: 3
+        livenessProbe:
+          exec:
+            command:
+            - /system/bin/pico-bb/busybox
+            - sh
+            - /system/bin/pico-health.sh
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 5
         volumeMounts:
         - name: data
           mountPath: /data
@@ -60,10 +88,13 @@ spec:
         # - name: vndbinder
         #   mountPath: /dev/vndbinder
       volumes:
+      # 单节点 K3s/K8s 默认使用 hostPath；多节点集群请替换为 PersistentVolumeClaim 以防重调度丢失 /data
       - name: data
         hostPath:
           path: /var/lib/pico-onebot-data
           type: DirectoryOrCreate
+        # persistentVolumeClaim:
+        #   claimName: pico-onebot-data
       - name: dshm
         emptyDir:
           medium: Memory
@@ -81,6 +112,7 @@ spec:
       #     path: /dev/vndbinder
       #     type: CharDevice
 ---
+# 生产环境建议改用 type: ClusterIP + TLS Ingress/VPN；切勿在此 Service 中添加 5555 (ADB) 端口。
 apiVersion: v1
 kind: Service
 metadata:
@@ -99,3 +131,24 @@ spec:
     port: 3001
     targetPort: 3001
     nodePort: 30001
+# ---
+# 可选安全加固：NetworkPolicy（推荐在 Calico / Cilium / kube-router 等支持 NetworkPolicy 的集群启用）
+# 仅放行 WebUI (6099) 与 OneBot (3001) 入站流量，隐式拒绝集群内任意 Pod 访问无认证 Root ADB (5555)。
+# 若在 WebUI 中配置了其他自定义 OneBot 端口，请同步加入下方 ports 列表。
+# apiVersion: networking.k8s.io/v1
+# kind: NetworkPolicy
+# metadata:
+#   name: pico-onebot-block-adb
+#   namespace: default
+# spec:
+#   podSelector:
+#     matchLabels:
+#       app: pico-onebot
+#   policyTypes:
+#   - Ingress
+#   ingress:
+#   - ports:
+#     - protocol: TCP
+#       port: 6099
+#     - protocol: TCP
+#       port: 3001
