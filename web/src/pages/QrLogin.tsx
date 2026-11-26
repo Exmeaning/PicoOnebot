@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { QrCode, RefreshCw, Smartphone, Copy, CheckCircle2, Loader2, Clock3, TerminalSquare, ArrowRight } from "lucide-react";
 import { Badge, Button, Card, useToast } from "../components/ui";
-import { api } from "../lib/api";
+import { ApiError, api, isAbortError } from "../lib/api";
+import { copyText } from "../lib/clipboard";
 import type { QrInfo } from "../lib/types";
 import type { PageKey } from "../components/Shell";
 
 /**
- * QQ 账号扫码登录页。后端 `GET /api/qr` 只读、2s 轮询;过期 / 还停在账号状态页时自动 `POST /api/qr/refresh`。
+ * QQ 账号扫码登录页。后端 `GET /api/qr` 只读、串行 2s 轮询;过期 / 还停在账号状态页时自动 `POST /api/qr/refresh`。
  * 二维码图片就是 QQ 登录 SDK 回调给宿主的那张(不是截屏),状态机 ONLINE 后自动跳总览。
  */
 export function QrLogin({ onNavigate }: { onNavigate: (p: PageKey) => void }) {
@@ -14,72 +15,128 @@ export function QrLogin({ onNavigate }: { onNavigate: (p: PageKey) => void }) {
   const [refreshing, setRefreshing] = useState(false);
   const [failed, setFailed] = useState(0);
   const toast = useToast();
+
+  const mountedRef = useRef(true);
+  const reqSeq = useRef(0);
+  const refreshingRef = useRef(false);
+  const pollAbort = useRef<AbortController | null>(null);
+  const refreshAbort = useRef<AbortController | null>(null);
   const autoRefreshedFor = useRef("");
   const switched = useRef(false);
   const done = useRef(false);
 
+  const handleOnline = useCallback(() => {
+    if (!done.current) {
+      done.current = true;
+      toast.push("success", "QQ 已上线，欢迎回来");
+      onNavigate("dashboard");
+    }
+  }, [onNavigate, toast]);
+
   const refresh = useCallback(
     async (silent = false) => {
+      pollAbort.current?.abort();
+      refreshAbort.current?.abort();
+      const controller = new AbortController();
+      refreshAbort.current = controller;
+      const seq = ++reqSeq.current;
+
+      refreshingRef.current = true;
       setRefreshing(true);
       try {
-        const q = await api.qrRefresh();
-        setInfo(q);
-        if (!silent) toast.push("success", q.status === "ok" ? "二维码已刷新" : "已向 QQ 请求新的二维码，稍等片刻");
-      } catch (e) {
-        if (!silent) toast.push("error", (e as Error).message);
-      } finally {
-        setRefreshing(false);
-      }
-    },
-    [toast]
-  );
-
-  useEffect(() => {
-    let alive = true;
-    const tick = async () => {
-      try {
-        const q = await api.qr();
-        if (!alive) return;
+        const q = await api.qrRefresh(controller.signal);
+        if (!mountedRef.current || controller.signal.aborted || seq !== reqSeq.current) return;
         setInfo(q);
         setFailed(0);
         if (q.status === "online") {
-          if (!done.current) {
-            done.current = true;
-            toast.push("success", "QQ 已上线，欢迎回来");
-            onNavigate("dashboard");
-          }
+          handleOnline();
+          return;
+        }
+        if (!silent) {
+          toast.push("success", q.status === "ok" ? "二维码已刷新" : "已向 QQ 请求新的二维码，稍等片刻");
+        }
+      } catch (e) {
+        if (!mountedRef.current || isAbortError(e) || seq !== reqSeq.current) return;
+        if (e instanceof ApiError && (e.status === 401 || e.status === 428)) return;
+        if (!silent) toast.push("error", (e as Error).message || "刷新二维码失败");
+      } finally {
+        if (seq === reqSeq.current) {
+          refreshingRef.current = false;
+          if (mountedRef.current) setRefreshing(false);
+        }
+      }
+    },
+    [handleOnline, toast]
+  );
+
+  useEffect(() => {
+    mountedRef.current = true;
+    let alive = true;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const scheduleNext = () => {
+      if (!alive || done.current) return;
+      timer = setTimeout(() => void poll(), 2000);
+    };
+
+    const poll = async () => {
+      if (!alive || done.current) return;
+      if (refreshingRef.current) {
+        scheduleNext();
+        return;
+      }
+      pollAbort.current?.abort();
+      const controller = new AbortController();
+      pollAbort.current = controller;
+      const seq = ++reqSeq.current;
+      try {
+        const q = await api.qr(controller.signal);
+        if (!alive || controller.signal.aborted || seq !== reqSeq.current) return;
+        setInfo(q);
+        setFailed(0);
+        if (q.status === "online") {
+          handleOnline();
           return;
         }
         // 过期:同一张码只自动刷一次,避免和服务端互相追着刷
         if (q.status === "expired" && autoRefreshedFor.current !== q.url) {
           autoRefreshedFor.current = q.url;
-          void refresh(true);
-        }
-        // 还停在"账号状态页"(有上次登录的账号):替用户点一次"切换账号"进扫码页
-        if (q.status === "waiting_qr" && !q.hasFragment && q.hasStateFragment && !switched.current) {
+          await refresh(true);
+        } else if (q.status === "waiting_qr" && !q.hasFragment && q.hasStateFragment && !switched.current) {
+          // 还停在"账号状态页"(有上次登录的账号):替用户点一次"切换账号"进扫码页
           switched.current = true;
-          void refresh(true);
+          await refresh(true);
         }
-      } catch {
-        if (alive) setFailed((n) => n + 1);
+        scheduleNext();
+      } catch (e) {
+        if (!alive || isAbortError(e)) {
+          if (alive && !done.current) scheduleNext();
+          return;
+        }
+        if (e instanceof ApiError && (e.status === 401 || e.status === 428)) {
+          // Auth transition is handled centrally; stop polling and do not report backend offline.
+          return;
+        }
+        if (seq === reqSeq.current) setFailed((n) => n + 1);
+        scheduleNext();
       }
     };
-    void tick();
-    const t = setInterval(tick, 2000);
+
+    void poll();
+
     return () => {
       alive = false;
-      clearInterval(t);
+      mountedRef.current = false;
+      if (timer) clearTimeout(timer);
+      pollAbort.current?.abort();
+      refreshAbort.current?.abort();
     };
-  }, [onNavigate, refresh, toast]);
+  }, [handleOnline, refresh]);
 
   const copy = async () => {
     if (!info?.url) return;
-    try {
-      await navigator.clipboard.writeText(info.url);
-      toast.push("success", "已复制二维码链接");
-    } catch {
-      toast.push("error", "复制失败，请手动选择下方链接");
-    }
+    const ok = await copyText(info.url);
+    toast.push(ok ? "success" : "error", ok ? "已复制二维码链接" : "复制失败，请手动选择下方链接");
   };
 
   const st = info?.status ?? "waiting_qr";
@@ -91,7 +148,9 @@ export function QrLogin({ onNavigate }: { onNavigate: (p: PageKey) => void }) {
         ? "已扫码，请在手机上确认"
         : "请用手机 QQ 扫码"
       : st === "expired"
-        ? "二维码已过期，正在刷新"
+        ? refreshing
+          ? "二维码已过期，正在刷新"
+          : "二维码已过期，请刷新"
         : info?.hasFragment
           ? "正在向 QQ 请求二维码"
           : info?.hasStateFragment
@@ -108,12 +167,12 @@ export function QrLogin({ onNavigate }: { onNavigate: (p: PageKey) => void }) {
             <div className="relative flex h-72 w-72 items-center justify-center rounded-3xl bg-white p-4 shadow-cute ring-1 ring-pico-line">
               {info?.image ? (
                 <img src={info.image} alt="QQ 登录二维码" className={`h-full w-full rounded-2xl object-contain transition ${dimmed ? "opacity-30 blur-[2px]" : ""}`} />
-              ) : (
+              ) : st !== "expired" ? (
                 <div className="flex flex-col items-center gap-3 text-pico-muted">
                   <Loader2 className="h-8 w-8 animate-spin text-pico" />
                   <p className="px-6 text-center text-xs font-bold">{label}</p>
                 </div>
-              )}
+              ) : null}
               {info?.image && scanned && st === "ok" ? (
                 <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 rounded-3xl text-center">
                   <span className="flex h-14 w-14 items-center justify-center rounded-full bg-emerald-100 text-emerald-600 shadow-cute">
@@ -123,10 +182,10 @@ export function QrLogin({ onNavigate }: { onNavigate: (p: PageKey) => void }) {
                   <p className="text-xs font-bold text-pico-muted">在手机上点「确认登录」</p>
                 </div>
               ) : null}
-              {info?.image && st === "expired" ? (
-                <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 rounded-3xl text-center">
+              {st === "expired" ? (
+                <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 rounded-3xl bg-white/80 text-center">
                   <p className="text-sm font-black text-pico-ink">二维码已过期</p>
-                  <Button size="sm" onClick={() => refresh()} loading={refreshing}>
+                  <Button size="sm" onClick={() => void refresh()} loading={refreshing}>
                     <RefreshCw className="h-3.5 w-3.5" /> 换一张
                   </Button>
                 </div>
@@ -171,10 +230,10 @@ export function QrLogin({ onNavigate }: { onNavigate: (p: PageKey) => void }) {
             </ol>
 
             <div className="mt-6 flex flex-wrap items-center gap-2">
-              <Button onClick={() => refresh()} loading={refreshing}>
+              <Button onClick={() => void refresh()} loading={refreshing}>
                 <RefreshCw className="h-4 w-4" /> 刷新二维码
               </Button>
-              <Button variant="soft" onClick={copy} disabled={!info?.url}>
+              <Button variant="soft" onClick={() => void copy()} disabled={!info?.url}>
                 <Copy className="h-4 w-4" /> 复制链接
               </Button>
               {st === "ok" && info ? (

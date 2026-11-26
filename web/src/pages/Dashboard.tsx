@@ -7,33 +7,51 @@ import type { PageKey } from "../components/Shell";
 import { fmtDuration, fmtNumber, fmtTime, greeting } from "../lib/format";
 import { LevelPill } from "../components/LogLine";
 
+const HISTORY_SLOTS = 24;
+
 export function Dashboard({ status, onNavigate }: { status: BotStatus | null; onNavigate: (p: PageKey) => void }) {
   const [conns, setConns] = useState<ConnectionInfo[]>([]);
   const [recent, setRecent] = useState<LogEntry[]>([]);
-  const [history, setHistory] = useState<number[]>(() => Array.from({ length: 24 }, () => 0));
+  const [history, setHistory] = useState<number[]>([]);
 
   useEffect(() => {
     let alive = true;
+    let ac: AbortController | null = null;
     const load = async () => {
-      const [c, l] = await Promise.all([api.connections(), api.logs(8)]);
-      if (!alive) return;
-      setConns(c);
-      setRecent(l.slice(-8).reverse());
+      ac?.abort();
+      const controller = new AbortController();
+      ac = controller;
+      try {
+        const [c, l] = await Promise.all([api.connections(controller.signal), api.logs(8, controller.signal)]);
+        if (!alive || controller.signal.aborted) return;
+        setConns(c);
+        setRecent(l.slice(-8).reverse());
+      } catch {
+        // Ignore transient poll errors; 401/428 are handled centrally.
+      }
     };
-    load();
-    const t = setInterval(load, 8000);
+    void load();
+    const t = setInterval(() => void load(), 8000);
     return () => {
       alive = false;
+      ac?.abort();
       clearInterval(t);
     };
   }, []);
 
   useEffect(() => {
     if (!status) return;
-    setHistory((h) => [...h.slice(1), status.msgRecv + status.msgSent]);
+    const total = status.msgRecv + status.msgSent;
+    setHistory((h) => {
+      if (h.length === 0) return Array.from({ length: HISTORY_SLOTS }, () => total);
+      return [...h.slice(1), total];
+    });
   }, [status]);
 
-  const deltas = history.map((v, i) => (i === 0 ? 0 : Math.max(0, v - history[i - 1])));
+  const deltas =
+    history.length === 0
+      ? Array.from({ length: HISTORY_SLOTS }, () => 0)
+      : history.map((v, i) => (i === 0 ? 0 : Math.max(0, v - history[i - 1])));
   const max = Math.max(1, ...deltas);
 
   return (
@@ -46,7 +64,7 @@ export function Dashboard({ status, onNavigate }: { status: BotStatus | null; on
             {status?.online ? "运行中" : "未连接"}
           </Badge>
           <h2 className="mt-3 text-2xl font-black tracking-tight text-pico-ink sm:text-3xl">
-            {greeting()}，{status?.nickname ?? "主人"}
+            {greeting()}，{status?.nickname || "主人"}
           </h2>
           <p className="mt-2 text-sm text-pico-muted">
             PicoOnebot 已稳定运行 <span className="font-extrabold text-pico-deep">{fmtDuration(status?.uptime ?? 0)}</span>
@@ -72,7 +90,12 @@ export function Dashboard({ status, onNavigate }: { status: BotStatus | null; on
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <Stat label="收到消息" value={fmtNumber(status?.msgRecv ?? 0)} sub="自启动以来" icon={<MessageSquareText className="h-5 w-5" />} />
         <Stat label="发送消息" value={fmtNumber(status?.msgSent ?? 0)} sub="自启动以来" icon={<Send className="h-5 w-5" />} />
-        <Stat label="运行时长" value={fmtDuration(status?.uptime ?? 0, true)} sub={`心跳 ${status ? fmtTime(status.lastHeartbeat) : "--"}`} icon={<Clock3 className="h-5 w-5" />} />
+        <Stat
+          label="运行时长"
+          value={fmtDuration(status?.uptime ?? 0, true)}
+          sub={`心跳 ${status && status.lastHeartbeat > 0 ? fmtTime(status.lastHeartbeat) : "--"}`}
+          icon={<Clock3 className="h-5 w-5" />}
+        />
         <Stat label="资源占用" value={`${status?.memoryMb ?? 0} MB`} sub={`CPU ${status?.cpu ?? 0}%`} icon={<Cpu className="h-5 w-5" />} />
       </div>
 
@@ -83,12 +106,12 @@ export function Dashboard({ status, onNavigate }: { status: BotStatus | null; on
           <div className="p-6 pt-4">
             <div className="flex items-center gap-4 rounded-3xl bg-pico-softer p-4">
               <div className="flex h-16 w-16 shrink-0 items-center justify-center overflow-hidden rounded-3xl bg-gradient-to-br from-pico to-pico-deep text-2xl font-black text-white shadow-cute ring-4 ring-white">
-                {status?.avatar ? <img src={status.avatar} alt="" className="h-full w-full object-cover" /> : status?.nickname?.slice(0, 1) ?? "P"}
+                {status?.avatar ? <img src={status.avatar} alt="" className="h-full w-full object-cover" /> : status?.nickname?.slice(0, 1) || "P"}
               </div>
               <div className="min-w-0">
-                <p className="truncate text-lg font-black text-pico-ink">{status?.nickname ?? "--"}</p>
-                <p className="font-mono text-xs text-pico-muted">{status?.selfId ?? "--"}</p>
-                <Badge tone="pink" className="mt-1.5">{status?.platform ?? "--"}</Badge>
+                <p className="truncate text-lg font-black text-pico-ink">{status?.nickname || "--"}</p>
+                <p className="font-mono text-xs text-pico-muted">{status?.selfId || "--"}</p>
+                <Badge tone="pink" className="mt-1.5">{status?.platform || "--"}</Badge>
               </div>
             </div>
             <dl className="mt-4 grid grid-cols-2 gap-3">
@@ -108,9 +131,9 @@ export function Dashboard({ status, onNavigate }: { status: BotStatus | null; on
               ))}
             </dl>
             <div className="mt-4 space-y-2 text-xs">
-              <Row k="PicoOnebot" v={`v${status?.version ?? "--"}`} />
-              <Row k="内核" v={status?.qqVersion ?? "--"} />
-              <Row k="协议" v={status?.protocol ?? "--"} />
+              <Row k="PicoOnebot" v={status?.version ? `v${status.version}` : "--"} />
+              <Row k="内核" v={status?.qqVersion || "--"} />
+              <Row k="协议" v={status?.protocol || "--"} />
             </div>
           </div>
         </Card>
@@ -126,7 +149,7 @@ export function Dashboard({ status, onNavigate }: { status: BotStatus | null; on
           <div className="p-6 pt-4">
             <div className="flex h-36 items-end gap-1.5 rounded-3xl bg-pico-softer p-4">
               {deltas.map((d, i) => (
-                <div key={i} className="group relative flex-1">
+                <div key={i} className="group relative flex h-full flex-1 items-end">
                   <div
                     className="w-full rounded-full bg-gradient-to-t from-pico to-pico-deep/80 transition-all duration-500"
                     style={{ height: `${Math.max(6, (d / max) * 100)}%`, opacity: 0.35 + (i / deltas.length) * 0.65 }}

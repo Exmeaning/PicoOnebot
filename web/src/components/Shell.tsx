@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { LayoutDashboard, Network, ScrollText, FolderCog, Settings2, Info, LogOut, Menu, X, Settings, RefreshCw, QrCode, Star } from "lucide-react";
 import { Logo } from "./Logo";
 import { Badge, Button, HeartDot, useToast } from "./ui";
@@ -33,10 +33,23 @@ export function Shell({
 }) {
   const [open, setOpen] = useState(false);
   const [restarting, setRestarting] = useState(false);
+  const restartTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const mountedRef = useRef(true);
   const toast = useToast();
   const current = NAV.find((n) => n.key === page);
   const title = current?.label ?? "扫码登录";
   const desc = current?.desc ?? "让 QQ 账号上线";
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      if (restartTimer.current) {
+        clearTimeout(restartTimer.current);
+        restartTimer.current = null;
+      }
+    };
+  }, []);
 
   useEffect(() => {
     setOpen(false);
@@ -46,14 +59,25 @@ export function Shell({
     if (!status?.canRestartQq || restarting) return;
     if (!confirm("确定重启 QQ 吗？不会重启容器或清除数据。QQ 和 WebUI 会短暂断开，恢复后需要重新登录控制台。")) return;
     setRestarting(true);
+    let submitted = false;
     try {
       const r = await api.restart();
-      if (r.ok) toast.push("success", r.wording ?? "QQ 重启请求已提交");
-      else toast.push("info", r.wording ?? "当前环境不支持重启 QQ");
+      if (!mountedRef.current) return;
+      if (r.ok) {
+        submitted = true;
+        toast.push("success", r.wording ?? "QQ 重启请求已提交");
+        if (restartTimer.current) clearTimeout(restartTimer.current);
+        restartTimer.current = setTimeout(() => {
+          restartTimer.current = null;
+          if (mountedRef.current) setRestarting(false);
+        }, 30000);
+      } else {
+        toast.push("info", r.wording ?? "当前环境不支持重启 QQ");
+      }
     } catch (e) {
-      toast.push("error", (e as Error).message);
+      if (mountedRef.current) toast.push("error", (e as Error).message);
     } finally {
-      window.setTimeout(() => setRestarting(false), 30000);
+      if (!submitted && mountedRef.current) setRestarting(false);
     }
   };
 

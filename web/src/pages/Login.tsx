@@ -2,23 +2,31 @@ import { useState, type FormEvent } from "react";
 import { KeyRound, Server, ArrowRight, Eye, EyeOff, Sparkles } from "lucide-react";
 import { Logo } from "../components/Logo";
 import { Button, Field, Input, HeartDot, useToast, Badge } from "../components/ui";
-import { api, getBaseUrl, setBaseUrl, setToken } from "../lib/api";
+import { api, getStoredBaseUrl, normalizeBaseUrl, setBaseUrl, setToken } from "../lib/api";
 
 export function Login({ onSuccess }: { onSuccess: (mustChangePassword: boolean) => void }) {
   const [token, setTok] = useState("");
   const [show, setShow] = useState(false);
-  const [advanced, setAdvanced] = useState(false);
-  const [base, setBase] = useState(getBaseUrl());
+  const [advanced, setAdvanced] = useState(() => Boolean(getStoredBaseUrl()));
+  const [base, setBase] = useState(() => getStoredBaseUrl());
   const [loading, setLoading] = useState(false);
   const toast = useToast();
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
+    const parsedBase = normalizeBaseUrl(base);
+    if (!parsedBase.ok) {
+      toast.push("error", parsedBase.error);
+      return;
+    }
     setLoading(true);
     try {
-      if (base.trim()) setBaseUrl(base.trim());
-      const res = await api.login(token);
-      setToken(res.token || token);
+      const res = await api.login(token, parsedBase.url);
+      if (!res.token) {
+        throw new Error("后端未返回会话令牌，请检查 PicoOnebot 服务版本");
+      }
+      setBaseUrl(parsedBase.url);
+      setToken(res.token);
       toast.push("success", "登录成功，欢迎回来");
       onSuccess(!!res.mustChangePassword);
     } catch (err) {
@@ -106,10 +114,22 @@ export function Login({ onSuccess }: { onSuccess: (mustChangePassword: boolean) 
             </button>
 
             {advanced ? (
-              <Field label="后端地址" hint="默认与当前页面同源，例如 http://127.0.0.1:6099">
-                <div className="relative">
-                  <Server className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-pico-muted" />
-                  <Input className="pl-10 font-mono text-xs" value={base} onChange={(e) => setBase(e.target.value)} placeholder="http://127.0.0.1:6099" />
+              <Field label="后端地址" hint="留空则默认与当前页面同源，仅支持 http:// 或 https://">
+                <div className="flex items-center gap-2">
+                  <div className="relative min-w-0 flex-1">
+                    <Server className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-pico-muted" />
+                    <Input
+                      className="pl-10 font-mono text-xs"
+                      value={base}
+                      onChange={(e) => setBase(e.target.value)}
+                      placeholder={window.location.origin}
+                    />
+                  </div>
+                  {base.trim() ? (
+                    <Button type="button" variant="ghost" size="sm" onClick={() => setBase("")}>
+                      恢复同源
+                    </Button>
+                  ) : null}
                 </div>
               </Field>
             ) : null}
@@ -117,7 +137,6 @@ export function Login({ onSuccess }: { onSuccess: (mustChangePassword: boolean) 
             <Button type="submit" size="lg" className="w-full" loading={loading} disabled={!token}>
               进入控制台 <ArrowRight className="h-4 w-4" />
             </Button>
-
           </div>
         </form>
       </div>

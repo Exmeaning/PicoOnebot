@@ -11,7 +11,14 @@ import { Settings } from "./pages/Settings";
 import { About } from "./pages/About";
 import { QrLogin } from "./pages/QrLogin";
 import { ChangePassword } from "./pages/ChangePassword";
-import { api, getToken, setToken, ApiError } from "./lib/api";
+import {
+  api,
+  getToken,
+  setToken,
+  setUnauthorizedHandler,
+  setMustChangePasswordHandler,
+  ApiError,
+} from "./lib/api";
 import type { BotStatus } from "./lib/types";
 
 function pageFromHash(): PageKey {
@@ -28,25 +35,83 @@ function Root() {
   const [status, setStatus] = useState<BotStatus | null>(null);
   const toast = useToast();
   const gPressed = useRef(false);
+  const gTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pageRef = useRef(page);
+  const authedRef = useRef(authed);
+  const mustChangeRef = useRef(mustChangePassword);
   // QQ 未登录时只自动带去扫码页一次;用户手动离开就不再打扰
   const qrRedirected = useRef(false);
 
+  const resetToLogin = useCallback(
+    (notice?: { kind: "info" | "success" | "error"; text: string }) => {
+      authedRef.current = false;
+      mustChangeRef.current = false;
+      qrRedirected.current = false;
+      setToken("");
+      setAuthed(false);
+      setMustChangePassword(false);
+      setStatus(null);
+      if (notice) toast.push(notice.kind, notice.text);
+    },
+    [toast]
+  );
+
   useEffect(() => {
+    setUnauthorizedHandler(() => {
+      if (authedRef.current || mustChangeRef.current) {
+        resetToLogin({ kind: "error", text: "登录已过期，请重新登录" });
+      }
+    });
+    setMustChangePasswordHandler(() => {
+      if (authedRef.current) {
+        authedRef.current = false;
+        mustChangeRef.current = true;
+        setAuthed(false);
+        setMustChangePassword(true);
+      }
+    });
+    return () => {
+      setUnauthorizedHandler(null);
+      setMustChangePasswordHandler(null);
+    };
+  }, [resetToLogin]);
+
+  useEffect(() => {
+    let alive = true;
     const saved = getToken();
     if (!saved) {
       setCheckingAuth(false);
       return;
     }
-    api.login(saved)
+    api
+      .login(saved)
       .then((result) => {
+        if (!alive) return;
+        if (!result.token) throw new ApiError("后端未返回会话令牌", 401);
         setToken(result.token);
-        if (result.mustChangePassword) setMustChangePassword(true);
-        else setAuthed(true);
+        if (result.mustChangePassword) {
+          mustChangeRef.current = true;
+          setMustChangePassword(true);
+        } else {
+          authedRef.current = true;
+          setAuthed(true);
+        }
       })
-      .catch(() => setToken(""))
-      .finally(() => setCheckingAuth(false));
-  }, []);
+      .catch((err) => {
+        if (!alive) return;
+        if (err instanceof ApiError && err.status === 401) {
+          setToken("");
+        } else {
+          toast.push("error", (err as Error).message || "无法连接 PicoOnebot 后端");
+        }
+      })
+      .finally(() => {
+        if (alive) setCheckingAuth(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [toast]);
 
   useEffect(() => {
     pageRef.current = page;
@@ -68,38 +133,37 @@ function Root() {
   useEffect(() => {
     if (!authed) return;
     let alive = true;
+    let ac: AbortController | null = null;
     const tick = async () => {
+      ac?.abort();
+      const controller = new AbortController();
+      ac = controller;
       try {
-        const s = await api.status();
-        if (!alive) return;
+        const s = await api.status(controller.signal);
+        if (!alive || controller.signal.aborted) return;
         setStatus(s);
         if (s.online) {
           qrRedirected.current = false;
           if (pageRef.current === "qr") navigate("dashboard");
         } else if (!qrRedirected.current && pageRef.current !== "qr") {
           // 先确认登录页确实在(不是内核还在热身),再跳,免得刚启动就来回蹦
-          const q = await api.qr().catch(() => null);
-          if (!alive || !q) return;
+          const q = await api.qr(controller.signal).catch(() => null);
+          if (!alive || controller.signal.aborted || !q) return;
           if (q.status !== "online" && (q.hasFragment || q.hasStateFragment || q.url)) {
             qrRedirected.current = true;
             toast.push("info", "QQ 还没登录，先扫个码吧");
             navigate("qr");
           }
         }
-      } catch (e) {
-        if (e instanceof ApiError && e.status === 401) {
-          setAuthed(false);
-          toast.push("error", "登录已过期，请重新登录");
-        } else if (e instanceof ApiError && e.status === 428) {
-          setAuthed(false);
-          setMustChangePassword(true);
-        }
+      } catch {
+        // 401 / 428 transitions are handled centrally by api.ts handlers; transient network errors retry on next tick.
       }
     };
-    tick();
-    const t = setInterval(tick, 5000);
+    void tick();
+    const t = setInterval(() => void tick(), 5000);
     return () => {
       alive = false;
+      ac?.abort();
       clearInterval(t);
     };
   }, [authed, toast, navigate]);
@@ -107,30 +171,54 @@ function Root() {
   // keyboard shortcuts: g then 1-6
   useEffect(() => {
     if (!authed) return;
+    const clearG = () => {
+      gPressed.current = false;
+      if (gTimer.current) {
+        clearTimeout(gTimer.current);
+        gTimer.current = null;
+      }
+    };
     const onKey = (e: KeyboardEvent) => {
-      const target = e.target as HTMLElement;
-      if (["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)) return;
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      const target = e.target as HTMLElement | null;
+      if (target && (["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName) || target.isContentEditable)) return;
       if (e.key.toLowerCase() === "g") {
+        clearG();
         gPressed.current = true;
-        setTimeout(() => (gPressed.current = false), 1200);
+        gTimer.current = setTimeout(() => {
+          gPressed.current = false;
+          gTimer.current = null;
+        }, 1200);
         return;
       }
       if (gPressed.current && /^[1-6]$/.test(e.key)) {
         navigate(NAV[Number(e.key) - 1].key);
-        gPressed.current = false;
+        clearG();
       }
     };
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      clearG();
+    };
   }, [authed, navigate]);
 
-  const logout = async () => {
+  const logout = useCallback(async () => {
     await api.logout();
-    setAuthed(false);
-    setMustChangePassword(false);
-    setStatus(null);
-    toast.push("info", "已退出登录，下次见");
-  };
+    resetToLogin({ kind: "info", text: "已退出登录，下次见" });
+  }, [resetToLogin]);
+
+  const cancelPasswordSetup = useCallback(async () => {
+    await api.logout();
+    resetToLogin({ kind: "info", text: "已返回登录页" });
+  }, [resetToLogin]);
+
+  const requireRelogin = useCallback(
+    (message: string) => {
+      resetToLogin({ kind: "success", text: message });
+    },
+    [resetToLogin]
+  );
 
   if (checkingAuth) {
     return <div className="flex min-h-full items-center justify-center text-sm font-bold text-pico-muted">正在验证控制台会话...</div>;
@@ -140,10 +228,13 @@ function Root() {
     return (
       <ChangePassword
         onSuccess={() => {
+          mustChangeRef.current = false;
+          authedRef.current = true;
           setMustChangePassword(false);
           setAuthed(true);
           navigate("dashboard");
         }}
+        onCancel={() => void cancelPasswordSetup()}
       />
     );
   }
@@ -152,8 +243,13 @@ function Root() {
     return (
       <Login
         onSuccess={(mustChange) => {
-          if (mustChange) setMustChangePassword(true);
-          else {
+          if (mustChange) {
+            mustChangeRef.current = true;
+            authedRef.current = false;
+            setMustChangePassword(true);
+          } else {
+            mustChangeRef.current = false;
+            authedRef.current = true;
             setAuthed(true);
             navigate("dashboard");
           }
@@ -163,13 +259,13 @@ function Root() {
   }
 
   return (
-    <Shell page={page} onNavigate={navigate} onLogout={logout} status={status}>
+    <Shell page={page} onNavigate={navigate} onLogout={() => void logout()} status={status}>
       {page === "dashboard" && <Dashboard status={status} onNavigate={navigate} />}
       {page === "qr" && <QrLogin onNavigate={navigate} />}
       {page === "network" && <Network />}
       {page === "logs" && <Logs />}
       {page === "files" && <FileManager />}
-      {page === "settings" && <Settings />}
+      {page === "settings" && <Settings onRequireRelogin={requireRelogin} />}
       {page === "about" && <About status={status} />}
     </Shell>
   );

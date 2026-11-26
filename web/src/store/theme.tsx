@@ -28,15 +28,53 @@ type ThemeState = {
   setCustomColor: (hex: string) => void;
 };
 
+type StoredTheme = {
+  presetId: string;
+  customColor: string | null;
+};
+
 const ThemeCtx = createContext<ThemeState | null>(null);
 const KEY = "picoonebot.theme";
+const DEFAULT_PRESET_ID = "sakura";
+const HEX_RE = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
+
+export function normalizeHexColor(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!HEX_RE.test(trimmed)) return null;
+  if (trimmed.length === 4) {
+    const [, r, g, b] = trimmed;
+    return `#${r}${r}${g}${g}${b}${b}`.toLowerCase();
+  }
+  return trimmed.toLowerCase();
+}
+
+function readStoredTheme(): StoredTheme {
+  try {
+    const raw = localStorage.getItem(KEY);
+    if (!raw) return { presetId: DEFAULT_PRESET_ID, customColor: null };
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object") {
+      return { presetId: DEFAULT_PRESET_ID, customColor: null };
+    }
+    const rec = parsed as Record<string, unknown>;
+    const presetId =
+      typeof rec.presetId === "string" && THEME_PRESETS.some((p) => p.id === rec.presetId)
+        ? rec.presetId
+        : DEFAULT_PRESET_ID;
+    const customColor = normalizeHexColor(rec.customColor);
+    return { presetId, customColor };
+  } catch {
+    return { presetId: DEFAULT_PRESET_ID, customColor: null };
+  }
+}
 
 function hexToRgb(hex: string) {
-  const h = hex.replace("#", "");
-  const full = h.length === 3 ? h.split("").map((c) => c + c).join("") : h;
-  const n = parseInt(full, 16);
+  const safe = normalizeHexColor(hex) ?? THEME_PRESETS[0].color;
+  const n = parseInt(safe.slice(1), 16);
   return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
 }
+
 function mix(hex: string, target: { r: number; g: number; b: number }, amount: number) {
   const c = hexToRgb(hex);
   const r = Math.round(c.r + (target.r - c.r) * amount);
@@ -46,14 +84,15 @@ function mix(hex: string, target: { r: number; g: number; b: number }, amount: n
 }
 
 function derive(color: string): Omit<ThemePreset, "id" | "name"> {
+  const safe = normalizeHexColor(color) ?? THEME_PRESETS[0].color;
   const white = { r: 255, g: 255, b: 255 };
   const dark = { r: 50, g: 30, b: 40 };
   return {
-    color,
-    ink: mix(color, dark, 0.72),
-    muted: mix(color, { r: 120, g: 100, b: 110 }, 0.55),
-    bgA: mix(color, white, 0.94),
-    bgB: mix(color, white, 0.88),
+    color: safe,
+    ink: mix(safe, dark, 0.72),
+    muted: mix(safe, { r: 120, g: 100, b: 110 }, 0.55),
+    bgA: mix(safe, white, 0.94),
+    bgB: mix(safe, white, 0.88),
   };
 }
 
@@ -69,38 +108,34 @@ function applyTheme(t: Omit<ThemePreset, "id" | "name">) {
 }
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
-  const [presetId, setPresetId] = useState("sakura");
-  const [customColor, setCustom] = useState<string | null>(null);
-
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(KEY);
-      if (raw) {
-        const s = JSON.parse(raw);
-        if (s.presetId) setPresetId(s.presetId);
-        if (s.customColor) setCustom(s.customColor);
-      }
-    } catch {
-      /* ignore */
-    }
-  }, []);
+  const [stored] = useState<StoredTheme>(readStoredTheme);
+  const [presetId, setPresetId] = useState<string>(stored.presetId);
+  const [customColor, setCustom] = useState<string | null>(stored.customColor);
 
   useEffect(() => {
     const preset = THEME_PRESETS.find((p) => p.id === presetId) ?? THEME_PRESETS[0];
     applyTheme(customColor ? derive(customColor) : preset);
-    localStorage.setItem(KEY, JSON.stringify({ presetId, customColor }));
+    try {
+      localStorage.setItem(KEY, JSON.stringify({ presetId, customColor }));
+    } catch {
+      // Ignore storage quota or privacy-mode errors.
+    }
   }, [presetId, customColor]);
 
   const value = useMemo<ThemeState>(
     () => ({
       presetId,
       customColor,
-      color: customColor ?? (THEME_PRESETS.find((p) => p.id === presetId)?.color ?? "#ff85a2"),
+      color: customColor ?? (THEME_PRESETS.find((p) => p.id === presetId)?.color ?? THEME_PRESETS[0].color),
       setPreset: (id) => {
+        if (!THEME_PRESETS.some((p) => p.id === id)) return;
         setCustom(null);
         setPresetId(id);
       },
-      setCustomColor: (hex) => setCustom(hex),
+      setCustomColor: (hex) => {
+        const normalized = normalizeHexColor(hex);
+        if (normalized) setCustom(normalized);
+      },
     }),
     [presetId, customColor]
   );

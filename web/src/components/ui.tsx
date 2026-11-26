@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useState, type ButtonHTMLAttributes, type InputHTMLAttributes, type ReactNode, type SelectHTMLAttributes } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ButtonHTMLAttributes, type InputHTMLAttributes, type ReactNode, type SelectHTMLAttributes } from "react";
 import { X, Check, AlertTriangle, Info, Loader2, Sparkles } from "lucide-react";
 import { cn } from "../utils/cn";
 
@@ -207,13 +207,31 @@ const ToastCtx = createContext<{ push: (kind: Toast["kind"], text: string) => vo
 
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [list, setList] = useState<Toast[]>([]);
-  const push = (kind: Toast["kind"], text: string) => {
-    const id = Date.now() + Math.random();
+  const nextId = useRef(0);
+  const timers = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
+
+  useEffect(() => {
+    const active = timers.current;
+    return () => {
+      active.forEach((timer) => clearTimeout(timer));
+      active.clear();
+    };
+  }, []);
+
+  const push = useCallback((kind: Toast["kind"], text: string) => {
+    const id = ++nextId.current;
     setList((l) => [...l, { id, kind, text }]);
-    setTimeout(() => setList((l) => l.filter((t) => t.id !== id)), 3200);
-  };
+    const timer = setTimeout(() => {
+      timers.current.delete(timer);
+      setList((l) => l.filter((t) => t.id !== id));
+    }, 3200);
+    timers.current.add(timer);
+  }, []);
+
+  const ctxValue = useMemo(() => ({ push }), [push]);
+
   return (
-    <ToastCtx.Provider value={{ push }}>
+    <ToastCtx.Provider value={ctxValue}>
       {children}
       <div className="pointer-events-none fixed inset-x-0 top-4 z-[60] flex flex-col items-center gap-2 px-4">
         {list.map((t) => (

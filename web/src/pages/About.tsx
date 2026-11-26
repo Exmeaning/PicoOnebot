@@ -64,10 +64,10 @@ export function About({ status }: { status: BotStatus | null }) {
           <CardHeader title="版本信息" icon={<Package className="h-4 w-4" />} />
           <dl className="space-y-3 p-6 pt-4 text-sm">
             {[
-              ["PicoOnebot", status ? `v${status.version}` : "--"],
-              ["QQ 内核", status?.qqVersion ?? "--"],
-              ["运行平台", status?.platform ?? "--"],
-              ["协议版本", status?.protocol ?? "--"],
+              ["PicoOnebot", status?.version ? `v${status.version}` : "--"],
+              ["QQ 内核", status?.qqVersion || "--"],
+              ["运行平台", status?.platform || "--"],
+              ["协议版本", status?.protocol || "--"],
               ["WebUI", "v1.0.0"],
             ].map(([k, v]) => (
               <div key={k} className="flex items-center justify-between gap-3 border-b border-dashed border-pico-line pb-2 last:border-0">
