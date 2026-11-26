@@ -14,7 +14,6 @@ kotlin {
 repositories {
     mavenCentral()
     google()
-    mavenLocal()
 }
 dependencies {
     compileOnly(gradleApi())
@@ -30,6 +29,11 @@ dependencies {
     implementation(fileTree("./libs") {
         include("*.jar")
     })
+    testImplementation(kotlin("test"))
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+}
+tasks.test {
+    useJUnitPlatform()
 }
 gradlePlugin {
     plugins {
