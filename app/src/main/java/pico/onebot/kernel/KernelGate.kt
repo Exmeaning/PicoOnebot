@@ -362,6 +362,10 @@ object KernelGate {
             SendTracker.reset()
             ReadReporter.reset()
             MsgWatchdog.reset()
+            pico.onebot.media.MediaRefStore.reset()
+            pico.onebot.msg.ForwardStore.reset()
+            pico.onebot.media.MediaDownloader.reset()
+            pico.onebot.media.MediaFiles.clearServed()
             for (hook in sessionLostHooks) {
                 try {
                     hook()

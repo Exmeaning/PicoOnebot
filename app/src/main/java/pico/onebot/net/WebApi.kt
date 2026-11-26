@@ -1152,14 +1152,12 @@ object WebApi {
                 .put("scanned", false).put("hasFragment", hasFrag).put("hasStateFragment", hasState)
         }
         if (refresh) {
-            val before = PicoLoginManager.latestQrTime
-            val beforeUrl = PicoLoginManager.latestQrUrl
+            val before = PicoLoginManager.currentQrSnapshot()
             if (PicoLoginManager.refreshQr()) {
                 val deadline = System.nanoTime() + QR_REFRESH_WAIT_NS
                 while ((deadline - System.nanoTime()) > 0L) {
-                    val curTime = PicoLoginManager.latestQrTime
-                    val curUrl = PicoLoginManager.latestQrUrl
-                    if (curTime > before && !curUrl.isNullOrBlank() && curUrl != beforeUrl) {
+                    val cur = PicoLoginManager.currentQrSnapshot()
+                    if (cur.generation > before.generation && !cur.expired && !cur.url.isNullOrBlank()) {
                         break
                     }
                     try {
@@ -1171,17 +1169,15 @@ object WebApi {
                 }
             }
         }
-        var snapTime = PicoLoginManager.latestQrTime
-        var bytes = PicoLoginManager.latestQrBytes
-        var info = PicoLoginManager.info()
-        if (PicoLoginManager.latestQrTime != snapTime) {
-            snapTime = PicoLoginManager.latestQrTime
-            bytes = PicoLoginManager.latestQrBytes
-            info = PicoLoginManager.info()
+        val snap = PicoLoginManager.currentQrSnapshot()
+        val url = snap.url ?: ""
+        val bytes = snap.bytes
+        val age = if (snap.receivedAtWallMs <= 0L) {
+            -1
+        } else {
+            ((System.nanoTime() - snap.receivedAtNs).coerceAtLeast(0L) / 1_000_000_000L).toInt()
         }
-        val url = info.optString("url", "")
-        val age = info.optInt("age_seconds", -1)
-        val expired = info.optBoolean("expired", false)
+        val expired = snap.expired || (age > QR_TTL_SEC)
         val status = when {
             url.isEmpty() -> "waiting_qr"
             expired -> "expired"
@@ -1194,7 +1190,7 @@ object WebApi {
             .put("url", url).put("image", image)
             .put("ageSeconds", if (age < 0) 0 else age)
             .put("expiresIn", if (status == "ok") (QR_TTL_SEC - age).coerceAtLeast(0) else 0)
-            .put("scanned", info.optBoolean("scanned", false))
+            .put("scanned", snap.scanned)
             .put("hasFragment", PicoLoginManager.qrFragmentRef?.get() != null)
             .put("hasStateFragment", PicoLoginManager.hasLoginEntry)
     }

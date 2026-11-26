@@ -3,7 +3,7 @@ package pico.onebot.net
 import org.json.JSONObject
 import pico.onebot.core.Config
 import pico.onebot.core.PicoLog
-import pico.onebot.proto.Ob
+import pico.onebot.event.MetaEvents
 import java.util.ArrayDeque
 import java.util.concurrent.CopyOnWriteArrayList
 
@@ -41,10 +41,7 @@ object Transport {
             PicoLog.i("ws connected: " + c.tag + " role=" + c.role + " total=" + conns.size)
             if (c.wantsEvents && Config.enabled && !c.closed) {
                 // OneBot v11: 每条新 WS 连接建立后推送一次 lifecycle.connect。
-                val connectEvent = Ob.event("meta_event")
-                    .put("meta_event_type", "lifecycle")
-                    .put("sub_type", "connect")
-                    .toString()
+                val connectEvent = MetaEvents.lifecycleEvent("connect").toString()
                 c.sendText(connectEvent)
                 if (!c.closed && replayBuffer.isNotEmpty()) {
                     drainReplayLocked(c)
