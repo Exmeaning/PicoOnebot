@@ -34,7 +34,7 @@ export function QrLogin({ onNavigate }: { onNavigate: (p: PageKey) => void }) {
   }, [onNavigate, toast]);
 
   const refresh = useCallback(
-    async (silent = false) => {
+    async (silent = false): Promise<"ok" | "online" | "auth_error" | "error"> => {
       pollAbort.current?.abort();
       refreshAbort.current?.abort();
       const controller = new AbortController();
@@ -45,20 +45,22 @@ export function QrLogin({ onNavigate }: { onNavigate: (p: PageKey) => void }) {
       setRefreshing(true);
       try {
         const q = await api.qrRefresh(controller.signal);
-        if (!mountedRef.current || controller.signal.aborted || seq !== reqSeq.current) return;
+        if (!mountedRef.current || controller.signal.aborted || seq !== reqSeq.current) return "ok";
         setInfo(q);
         setFailed(0);
         if (q.status === "online") {
           handleOnline();
-          return;
+          return "online";
         }
         if (!silent) {
           toast.push("success", q.status === "ok" ? "二维码已刷新" : "已向 QQ 请求新的二维码，稍等片刻");
         }
+        return "ok";
       } catch (e) {
-        if (!mountedRef.current || isAbortError(e) || seq !== reqSeq.current) return;
-        if (e instanceof ApiError && (e.status === 401 || e.status === 428)) return;
+        if (!mountedRef.current || isAbortError(e) || seq !== reqSeq.current) return "ok";
+        if (e instanceof ApiError && (e.status === 401 || e.status === 428)) return "auth_error";
         if (!silent) toast.push("error", (e as Error).message || "刷新二维码失败");
+        return "error";
       } finally {
         if (seq === reqSeq.current) {
           refreshingRef.current = false;
@@ -76,7 +78,11 @@ export function QrLogin({ onNavigate }: { onNavigate: (p: PageKey) => void }) {
 
     const scheduleNext = () => {
       if (!alive || done.current) return;
-      timer = setTimeout(() => void poll(), 2000);
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = null;
+        void poll();
+      }, 2000);
     };
 
     const poll = async () => {
@@ -91,7 +97,11 @@ export function QrLogin({ onNavigate }: { onNavigate: (p: PageKey) => void }) {
       const seq = ++reqSeq.current;
       try {
         const q = await api.qr(controller.signal);
-        if (!alive || controller.signal.aborted || seq !== reqSeq.current) return;
+        if (!alive) return;
+        if (controller.signal.aborted || seq !== reqSeq.current) {
+          scheduleNext();
+          return;
+        }
         setInfo(q);
         setFailed(0);
         if (q.status === "online") {
@@ -101,16 +111,19 @@ export function QrLogin({ onNavigate }: { onNavigate: (p: PageKey) => void }) {
         // 过期:同一张码只自动刷一次,避免和服务端互相追着刷
         if (q.status === "expired" && autoRefreshedFor.current !== q.url) {
           autoRefreshedFor.current = q.url;
-          await refresh(true);
+          const outcome = await refresh(true);
+          if (outcome === "auth_error" || outcome === "online") return;
         } else if (q.status === "waiting_qr" && !q.hasFragment && q.hasStateFragment && !switched.current) {
           // 还停在"账号状态页"(有上次登录的账号):替用户点一次"切换账号"进扫码页
           switched.current = true;
-          await refresh(true);
+          const outcome = await refresh(true);
+          if (outcome === "auth_error" || outcome === "online") return;
         }
         scheduleNext();
       } catch (e) {
-        if (!alive || isAbortError(e)) {
-          if (alive && !done.current) scheduleNext();
+        if (!alive) return;
+        if (isAbortError(e)) {
+          scheduleNext();
           return;
         }
         if (e instanceof ApiError && (e.status === 401 || e.status === 428)) {
