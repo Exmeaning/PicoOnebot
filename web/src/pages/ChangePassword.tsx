@@ -1,8 +1,8 @@
-import { useState, type FormEvent } from "react";
+import { useId, useState, type FormEvent } from "react";
 import { ArrowLeft, Eye, EyeOff, KeyRound, LockKeyhole, ShieldCheck } from "lucide-react";
 import { Logo } from "../components/Logo";
 import { Button, Field, Input, useToast } from "../components/ui";
-import { ApiError, api, setToken } from "../lib/api";
+import { ApiError, api, getErrorMessage, setToken } from "../lib/api";
 
 const MIN_PASSWORD_LENGTH = 8;
 
@@ -17,6 +17,7 @@ export function ChangePassword({
   const [confirm, setConfirm] = useState("");
   const [show, setShow] = useState(false);
   const [loading, setLoading] = useState(false);
+  const idPrefix = useId();
   const toast = useToast();
 
   const hasEdgeWhitespace = password !== password.trim();
@@ -48,7 +49,7 @@ export function ChangePassword({
         // Central unauthorized handler resets back to Login and notifies the user.
         return;
       }
-      toast.push("error", (error as Error).message || "修改失败");
+      toast.push("error", getErrorMessage(error, "修改失败"));
     } finally {
       setLoading(false);
     }
@@ -70,6 +71,7 @@ export function ChangePassword({
         <div className="mt-6 space-y-4">
           <Field
             label="新密码"
+            htmlFor={`${idPrefix}-new-password`}
             hint={
               hasEdgeWhitespace
                 ? "密码首尾不能包含空格"
@@ -81,6 +83,7 @@ export function ChangePassword({
             <div className="relative">
               <KeyRound className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-pico-muted" />
               <Input
+                id={`${idPrefix}-new-password`}
                 className="pl-10 pr-11"
                 type={show ? "text" : "password"}
                 value={password}
@@ -98,10 +101,11 @@ export function ChangePassword({
               </button>
             </div>
           </Field>
-          <Field label="确认新密码" hint={confirm && confirm !== password ? "两次输入不一致" : undefined}>
+          <Field label="确认新密码" htmlFor={`${idPrefix}-confirm-password`} hint={confirm && confirm !== password ? "两次输入不一致" : undefined}>
             <div className="relative">
               <LockKeyhole className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-pico-muted" />
               <Input
+                id={`${idPrefix}-confirm-password`}
                 className="pl-10"
                 type={show ? "text" : "password"}
                 value={confirm}

@@ -13,6 +13,7 @@ import { QrLogin } from "./pages/QrLogin";
 import { ChangePassword } from "./pages/ChangePassword";
 import {
   api,
+  getErrorMessage,
   getToken,
   setToken,
   setUnauthorizedHandler,
@@ -22,9 +23,16 @@ import {
 import type { BotStatus } from "./lib/types";
 
 function pageFromHash(): PageKey {
-  const h = window.location.hash.replace("#/", "").replace("#", "") as PageKey;
+  const h = window.location.hash.replace(/^#\/?/, "");
   if (h === "qr") return "qr";
-  return NAV.some((n) => n.key === h) ? h : "dashboard";
+  const match = NAV.find((n) => n.key === h);
+  return match ? match.key : "dashboard";
+}
+
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  if (target.isContentEditable) return true;
+  return Boolean(target.closest("input, textarea, select, [contenteditable='true'], [contenteditable='']"));
 }
 
 function Root() {
@@ -39,14 +47,55 @@ function Root() {
   const pageRef = useRef(page);
   const authedRef = useRef(authed);
   const mustChangeRef = useRef(mustChangePassword);
+  // 提升至 App 的脏状态守护：拦截 SPA 切页、快捷键、浏览器回退与断线自动跳转扫码页
+  const dirtyGuardRef = useRef<{ page: PageKey; message: string } | null>(null);
   // QQ 未登录时只自动带去扫码页一次;用户手动离开就不再打扰
   const qrRedirected = useRef(false);
+  const qrDeferredNotified = useRef(false);
+
+  const setPageDirty = useCallback((sourcePage: PageKey, isDirty: boolean, message: string) => {
+    if (isDirty) {
+      dirtyGuardRef.current = { page: sourcePage, message };
+    } else if (dirtyGuardRef.current?.page === sourcePage) {
+      dirtyGuardRef.current = null;
+    }
+  }, []);
+
+  const onNetworkDirtyChange = useCallback(
+    (dirty: boolean) => setPageDirty("network", dirty, "当前网络配置有未保存的修改，确定放弃并离开吗？"),
+    [setPageDirty]
+  );
+
+  const onFilesDirtyChange = useCallback(
+    (dirty: boolean) => setPageDirty("files", dirty, "当前文件有未保存的修改，确定放弃并离开吗？"),
+    [setPageDirty]
+  );
+
+  const onSettingsDirtyChange = useCallback(
+    (dirty: boolean) => setPageDirty("settings", dirty, "当前偏好设置有未保存的修改，确定放弃并离开吗？"),
+    [setPageDirty]
+  );
+
+  const isActivePageDirty = useCallback(() => {
+    const guard = dirtyGuardRef.current;
+    return guard !== null && guard.page === pageRef.current;
+  }, []);
+
+  const confirmLeaveIfDirty = useCallback(() => {
+    const guard = dirtyGuardRef.current;
+    if (!guard || guard.page !== pageRef.current) return true;
+    if (!window.confirm(guard.message)) return false;
+    dirtyGuardRef.current = null;
+    return true;
+  }, []);
 
   const resetToLogin = useCallback(
     (notice?: { kind: "info" | "success" | "error"; text: string }) => {
       authedRef.current = false;
       mustChangeRef.current = false;
+      dirtyGuardRef.current = null;
       qrRedirected.current = false;
+      qrDeferredNotified.current = false;
       setToken("");
       setAuthed(false);
       setMustChangePassword(false);
@@ -55,6 +104,16 @@ function Root() {
     },
     [toast]
   );
+
+  useEffect(() => {
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (!isActivePageDirty()) return;
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [isActivePageDirty]);
 
   useEffect(() => {
     setUnauthorizedHandler(() => {
@@ -66,6 +125,7 @@ function Root() {
       if (authedRef.current) {
         authedRef.current = false;
         mustChangeRef.current = true;
+        dirtyGuardRef.current = null;
         setAuthed(false);
         setMustChangePassword(true);
       }
@@ -102,7 +162,7 @@ function Root() {
         if (err instanceof ApiError && err.status === 401) {
           setToken("");
         } else {
-          toast.push("error", (err as Error).message || "无法连接 PicoOnebot 后端");
+          toast.push("error", getErrorMessage(err, "无法连接 PicoOnebot 后端"));
         }
       })
       .finally(() => {
@@ -117,19 +177,42 @@ function Root() {
     pageRef.current = page;
   }, [page]);
 
-  const navigate = useCallback((p: PageKey) => {
-    window.location.hash = `/${p}`;
-    setPage(p);
-    window.scrollTo({ top: 0, behavior: "smooth" });
-  }, []);
+  const navigate = useCallback(
+    (p: PageKey, options?: { force?: boolean }) => {
+      if (p === pageRef.current) return;
+      if (!options?.force && !confirmLeaveIfDirty()) return;
+      if (options?.force) dirtyGuardRef.current = null;
+      pageRef.current = p;
+      window.location.hash = `/${p}`;
+      setPage(p);
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    },
+    [confirmLeaveIfDirty]
+  );
+
+  const navigateInteractive = useCallback(
+    (p: PageKey) => {
+      navigate(p);
+    },
+    [navigate]
+  );
 
   useEffect(() => {
-    const onHash = () => setPage(pageFromHash());
+    const onHash = () => {
+      const next = pageFromHash();
+      if (next === pageRef.current) return;
+      if (!confirmLeaveIfDirty()) {
+        window.location.hash = `/${pageRef.current}`;
+        return;
+      }
+      pageRef.current = next;
+      setPage(next);
+    };
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
-  }, []);
+  }, [confirmLeaveIfDirty]);
 
-  // status polling(+ QQ 离线时自动带去扫码页)
+  // status polling(+ QQ 离线时自动带去扫码页；存在未保存编辑时暂缓自动跳转)
   useEffect(() => {
     if (!authed) return;
     let alive = true;
@@ -144,15 +227,36 @@ function Root() {
         setStatus(s);
         if (s.online) {
           qrRedirected.current = false;
-          if (pageRef.current === "qr") navigate("dashboard");
+          qrDeferredNotified.current = false;
+          if (pageRef.current === "qr") navigate("dashboard", { force: true });
         } else if (!qrRedirected.current && pageRef.current !== "qr") {
+          if (isActivePageDirty()) {
+            // 有未保存修改时不打断编辑，待保存或放弃后的下次轮询再跳转
+            if (!qrDeferredNotified.current) {
+              const q = await api.qr(controller.signal).catch(() => null);
+              if (!alive || controller.signal.aborted || !q) return;
+              if (q.status !== "online" && (q.hasFragment || q.hasStateFragment || q.url)) {
+                qrDeferredNotified.current = true;
+                toast.push("info", "QQ 已离线，检测到未保存修改，已暂缓自动跳转扫码页");
+              }
+            }
+            return;
+          }
           // 先确认登录页确实在(不是内核还在热身),再跳,免得刚启动就来回蹦
           const q = await api.qr(controller.signal).catch(() => null);
           if (!alive || controller.signal.aborted || !q) return;
           if (q.status !== "online" && (q.hasFragment || q.hasStateFragment || q.url)) {
+            if (isActivePageDirty()) {
+              if (!qrDeferredNotified.current) {
+                qrDeferredNotified.current = true;
+                toast.push("info", "QQ 已离线，检测到未保存修改，已暂缓自动跳转扫码页");
+              }
+              return;
+            }
             qrRedirected.current = true;
+            qrDeferredNotified.current = false;
             toast.push("info", "QQ 还没登录，先扫个码吧");
-            navigate("qr");
+            navigate("qr", { force: true });
           }
         }
       } catch {
@@ -166,22 +270,29 @@ function Root() {
       ac?.abort();
       clearInterval(t);
     };
-  }, [authed, toast, navigate]);
+  }, [authed, toast, navigate, isActivePageDirty]);
 
   // keyboard shortcuts: g then 1-6
   useEffect(() => {
     if (!authed) return;
     const clearG = () => {
       gPressed.current = false;
-      if (gTimer.current) {
+      if (gTimer.current !== null) {
         clearTimeout(gTimer.current);
         gTimer.current = null;
       }
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.ctrlKey || e.metaKey || e.altKey) return;
-      const target = e.target as HTMLElement | null;
-      if (target && (["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName) || target.isContentEditable)) return;
+      if (e.ctrlKey || e.metaKey || e.altKey) {
+        clearG();
+        return;
+      }
+      if (e.isComposing || e.repeat || e.defaultPrevented) return;
+      if (document.querySelector('[role="dialog"][aria-modal="true"]')) {
+        clearG();
+        return;
+      }
+      if (isEditableTarget(e.target)) return;
       if (e.key.toLowerCase() === "g") {
         clearG();
         gPressed.current = true;
@@ -192,7 +303,12 @@ function Root() {
         return;
       }
       if (gPressed.current && /^[1-6]$/.test(e.key)) {
-        navigate(NAV[Number(e.key) - 1].key);
+        const dest = NAV[Number(e.key) - 1];
+        clearG();
+        if (dest) navigate(dest.key);
+        return;
+      }
+      if (gPressed.current && e.key !== "Shift") {
         clearG();
       }
     };
@@ -204,9 +320,10 @@ function Root() {
   }, [authed, navigate]);
 
   const logout = useCallback(async () => {
+    if (!confirmLeaveIfDirty()) return;
     await api.logout();
     resetToLogin({ kind: "info", text: "已退出登录，下次见" });
-  }, [resetToLogin]);
+  }, [confirmLeaveIfDirty, resetToLogin]);
 
   const cancelPasswordSetup = useCallback(async () => {
     await api.logout();
@@ -232,7 +349,7 @@ function Root() {
           authedRef.current = true;
           setMustChangePassword(false);
           setAuthed(true);
-          navigate("dashboard");
+          navigate("dashboard", { force: true });
         }}
         onCancel={() => void cancelPasswordSetup()}
       />
@@ -251,7 +368,7 @@ function Root() {
             mustChangeRef.current = false;
             authedRef.current = true;
             setAuthed(true);
-            navigate("dashboard");
+            navigate("dashboard", { force: true });
           }
         }}
       />
@@ -259,13 +376,13 @@ function Root() {
   }
 
   return (
-    <Shell page={page} onNavigate={navigate} onLogout={() => void logout()} status={status}>
-      {page === "dashboard" && <Dashboard status={status} onNavigate={navigate} />}
-      {page === "qr" && <QrLogin onNavigate={navigate} />}
-      {page === "network" && <Network />}
+    <Shell page={page} onNavigate={navigateInteractive} onLogout={() => void logout()} status={status}>
+      {page === "dashboard" && <Dashboard status={status} onNavigate={navigateInteractive} />}
+      {page === "qr" && <QrLogin onNavigate={navigateInteractive} />}
+      {page === "network" && <Network onDirtyChange={onNetworkDirtyChange} />}
       {page === "logs" && <Logs />}
-      {page === "files" && <FileManager />}
-      {page === "settings" && <Settings onRequireRelogin={requireRelogin} />}
+      {page === "files" && <FileManager onDirtyChange={onFilesDirtyChange} />}
+      {page === "settings" && <Settings onRequireRelogin={requireRelogin} onDirtyChange={onSettingsDirtyChange} />}
       {page === "about" && <About status={status} />}
     </Shell>
   );

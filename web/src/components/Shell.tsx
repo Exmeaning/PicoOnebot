@@ -1,9 +1,9 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { LayoutDashboard, Network, ScrollText, FolderCog, Settings2, Info, LogOut, Menu, X, Settings, RefreshCw, QrCode, Star } from "lucide-react";
 import { Logo } from "./Logo";
-import { Badge, Button, HeartDot, useToast } from "./ui";
+import { Badge, Button, HeartDot, useDialogAccessibility, useToast } from "./ui";
 import { cn } from "../utils/cn";
-import { api } from "../lib/api";
+import { api, getErrorMessage } from "../lib/api";
 import type { BotStatus } from "../lib/types";
 
 /** `qr` 不进侧栏导航:QQ 离线时由 App 自动带过去,顶栏离线徽标也能点过去。 */
@@ -35,16 +35,20 @@ export function Shell({
   const [restarting, setRestarting] = useState(false);
   const restartTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mountedRef = useRef(true);
+  const drawerRef = useRef<HTMLDivElement>(null);
   const toast = useToast();
   const current = NAV.find((n) => n.key === page);
   const title = current?.label ?? "扫码登录";
   const desc = current?.desc ?? "让 QQ 账号上线";
 
+  const closeDrawer = useCallback(() => setOpen(false), []);
+  useDialogAccessibility(open, closeDrawer, drawerRef);
+
   useEffect(() => {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
-      if (restartTimer.current) {
+      if (restartTimer.current !== null) {
         clearTimeout(restartTimer.current);
         restartTimer.current = null;
       }
@@ -66,7 +70,7 @@ export function Shell({
       if (r.ok) {
         submitted = true;
         toast.push("success", r.wording ?? "QQ 重启请求已提交");
-        if (restartTimer.current) clearTimeout(restartTimer.current);
+        if (restartTimer.current !== null) clearTimeout(restartTimer.current);
         restartTimer.current = setTimeout(() => {
           restartTimer.current = null;
           if (mountedRef.current) setRestarting(false);
@@ -75,7 +79,7 @@ export function Shell({
         toast.push("info", r.wording ?? "当前环境不支持重启 QQ");
       }
     } catch (e) {
-      if (mountedRef.current) toast.push("error", (e as Error).message);
+      if (mountedRef.current) toast.push("error", getErrorMessage(e, "提交重启请求失败"));
     } finally {
       if (!submitted && mountedRef.current) setRestarting(false);
     }
@@ -88,13 +92,15 @@ export function Shell({
         <p className="mt-1 truncate text-[11px] font-bold text-pico-muted">PicoOnebot 控制台</p>
       </div>
 
-      <nav className="pico-glass flex-1 space-y-1 overflow-y-auto rounded-bubble border border-white p-3 shadow-cute ring-1 ring-pico-line">
+      <nav aria-label="主导航" className="pico-glass flex-1 space-y-1 overflow-y-auto rounded-bubble border border-white p-3 shadow-cute ring-1 ring-pico-line">
         {NAV.map((n) => {
           const active = n.key === page;
           const Icon = n.icon;
           return (
             <button
               key={n.key}
+              type="button"
+              aria-current={active ? "page" : undefined}
               onClick={() => onNavigate(n.key)}
               className={cn(
                 "pico-ring group relative flex w-full items-center gap-3 rounded-2xl px-3 py-2.5 text-left transition-all duration-200",
@@ -133,16 +139,16 @@ export function Shell({
         </div>
         <div className="mt-3 grid grid-cols-2 gap-2">
           {status && !status.online ? (
-            <Button variant="soft" size="sm" onClick={() => onNavigate("qr")}>
+            <Button type="button" variant="soft" size="sm" onClick={() => onNavigate("qr")}>
               <QrCode className="h-3.5 w-3.5" /> 扫码
             </Button>
           ) : null}
           {status?.canRestartQq && (
-            <Button variant="soft" size="sm" onClick={restart} loading={restarting}>
+            <Button type="button" variant="soft" size="sm" onClick={() => void restart()} loading={restarting}>
               <RefreshCw className="h-3.5 w-3.5" /> 重启 QQ
             </Button>
           )}
-          <Button variant="outline" size="sm" onClick={onLogout}>
+          <Button type="button" variant="outline" size="sm" onClick={onLogout}>
             <LogOut className="h-3.5 w-3.5" /> 退出
           </Button>
         </div>
@@ -157,16 +163,33 @@ export function Shell({
 
       {/* mobile drawer */}
       {open ? (
-        <div className="fixed inset-0 z-40 lg:hidden">
-          <div className="absolute inset-0 bg-pico-deep/25 backdrop-blur-sm" onClick={() => setOpen(false)} />
-          <div className="absolute inset-y-0 left-0">{sidebar}</div>
+        <div
+          id="pico-mobile-drawer"
+          role="dialog"
+          aria-modal="true"
+          aria-label="导航菜单"
+          className="fixed inset-0 z-40 lg:hidden"
+        >
+          <div className="absolute inset-0 bg-pico-deep/25 backdrop-blur-sm" onClick={closeDrawer} aria-hidden="true" />
+          <div ref={drawerRef} tabIndex={-1} className="absolute inset-y-0 left-0 outline-none">
+            {sidebar}
+          </div>
         </div>
       ) : null}
 
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="sticky top-0 z-30 px-4 pt-4 lg:px-6">
           <div className="pico-glass flex items-center gap-3 rounded-full border border-white px-3 py-2 shadow-cute ring-1 ring-pico-line">
-            <Button variant="ghost" size="icon" className="lg:hidden" onClick={() => setOpen((v) => !v)} aria-label="菜单">
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="lg:hidden"
+              onClick={() => setOpen((v) => !v)}
+              aria-label={open ? "关闭菜单" : "打开菜单"}
+              aria-expanded={open}
+              aria-controls="pico-mobile-drawer"
+            >
               {open ? <X className="h-4 w-4" /> : <Menu className="h-4 w-4" />}
             </Button>
             <Logo className="h-5 lg:hidden" />
@@ -176,7 +199,7 @@ export function Shell({
             </div>
             <div className="ml-auto flex items-center gap-2">
               {status && !status.online ? (
-                <button onClick={() => onNavigate("qr")} className="pico-ring rounded-full" title="QQ 未登录，去扫码">
+                <button type="button" onClick={() => onNavigate("qr")} className="pico-ring rounded-full" title="QQ 未登录，去扫码">
                   <Badge tone="amber">
                     <QrCode className="h-3 w-3" /> QQ 离线 · 去扫码
                   </Badge>
@@ -187,7 +210,7 @@ export function Shell({
                   {status?.online ? "在线" : "连接中"}
                 </Badge>
               )}
-              <Button variant="ghost" size="icon" onClick={() => onNavigate("settings")} aria-label="偏好设置" title="偏好设置">
+              <Button type="button" variant="ghost" size="icon" onClick={() => onNavigate("settings")} aria-label="偏好设置" title="偏好设置">
                 <Settings className="h-4 w-4" />
               </Button>
             </div>

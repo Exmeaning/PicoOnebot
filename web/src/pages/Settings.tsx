@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type FormEvent } from "react";
 import {
   Palette,
   Check,
@@ -17,6 +17,7 @@ import {
   ApiError,
   api,
   getBaseUrl,
+  getErrorMessage,
   getStoredBaseUrl,
   isAbortError,
   normalizeBaseUrl,
@@ -24,6 +25,32 @@ import {
 } from "../lib/api";
 import type { AppConfig, ForwardMode, GeneralConfig, LogLevel, MessageFormat, WebuiConfig } from "../lib/types";
 import { cn } from "../utils/cn";
+
+type SettingsSnapshot = {
+  general: GeneralConfig;
+  webui: { host: string; port: number };
+};
+
+const LOG_LEVELS: readonly LogLevel[] = ["debug", "info", "warn", "error"];
+
+function isLogLevel(value: string): value is LogLevel {
+  return value === "debug" || value === "info" || value === "warn" || value === "error";
+}
+
+function isForwardMode(value: string): value is ForwardMode {
+  return value === "merge_one" || value === "separate" || value === "silent";
+}
+
+function isMessageFormat(value: string): value is MessageFormat {
+  return value === "array" || value === "string";
+}
+
+function extractSnapshot(c: AppConfig): SettingsSnapshot {
+  return {
+    general: structuredClone(c.general),
+    webui: { host: c.webui.host, port: c.webui.port },
+  };
+}
 
 function validateSettings(cfg: AppConfig): string {
   const g = cfg.general;
@@ -57,13 +84,21 @@ function validateSettings(cfg: AppConfig): string {
   return "";
 }
 
-export function Settings({ onRequireRelogin }: { onRequireRelogin: (message: string) => void }) {
+export function Settings({
+  onRequireRelogin,
+  onDirtyChange,
+}: {
+  onRequireRelogin: (message: string) => void;
+  onDirtyChange?: (dirty: boolean) => void;
+}) {
   const theme = useTheme();
   const toast = useToast();
+  const idPrefix = useId();
   const [themeCollapsed, setThemeCollapsed] = useState(true);
   const [hexDraft, setHexDraft] = useState(theme.color);
   const [cfg, setCfg] = useState<AppConfig | null>(null);
-  const [saved, setSaved] = useState("");
+  const [savedSnapshot, setSavedSnapshot] = useState<SettingsSnapshot | null>(null);
+  const [savedJson, setSavedJson] = useState("");
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -87,10 +122,11 @@ export function Settings({ onRequireRelogin }: { onRequireRelogin: (message: str
       const c = await api.getConfig(controller.signal);
       if (controller.signal.aborted) return;
       setCfg(c);
-      setSaved(snap(c));
+      setSavedSnapshot(extractSnapshot(c));
+      setSavedJson(snap(c));
     } catch (err) {
       if (isAbortError(err)) return;
-      const msg = (err as Error).message || "加载设置失败";
+      const msg = getErrorMessage(err, "加载设置失败");
       setLoadError(msg);
       if (!(err instanceof ApiError && (err.status === 401 || err.status === 428))) {
         toast.push("error", msg);
@@ -107,17 +143,26 @@ export function Settings({ onRequireRelogin }: { onRequireRelogin: (message: str
     };
   }, [loadConfig]);
 
-  const dirty = useMemo(() => !!cfg && snap(cfg) !== saved, [cfg, saved]);
+  const dirty = useMemo(() => !!cfg && snap(cfg) !== savedJson, [cfg, savedJson]);
   const validationError = useMemo(() => (cfg ? validateSettings(cfg) : ""), [cfg]);
 
   useEffect(() => {
+    onDirtyChange?.(dirty);
+    return () => {
+      onDirtyChange?.(false);
+    };
+  }, [dirty, onDirtyChange]);
+
+  useEffect(() => {
+    if (onDirtyChange) return;
     const beforeUnload = (event: BeforeUnloadEvent) => {
       if (!dirty) return;
       event.preventDefault();
+      event.returnValue = "";
     };
     window.addEventListener("beforeunload", beforeUnload);
     return () => window.removeEventListener("beforeunload", beforeUnload);
-  }, [dirty]);
+  }, [dirty, onDirtyChange]);
 
   const set = <K extends keyof GeneralConfig>(k: K, v: GeneralConfig[K]) => setCfg((c) => (c ? { ...c, general: { ...c.general, [k]: v } } : c));
   const setWeb = <K extends keyof WebuiConfig>(k: K, v: WebuiConfig[K]) => setCfg((c) => (c ? { ...c, webui: { ...c.webui, [k]: v } } : c));
@@ -132,18 +177,20 @@ export function Settings({ onRequireRelogin }: { onRequireRelogin: (message: str
     setSaving(true);
     try {
       const r = await api.saveConfig({ general: cfg.general, webui: cfg.webui });
-      setSaved(snap(cfg));
+      setSavedSnapshot(extractSnapshot(cfg));
+      setSavedJson(snap(cfg));
       toast.push("success", r.restartRequired ? "已保存，WebUI 监听地址或启动设置需重启 QQ 生效" : "设置已保存");
     } catch (e) {
       if (!(e instanceof ApiError && (e.status === 401 || e.status === 428))) {
-        toast.push("error", (e as Error).message);
+        toast.push("error", getErrorMessage(e, "保存设置失败"));
       }
     } finally {
       setSaving(false);
     }
   };
 
-  const handleSaveBaseUrl = async () => {
+  const handleSaveBaseUrl = async (event?: FormEvent) => {
+    event?.preventDefault();
     const parsed = normalizeBaseUrl(base);
     if (!parsed.ok) {
       toast.push("error", parsed.error);
@@ -182,17 +229,22 @@ export function Settings({ onRequireRelogin }: { onRequireRelogin: (message: str
           <div className="flex items-center gap-2">
             {dirty ? (
               <Button
+                type="button"
                 variant="ghost"
                 onClick={() => {
-                  if (!cfg) return;
-                  const s = JSON.parse(saved) as { general: GeneralConfig; webui: { host: string; port: number } };
-                  setCfg({ ...cfg, general: s.general, webui: { ...cfg.webui, host: s.webui.host, port: s.webui.port } });
+                  if (!cfg || !savedSnapshot) return;
+                  const restored = structuredClone(savedSnapshot);
+                  setCfg({
+                    ...cfg,
+                    general: restored.general,
+                    webui: { ...cfg.webui, host: restored.webui.host, port: restored.webui.port },
+                  });
                 }}
               >
                 <RotateCcw className="h-4 w-4" /> 撤销
               </Button>
             ) : null}
-            <Button onClick={() => void save()} loading={saving} disabled={!dirty || !!validationError}>
+            <Button type="button" onClick={() => void save()} loading={saving} disabled={!dirty || !!validationError}>
               <Save className="h-4 w-4" /> 保存设置
             </Button>
           </div>
@@ -227,6 +279,7 @@ export function Settings({ onRequireRelogin }: { onRequireRelogin: (message: str
                   variant="ghost"
                   size="sm"
                   type="button"
+                  aria-expanded={!themeCollapsed}
                   onClick={(e) => {
                     e.stopPropagation();
                     setThemeCollapsed((v) => !v);
@@ -323,44 +376,58 @@ export function Settings({ onRequireRelogin }: { onRequireRelogin: (message: str
                 <AlertTriangle className="mb-2 h-7 w-7 text-rose-500" />
                 <p className="text-sm font-extrabold text-pico-ink">加载运行参数失败</p>
                 <p className="mt-1 text-xs text-pico-muted">{loadError}</p>
-                <Button className="mt-4" size="sm" variant="soft" onClick={() => void loadConfig()} loading={loading}>
+                <Button type="button" className="mt-4" size="sm" variant="soft" onClick={() => void loadConfig()} loading={loading}>
                   <RefreshCw className="h-3.5 w-3.5" /> 重试
                 </Button>
               </div>
             ) : g ? (
               <>
                 <div className="grid gap-4 sm:grid-cols-2">
-                  <Field label="控制台日志等级">
-                    <Select value={g.logLevel} onChange={(e) => set("logLevel", e.target.value as LogLevel)}>
-                      {["debug", "info", "warn", "error"].map((l) => (
+                  <Field label="控制台日志等级" htmlFor={`${idPrefix}-log-level`}>
+                    <Select
+                      id={`${idPrefix}-log-level`}
+                      value={g.logLevel}
+                      onChange={(e) => {
+                        if (isLogLevel(e.target.value)) set("logLevel", e.target.value);
+                      }}
+                    >
+                      {LOG_LEVELS.map((l) => (
                         <option key={l} value={l}>
                           {l}
                         </option>
                       ))}
                     </Select>
                   </Field>
-                  <Field label="合并转发降级方式" hint="手表协议发不了真合并转发，只能降级">
-                    <Select value={g.forwardMode} onChange={(e) => set("forwardMode", e.target.value as ForwardMode)}>
+                  <Field label="合并转发降级方式" htmlFor={`${idPrefix}-forward-mode`} hint="手表协议发不了真合并转发，只能降级">
+                    <Select
+                      id={`${idPrefix}-forward-mode`}
+                      value={g.forwardMode}
+                      onChange={(e) => {
+                        if (isForwardMode(e.target.value)) set("forwardMode", e.target.value);
+                      }}
+                    >
                       <option value="merge_one">merge_one · 拼成一条</option>
                       <option value="separate">separate · 逐条发</option>
                       <option value="silent">silent · 丢弃</option>
                     </Select>
                   </Field>
                 </div>
-                <Field label="合并转发抬头" hint="merge_one 时拼接在开头的提示文字">
-                  <Input value={g.forwardMergeHeader} onChange={(e) => set("forwardMergeHeader", e.target.value)} placeholder="〔合并转发〕" />
+                <Field label="合并转发抬头" htmlFor={`${idPrefix}-forward-header`} hint="merge_one 时拼接在开头的提示文字">
+                  <Input id={`${idPrefix}-forward-header`} value={g.forwardMergeHeader} onChange={(e) => set("forwardMergeHeader", e.target.value)} placeholder="〔合并转发〕" />
                 </Field>
                 <div className="grid gap-4 sm:grid-cols-2">
-                  <Field label="发送速率上限（条/秒）" hint="正整数">
+                  <Field label="发送速率上限（条/秒）" htmlFor={`${idPrefix}-send-rate`} hint="正整数">
                     <Input
+                      id={`${idPrefix}-send-rate`}
                       type="number"
                       min={1}
                       value={Number.isFinite(g.sendRatePerSec) ? g.sendRatePerSec : ""}
                       onChange={(e) => set("sendRatePerSec", e.target.value === "" ? Number.NaN : Number(e.target.value))}
                     />
                   </Field>
-                  <Field label="内核调用超时（毫秒）" hint="正整数">
+                  <Field label="内核调用超时（毫秒）" htmlFor={`${idPrefix}-kernel-timeout`} hint="正整数">
                     <Input
+                      id={`${idPrefix}-kernel-timeout`}
                       type="number"
                       min={1}
                       value={Number.isFinite(g.kernelCallTimeoutMs) ? g.kernelCallTimeoutMs : ""}
@@ -368,11 +435,12 @@ export function Settings({ onRequireRelogin }: { onRequireRelogin: (message: str
                     />
                   </Field>
                 </div>
-                <Field label="媒体外链前缀" hint="留空则用 /media 相对路径；跨机时填 http://<本机IP>:端口">
-                  <Input className="font-mono" value={g.mediaBaseUrl} onChange={(e) => set("mediaBaseUrl", e.target.value)} placeholder="http://192.168.1.10:3001" />
+                <Field label="媒体外链前缀" htmlFor={`${idPrefix}-media-url`} hint="留空则用 /media 相对路径；跨机时填 http://<本机IP>:端口">
+                  <Input id={`${idPrefix}-media-url`} className="font-mono" value={g.mediaBaseUrl} onChange={(e) => set("mediaBaseUrl", e.target.value)} placeholder="http://192.168.1.10:3001" />
                 </Field>
-                <Field label="base64 内联上限（字节）" hint="超过则改用外链，0 表示不内联">
+                <Field label="base64 内联上限（字节）" htmlFor={`${idPrefix}-media-limit`} hint="超过则改用外链，0 表示不内联">
                   <Input
+                    id={`${idPrefix}-media-limit`}
                     type="number"
                     min={0}
                     className="font-mono"
@@ -381,8 +449,9 @@ export function Settings({ onRequireRelogin }: { onRequireRelogin: (message: str
                   />
                 </Field>
                 <div className="grid gap-4 sm:grid-cols-2">
-                  <Field label="心跳间隔（毫秒）" hint="0 为关闭，启用时至少 1000">
+                  <Field label="心跳间隔（毫秒）" htmlFor={`${idPrefix}-heartbeat`} hint="0 为关闭，启用时至少 1000">
                     <Input
+                      id={`${idPrefix}-heartbeat`}
                       type="number"
                       min={0}
                       step={1000}
@@ -390,8 +459,14 @@ export function Settings({ onRequireRelogin }: { onRequireRelogin: (message: str
                       onChange={(e) => set("heartbeat", e.target.value === "" ? Number.NaN : Number(e.target.value))}
                     />
                   </Field>
-                  <Field label="消息格式" hint="对所有连接生效">
-                    <Select value={g.messageFormat} onChange={(e) => set("messageFormat", e.target.value as MessageFormat)}>
+                  <Field label="消息格式" htmlFor={`${idPrefix}-message-format`} hint="对所有连接生效">
+                    <Select
+                      id={`${idPrefix}-message-format`}
+                      value={g.messageFormat}
+                      onChange={(e) => {
+                        if (isMessageFormat(e.target.value)) set("messageFormat", e.target.value);
+                      }}
+                    >
                       <option value="array">消息段数组 (array)</option>
                       <option value="string">CQ 码字符串 (string)</option>
                     </Select>
@@ -410,11 +485,12 @@ export function Settings({ onRequireRelogin }: { onRequireRelogin: (message: str
             <div className="space-y-4 p-4 pt-3 sm:p-6 sm:pt-4 min-w-0">
               {cfg ? (
                 <div className="grid gap-4 sm:grid-cols-2">
-                  <Field label="WebUI 监听地址" hint="改动需重启 QQ 进程后生效">
-                    <Input className="font-mono" value={cfg.webui.host} onChange={(e) => setWeb("host", e.target.value)} />
+                  <Field label="WebUI 监听地址" htmlFor={`${idPrefix}-webui-host`} hint="改动需重启 QQ 进程后生效">
+                    <Input id={`${idPrefix}-webui-host`} className="font-mono" value={cfg.webui.host} onChange={(e) => setWeb("host", e.target.value)} />
                   </Field>
-                  <Field label="WebUI 端口" hint="1 - 65535，改动需重启 QQ 生效">
+                  <Field label="WebUI 端口" htmlFor={`${idPrefix}-webui-port`} hint="1 - 65535，改动需重启 QQ 生效">
                     <Input
+                      id={`${idPrefix}-webui-port`}
                       className="font-mono"
                       type="number"
                       min={1}
@@ -426,24 +502,27 @@ export function Settings({ onRequireRelogin }: { onRequireRelogin: (message: str
                 </div>
               ) : null}
               {cfg?.webui.passwordInitialized ? <ChangePasswordInline onRequireRelogin={onRequireRelogin} /> : null}
-              <Field label="后端地址（仅本浏览器）" hint="留空默认与当前页面同源；切换不同主机时会先退出当前会话">
-                <div className="flex gap-2 min-w-0">
-                  <Input
-                    className="font-mono text-xs min-w-0 flex-1"
-                    value={base}
-                    onChange={(e) => setBase(e.target.value)}
-                    placeholder={window.location.origin}
-                  />
-                  {base.trim() ? (
-                    <Button variant="ghost" type="button" className="shrink-0" onClick={() => setBase("")} disabled={switchingBase}>
-                      恢复同源
+              <form onSubmit={(e) => void handleSaveBaseUrl(e)}>
+                <Field label="后端地址（仅本浏览器）" htmlFor={`${idPrefix}-base-url`} hint="留空默认与当前页面同源；切换不同主机时会先退出当前会话">
+                  <div className="flex gap-2 min-w-0">
+                    <Input
+                      id={`${idPrefix}-base-url`}
+                      className="font-mono text-xs min-w-0 flex-1"
+                      value={base}
+                      onChange={(e) => setBase(e.target.value)}
+                      placeholder={window.location.origin}
+                    />
+                    {base.trim() ? (
+                      <Button variant="ghost" type="button" className="shrink-0" onClick={() => setBase("")} disabled={switchingBase}>
+                        恢复同源
+                      </Button>
+                    ) : null}
+                    <Button variant="soft" type="submit" className="shrink-0" loading={switchingBase}>
+                      保存
                     </Button>
-                  ) : null}
-                  <Button variant="soft" type="button" className="shrink-0" loading={switchingBase} onClick={() => void handleSaveBaseUrl()}>
-                    保存
-                  </Button>
-                </div>
-              </Field>
+                  </div>
+                </Field>
+              </form>
             </div>
           </Card>
         </div>
@@ -455,6 +534,7 @@ export function Settings({ onRequireRelogin }: { onRequireRelogin: (message: str
 /** 修改控制台密码:需要当前密码,成功后所有会话失效需重新登录。 */
 function ChangePasswordInline({ onRequireRelogin }: { onRequireRelogin: (message: string) => void }) {
   const toast = useToast();
+  const idPrefix = useId();
   const [current, setCurrent] = useState("");
   const [next, setNext] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -497,7 +577,7 @@ function ChangePasswordInline({ onRequireRelogin }: { onRequireRelogin: (message
       onRequireRelogin("密码已修改，请用新密码重新登录");
     } catch (e) {
       if (!(e instanceof ApiError && (e.status === 401 || e.status === 428))) {
-        toast.push("error", (e as Error).message);
+        toast.push("error", getErrorMessage(e, "修改密码失败"));
       }
     } finally {
       setBusy(false);
@@ -508,14 +588,14 @@ function ChangePasswordInline({ onRequireRelogin }: { onRequireRelogin: (message
     <form onSubmit={submit} className="space-y-3 rounded-2xl bg-pico-softer p-4">
       <p className="text-xs font-bold text-pico-ink">修改控制台密码</p>
       <div className="grid gap-3 sm:grid-cols-3">
-        <Field label="当前密码">
-          <Input type="password" autoComplete="current-password" value={current} onChange={(e) => setCurrent(e.target.value)} />
+        <Field label="当前密码" htmlFor={`${idPrefix}-current`}>
+          <Input id={`${idPrefix}-current`} type="password" autoComplete="current-password" value={current} onChange={(e) => setCurrent(e.target.value)} />
         </Field>
-        <Field label="新密码" hint={message && next.length > 0 ? message : "至少 8 位，首尾不含空格"}>
-          <Input type="password" autoComplete="new-password" value={next} onChange={(e) => setNext(e.target.value)} />
+        <Field label="新密码" htmlFor={`${idPrefix}-next`} hint={message && next.length > 0 ? message : "至少 8 位，首尾不含空格"}>
+          <Input id={`${idPrefix}-next`} type="password" autoComplete="new-password" value={next} onChange={(e) => setNext(e.target.value)} />
         </Field>
-        <Field label="确认新密码">
-          <Input type="password" autoComplete="new-password" value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} />
+        <Field label="确认新密码" htmlFor={`${idPrefix}-confirm`}>
+          <Input id={`${idPrefix}-confirm`} type="password" autoComplete="new-password" value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} />
         </Field>
       </div>
       <Button type="submit" variant="soft" loading={busy} disabled={!current || !next || !!message}>

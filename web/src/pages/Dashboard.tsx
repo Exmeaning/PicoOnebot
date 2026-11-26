@@ -4,7 +4,7 @@ import { Badge, Button, Card, CardHeader, Stat } from "../components/ui";
 import { api } from "../lib/api";
 import type { BotStatus, ConnectionInfo, LogEntry } from "../lib/types";
 import type { PageKey } from "../components/Shell";
-import { fmtDuration, fmtNumber, fmtTime, greeting } from "../lib/format";
+import { fmtDuration, fmtNumber, fmtTime, fmtVersion, greeting } from "../lib/format";
 import { LevelPill } from "../components/LogLine";
 
 const HISTORY_SLOTS = 24;
@@ -51,7 +51,7 @@ export function Dashboard({ status, onNavigate }: { status: BotStatus | null; on
   const deltas =
     history.length === 0
       ? Array.from({ length: HISTORY_SLOTS }, () => 0)
-      : history.map((v, i) => (i === 0 ? 0 : Math.max(0, v - history[i - 1])));
+      : history.map((v, i) => (i === 0 ? 0 : Math.max(0, v - (history[i - 1] ?? v))));
   const max = Math.max(1, ...deltas);
 
   return (
@@ -131,7 +131,7 @@ export function Dashboard({ status, onNavigate }: { status: BotStatus | null; on
               ))}
             </dl>
             <div className="mt-4 space-y-2 text-xs">
-              <Row k="PicoOnebot" v={status?.version ? `v${status.version}` : "--"} />
+              <Row k="PicoOnebot" v={fmtVersion(status?.version)} />
               <Row k="内核" v={status?.qqVersion || "--"} />
               <Row k="协议" v={status?.protocol || "--"} />
             </div>
@@ -225,6 +225,6 @@ function Row({ k, v }: { k: string; v: string }) {
   );
 }
 
-export function kindLabel(kind: ConnectionInfo["kind"]) {
+function kindLabel(kind: ConnectionInfo["kind"]) {
   return { "ws-server": "正向 WS", "ws-client": "反向 WS", "http-server": "HTTP 服务", "http-client": "HTTP 上报" }[kind];
 }

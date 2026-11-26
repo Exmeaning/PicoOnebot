@@ -4,7 +4,12 @@ import "./index.css";
 import App from "./App";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 
-createRoot(document.getElementById("root")!).render(
+const rootEl = document.getElementById("root");
+if (!rootEl) {
+  throw new Error("Missing #root mount element");
+}
+
+createRoot(rootEl).render(
   <StrictMode>
     <ErrorBoundary>
       <App />

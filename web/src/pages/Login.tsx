@@ -1,8 +1,8 @@
-import { useState, type FormEvent } from "react";
+import { useId, useState, type FormEvent } from "react";
 import { KeyRound, Server, ArrowRight, Eye, EyeOff, Sparkles } from "lucide-react";
 import { Logo } from "../components/Logo";
 import { Button, Field, Input, HeartDot, useToast, Badge } from "../components/ui";
-import { api, getStoredBaseUrl, normalizeBaseUrl, setBaseUrl, setToken } from "../lib/api";
+import { api, getErrorMessage, getStoredBaseUrl, normalizeBaseUrl, setBaseUrl, setToken } from "../lib/api";
 
 export function Login({ onSuccess }: { onSuccess: (mustChangePassword: boolean) => void }) {
   const [token, setTok] = useState("");
@@ -10,6 +10,7 @@ export function Login({ onSuccess }: { onSuccess: (mustChangePassword: boolean) 
   const [advanced, setAdvanced] = useState(() => Boolean(getStoredBaseUrl()));
   const [base, setBase] = useState(() => getStoredBaseUrl());
   const [loading, setLoading] = useState(false);
+  const idPrefix = useId();
   const toast = useToast();
 
   const submit = async (e: FormEvent) => {
@@ -30,7 +31,7 @@ export function Login({ onSuccess }: { onSuccess: (mustChangePassword: boolean) 
       toast.push("success", "登录成功，欢迎回来");
       onSuccess(!!res.mustChangePassword);
     } catch (err) {
-      toast.push("error", (err as Error).message || "登录失败");
+      toast.push("error", getErrorMessage(err, "登录失败"));
     } finally {
       setLoading(false);
     }
@@ -86,10 +87,11 @@ export function Login({ onSuccess }: { onSuccess: (mustChangePassword: boolean) 
           <p className="mt-1 text-sm text-pico-muted">输入 WebUI Token 进入控制台</p>
 
           <div className="mt-6 space-y-4">
-            <Field label="控制台密码" hint="首次使用初始密码 picopico 登录后，必须立即设置新密码">
+            <Field label="控制台密码" htmlFor={`${idPrefix}-password`} hint="首次使用初始密码 picopico 登录后，必须立即设置新密码">
               <div className="relative">
                 <KeyRound className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-pico-muted" />
                 <Input
+                  id={`${idPrefix}-password`}
                   className="pl-10 pr-11"
                   type={show ? "text" : "password"}
                   placeholder="输入控制台密码"
@@ -114,11 +116,12 @@ export function Login({ onSuccess }: { onSuccess: (mustChangePassword: boolean) 
             </button>
 
             {advanced ? (
-              <Field label="后端地址" hint="留空则默认与当前页面同源，仅支持 http:// 或 https://">
+              <Field label="后端地址" htmlFor={`${idPrefix}-base-url`} hint="留空则默认与当前页面同源，仅支持 http:// 或 https://">
                 <div className="flex items-center gap-2">
                   <div className="relative min-w-0 flex-1">
                     <Server className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-pico-muted" />
                     <Input
+                      id={`${idPrefix}-base-url`}
                       className="pl-10 font-mono text-xs"
                       value={base}
                       onChange={(e) => setBase(e.target.value)}

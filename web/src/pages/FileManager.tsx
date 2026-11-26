@@ -16,7 +16,7 @@ import {
   Search,
 } from "lucide-react";
 import { Badge, Button, Card, CardHeader, Empty, Input, PageHeader, useToast } from "../components/ui";
-import { ApiError, api } from "../lib/api";
+import { ApiError, api, getErrorMessage } from "../lib/api";
 import { copyText } from "../lib/clipboard";
 import { fmtApplied, fmtDateTime } from "../lib/format";
 import type { FileDocument, FileEntry, FileListing } from "../lib/types";
@@ -34,7 +34,7 @@ function fileIcon(entry: FileEntry) {
   return <FileText className="h-4 w-4" />;
 }
 
-export function FileManager() {
+export function FileManager({ onDirtyChange }: { onDirtyChange?: (dirty: boolean) => void }) {
   const toast = useToast();
   const mountedRef = useRef(true);
   const requestId = useRef(0);
@@ -75,7 +75,7 @@ export function FileManager() {
         }
       } catch (error) {
         if (!mountedRef.current || directoryRequestId.current !== id) return;
-        const msg = (error as Error).message || "读取目录失败";
+        const msg = getErrorMessage(error, "读取目录失败");
         setDirectoryError(msg);
         if (!(error instanceof ApiError && (error.status === 401 || error.status === 428))) {
           toast.push("error", msg);
@@ -94,13 +94,22 @@ export function FileManager() {
   }, [loadDirectory]);
 
   useEffect(() => {
+    onDirtyChange?.(dirty);
+    return () => {
+      onDirtyChange?.(false);
+    };
+  }, [dirty, onDirtyChange]);
+
+  useEffect(() => {
+    if (onDirtyChange) return;
     const beforeUnload = (event: BeforeUnloadEvent) => {
       if (!dirty) return;
       event.preventDefault();
+      event.returnValue = "";
     };
     window.addEventListener("beforeunload", beforeUnload);
     return () => window.removeEventListener("beforeunload", beforeUnload);
-  }, [dirty]);
+  }, [dirty, onDirtyChange]);
 
   const canLeaveEditor = () => !dirty || confirm("当前文件有未保存的修改，确定放弃吗？");
 
@@ -138,7 +147,7 @@ export function FileManager() {
         );
       } catch (error) {
         if (!mountedRef.current || requestId.current !== id) return;
-        const msg = (error as Error).message || "读取文件失败";
+        const msg = getErrorMessage(error, "读取文件失败");
         setFileError(msg);
         if (!(error instanceof ApiError && (error.status === 401 || error.status === 428))) {
           toast.push("error", msg);
@@ -214,7 +223,7 @@ export function FileManager() {
         setSaveConflict(true);
       }
       if (!(error instanceof ApiError && (error.status === 401 || error.status === 428))) {
-        toast.push("error", (error as Error).message || "保存失败");
+        toast.push("error", getErrorMessage(error, "保存失败"));
       }
     } finally {
       savingRef.current = false;
@@ -249,7 +258,7 @@ export function FileManager() {
     try {
       setContent(JSON.stringify(JSON.parse(content), null, 2) + "\n");
     } catch (error) {
-      toast.push("error", `JSON 格式错误: ${(error as Error).message}`);
+      toast.push("error", `JSON 格式错误: ${getErrorMessage(error, "无法解析 JSON")}`);
     }
   };
 
@@ -308,23 +317,26 @@ export function FileManager() {
                 </div>
               ) : (
                 <>
-                  {listing?.activeConfig ? (
-                    <button
-                      type="button"
-                      onClick={() => void openEntry(listing.activeConfig!)}
-                      className={cn(
-                        "pico-ring mb-1 flex w-full items-center gap-3 rounded-xl border border-pico-line px-3 py-3 text-left transition",
-                        selected?.path === listing.activeConfig.path ? "bg-pico-soft text-pico-deep" : "bg-white/70 text-pico-ink hover:bg-pico-softer"
-                      )}
-                    >
-                      <FileCode2 className="h-4 w-4 shrink-0 text-pico-deep" />
-                      <span className="min-w-0 flex-1">
-                        <span className="block truncate text-xs font-extrabold">当前生效配置</span>
-                        <span className="mt-0.5 block truncate font-mono text-[10px] text-pico-muted">{listing.activeConfig.path}</span>
-                      </span>
-                      <Badge tone="amber" className="shrink-0">开发者</Badge>
-                    </button>
-                  ) : null}
+                  {listing?.activeConfig ? (() => {
+                    const activeConfig = listing.activeConfig;
+                    return (
+                      <button
+                        type="button"
+                        onClick={() => void openEntry(activeConfig)}
+                        className={cn(
+                          "pico-ring mb-1 flex w-full items-center gap-3 rounded-xl border border-pico-line px-3 py-3 text-left transition",
+                          selected?.path === activeConfig.path ? "bg-pico-soft text-pico-deep" : "bg-white/70 text-pico-ink hover:bg-pico-softer"
+                        )}
+                      >
+                        <FileCode2 className="h-4 w-4 shrink-0 text-pico-deep" />
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-xs font-extrabold">当前生效配置</span>
+                          <span className="mt-0.5 block truncate font-mono text-[10px] text-pico-muted">{activeConfig.path}</span>
+                        </span>
+                        <Badge tone="amber" className="shrink-0">开发者</Badge>
+                      </button>
+                    );
+                  })() : null}
                   {listing?.parent !== null && listing ? (
                     <button type="button" onClick={() => void openDirectory(listing.parent ?? "")} className="pico-ring flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm text-pico-muted hover:bg-pico-soft">
                       <FolderOpen className="h-4 w-4" />

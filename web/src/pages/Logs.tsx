@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Search, Pause, Play, Trash2, Download, ArrowDownToLine, Wifi, WifiOff } from "lucide-react";
 import { Badge, Button, Card, Input, PageHeader, useToast } from "../components/ui";
 import { LogLine } from "../components/LogLine";
-import { ApiError, api, isAbortError } from "../lib/api";
+import { ApiError, api, getErrorMessage, isAbortError } from "../lib/api";
 import type { LogEntry, LogLevel } from "../lib/types";
 import { fmtDateTime } from "../lib/format";
 import { cn } from "../utils/cn";
@@ -82,7 +82,7 @@ export function Logs() {
       .catch((err) => {
         if (!alive || isAbortError(err)) return;
         if (err instanceof ApiError && (err.status === 401 || err.status === 428)) return;
-        toast.push("error", (err as Error).message || "加载历史日志失败");
+        toast.push("error", getErrorMessage(err, "加载历史日志失败"));
       });
 
     const off = api.subscribeLogs(
@@ -93,7 +93,8 @@ export function Logs() {
           return;
         }
         setLogs((prev) => {
-          if (prev.length > 0 && prev[prev.length - 1].id < entry.id) {
+          const last = prev[prev.length - 1];
+          if (last && last.id < entry.id) {
             return prev.length >= MAX ? [...prev.slice(prev.length - MAX + 1), entry] : [...prev, entry];
           }
           if (prev.some((x) => x.id === entry.id)) return prev;
@@ -193,6 +194,7 @@ export function Logs() {
             {LEVELS.map((lv) => (
               <button
                 key={lv}
+                type="button"
                 onClick={() => toggleLevel(lv)}
                 className={cn(
                   "pico-ring rounded-xl px-2.5 py-1 font-mono text-[11px] font-extrabold uppercase transition",
@@ -248,6 +250,7 @@ export function Logs() {
 
         {!autoScroll ? (
           <button
+            type="button"
             onClick={() => {
               setAutoScroll(true);
               if (box.current) box.current.scrollTop = box.current.scrollHeight;

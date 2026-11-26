@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { QrCode, RefreshCw, Smartphone, Copy, CheckCircle2, Loader2, Clock3, TerminalSquare, ArrowRight } from "lucide-react";
 import { Badge, Button, Card, useToast } from "../components/ui";
-import { ApiError, api, isAbortError } from "../lib/api";
+import { ApiError, api, getErrorMessage, isAbortError } from "../lib/api";
 import { copyText } from "../lib/clipboard";
 import type { QrInfo } from "../lib/types";
 import type { PageKey } from "../components/Shell";
@@ -59,7 +59,7 @@ export function QrLogin({ onNavigate }: { onNavigate: (p: PageKey) => void }) {
       } catch (e) {
         if (!mountedRef.current || isAbortError(e) || seq !== reqSeq.current) return "ok";
         if (e instanceof ApiError && (e.status === 401 || e.status === 428)) return "auth_error";
-        if (!silent) toast.push("error", (e as Error).message || "刷新二维码失败");
+        if (!silent) toast.push("error", getErrorMessage(e, "刷新二维码失败"));
         return "error";
       } finally {
         if (seq === reqSeq.current) {

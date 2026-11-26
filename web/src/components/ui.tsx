@@ -1,6 +1,96 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ButtonHTMLAttributes, type InputHTMLAttributes, type ReactNode, type SelectHTMLAttributes } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  type ButtonHTMLAttributes,
+  type InputHTMLAttributes,
+  type ReactNode,
+  type RefObject,
+  type SelectHTMLAttributes,
+} from "react";
 import { X, Check, AlertTriangle, Info, Loader2, Sparkles } from "lucide-react";
 import { cn } from "../utils/cn";
+
+const FOCUSABLE_SELECTOR =
+  'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+function getFocusableElements(container: HTMLElement): HTMLElement[] {
+  return Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
+    (el) => el.getClientRects().length > 0 && el.getAttribute("aria-hidden") !== "true"
+  );
+}
+
+/**
+ * Shared dialog accessibility lifecycle:
+ * - Escape key closes the dialog
+ * - Tab / Shift+Tab stays trapped inside `containerRef`
+ * - Locks body scroll while open and restores previous focus on close
+ */
+export function useDialogAccessibility(
+  open: boolean,
+  onClose: () => void,
+  containerRef: RefObject<HTMLElement | null>
+) {
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
+  useEffect(() => {
+    if (!open) return;
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+
+    const container = containerRef.current;
+    if (container && !container.contains(document.activeElement)) {
+      container.focus();
+    }
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onCloseRef.current();
+        return;
+      }
+      if (e.key === "Tab") {
+        const panel = containerRef.current;
+        if (!panel) return;
+        const focusable = getFocusableElements(panel);
+        if (focusable.length === 0) {
+          e.preventDefault();
+          panel.focus();
+          return;
+        }
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        if (!first || !last) return;
+        const active = document.activeElement;
+        if (e.shiftKey) {
+          if (active === first || active === panel || !panel.contains(active)) {
+            e.preventDefault();
+            last.focus();
+          }
+        } else if (active === last || !panel.contains(active)) {
+          e.preventDefault();
+          first.focus();
+        }
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      document.body.style.overflow = previousOverflow;
+      if (previousFocus && previousFocus.isConnected) {
+        previousFocus.focus();
+      }
+    };
+  }, [open, containerRef]);
+}
 
 /* ---------------- Button ---------------- */
 type BtnVariant = "primary" | "soft" | "ghost" | "danger" | "outline";
@@ -113,13 +203,31 @@ export function Select({ className, children, ...rest }: SelectHTMLAttributes<HT
   );
 }
 
-export function Field({ label, hint, children, className }: { label: ReactNode; hint?: ReactNode; children: ReactNode; className?: string }) {
+export function Field({
+  label,
+  hint,
+  htmlFor,
+  children,
+  className,
+}: {
+  label: ReactNode;
+  hint?: ReactNode;
+  htmlFor?: string;
+  children: ReactNode;
+  className?: string;
+}) {
   return (
-    <label className={cn("block", className)}>
-      <span className="mb-1.5 block text-xs font-bold text-pico-ink/80">{label}</span>
+    <div className={cn("block", className)}>
+      {htmlFor ? (
+        <label htmlFor={htmlFor} className="mb-1.5 block text-xs font-bold text-pico-ink/80">
+          {label}
+        </label>
+      ) : (
+        <span className="mb-1.5 block text-xs font-bold text-pico-ink/80">{label}</span>
+      )}
       {children}
       {hint ? <span className="mt-1 block text-[11px] text-pico-muted">{hint}</span> : null}
-    </label>
+    </div>
   );
 }
 
@@ -173,24 +281,32 @@ export function Badge({ children, tone = "pink", className }: { children: ReactN
 
 /* ---------------- Modal ---------------- */
 export function Modal({ open, onClose, title, children, footer, wide }: { open: boolean; onClose: () => void; title: ReactNode; children: ReactNode; footer?: ReactNode; wide?: boolean }) {
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
-    window.addEventListener("keydown", onKey);
-    document.body.style.overflow = "hidden";
-    return () => {
-      window.removeEventListener("keydown", onKey);
-      document.body.style.overflow = "";
-    };
-  }, [open, onClose]);
+  const titleId = useId();
+  const dialogRef = useRef<HTMLDivElement>(null);
+  useDialogAccessibility(open, onClose, dialogRef);
+
   if (!open) return null;
   return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center p-4 sm:items-center" role="dialog" aria-modal>
-      <div className="absolute inset-0 bg-pico-deep/25 backdrop-blur-sm" onClick={onClose} />
-      <div className={cn("pico-glass relative w-full rounded-bubble border border-white shadow-cute-lg ring-1 ring-pico-line", wide ? "max-w-3xl" : "max-w-lg")}>
+    <div
+      className="fixed inset-0 z-50 flex items-end justify-center p-4 sm:items-center"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby={titleId}
+    >
+      <div className="absolute inset-0 bg-pico-deep/25 backdrop-blur-sm" onClick={onClose} aria-hidden="true" />
+      <div
+        ref={dialogRef}
+        tabIndex={-1}
+        className={cn(
+          "pico-glass relative w-full rounded-bubble border border-white shadow-cute-lg ring-1 ring-pico-line outline-none",
+          wide ? "max-w-3xl" : "max-w-lg"
+        )}
+      >
         <div className="flex items-center justify-between border-b border-pico-line/70 px-6 py-4">
-          <h3 className="text-base font-extrabold text-pico-ink">{title}</h3>
-          <Button variant="ghost" size="icon" onClick={onClose} aria-label="关闭">
+          <h3 id={titleId} className="text-base font-extrabold text-pico-ink">
+            {title}
+          </h3>
+          <Button type="button" variant="ghost" size="icon" onClick={onClose} aria-label="关闭">
             <X className="h-4 w-4" />
           </Button>
         </div>

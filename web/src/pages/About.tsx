@@ -1,9 +1,20 @@
 import { Star, BookOpen, Heart, Watch, Waypoints, Package, Cpu, ExternalLink } from "lucide-react";
 import { Badge, Card, CardHeader, HeartDot, Kbd, PageHeader } from "../components/ui";
 import { Logo } from "../components/Logo";
+import { fmtVersion } from "../lib/format";
 import type { BotStatus } from "../lib/types";
 
+const BUILD_WEBUI_VERSION = typeof __PICO_WEBUI_VERSION__ === "string" ? __PICO_WEBUI_VERSION__ : "";
+
 export function About({ status }: { status: BotStatus | null }) {
+  const versionRows: readonly [string, string][] = [
+    ["PicoOnebot", fmtVersion(status?.version)],
+    ["QQ 内核", status?.qqVersion || "--"],
+    ["运行平台", status?.platform || "--"],
+    ["协议版本", status?.protocol || "--"],
+    ["WebUI", fmtVersion(BUILD_WEBUI_VERSION || status?.version)],
+  ];
+
   return (
     <div>
       <PageHeader title="关于 PICOPICO" desc="一个可爱又可靠的 OneBot 11 实现" />
@@ -63,13 +74,7 @@ export function About({ status }: { status: BotStatus | null }) {
         <Card>
           <CardHeader title="版本信息" icon={<Package className="h-4 w-4" />} />
           <dl className="space-y-3 p-6 pt-4 text-sm">
-            {[
-              ["PicoOnebot", status?.version ? `v${status.version}` : "--"],
-              ["QQ 内核", status?.qqVersion || "--"],
-              ["运行平台", status?.platform || "--"],
-              ["协议版本", status?.protocol || "--"],
-              ["WebUI", "v1.0.0"],
-            ].map(([k, v]) => (
+            {versionRows.map(([k, v]) => (
               <div key={k} className="flex items-center justify-between gap-3 border-b border-dashed border-pico-line pb-2 last:border-0">
                 <dt className="font-bold text-pico-muted">{k}</dt>
                 <dd className="truncate font-mono text-xs text-pico-ink">{v}</dd>
