@@ -15,7 +15,6 @@ import pico.onebot.core.Config
 import pico.onebot.core.PicoLog
 import pico.onebot.core.Promise
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.CopyOnWriteArrayList
 
 /**
  * 好友 / 群 的进程内名册。
@@ -37,9 +36,10 @@ object ContactStore {
     /** 监听器推回来的完整好友信息(带 uin/昵称),比纯 uid 列表好用,作为补充来源。 */
     private val buddyRich = ConcurrentHashMap<String, Friend>()
 
-    /** 等"下一次群列表回填"的人。用列表是因为可能有多个 action 同时在等。 */
-    private val groupWaiters = CopyOnWriteArrayList<Promise<Boolean>>()
-    private val detailWaiters = ConcurrentHashMap<Long, CopyOnWriteArrayList<Promise<Boolean>>>()
+    /** 等待队列统一受 waiterLock 保护,杜绝登记/排空/回收竞态与空桶泄漏。 */
+    private val waiterLock = Any()
+    private var groupWaiters = ArrayList<Promise<Boolean>>()
+    private val detailWaiters = HashMap<Long, ArrayList<Promise<Boolean>>>()
 
     @Volatile
     var groupListLoaded = false
@@ -57,9 +57,18 @@ object ContactStore {
         groupDetails.clear()
         buddyRich.clear()
         groupListLoaded = false
-        releaseAll(groupWaiters)
-        for (bucket in detailWaiters.values) releaseAll(bucket)
-        detailWaiters.clear()
+        val allGroup: List<Promise<Boolean>>
+        val allDetail: List<Promise<Boolean>>
+        synchronized(waiterLock) {
+            allGroup = groupWaiters
+            groupWaiters = ArrayList()
+            allDetail = ArrayList<Promise<Boolean>>().also { acc ->
+                for (bucket in detailWaiters.values) acc.addAll(bucket)
+            }
+            detailWaiters.clear()
+        }
+        for (w in allGroup) w.resolve(false)
+        for (w in allDetail) w.resolve(false)
         PicoLog.i("contact store reset")
     }
 
@@ -74,13 +83,13 @@ object ContactStore {
         }
         groupListLoaded = true
         PicoLog.d("group list update type=" + updateType + " n=" + n + " total=" + groups.size)
-        releaseAll(groupWaiters)
+        drainGroupWaiters(true)
     }
 
     fun onGroupDetailInfo(d: Any?) {
         val info = d as? GroupDetailInfo ?: return
         groupDetails[info.groupCode] = info
-        releaseAll(detailWaiters.remove(info.groupCode))
+        drainDetailWaiters(info.groupCode, true)
     }
 
     /** 群成员信息变更的副产物:顺手喂 uid↔uin 和昵称,省掉后面一堆回查。 */
@@ -100,9 +109,12 @@ object ContactStore {
     fun groups(refresh: Boolean): List<GroupSimpleInfo> {
         if (refresh || !groupListLoaded) {
             val p = Promise<Boolean>()
-            groupWaiters.add(p)
-            if (requestGroupList(refresh)) p.await(Config.kernelTimeoutMs)
-            groupWaiters.remove(p)
+            addGroupWaiter(p)
+            try {
+                if (requestGroupList(refresh, p)) p.await(Config.kernelTimeoutMs)
+            } finally {
+                removeGroupWaiter(p)
+            }
         }
         return groups.values.sortedBy { it.groupCode }
     }
@@ -118,34 +130,74 @@ object ContactStore {
         if (!refresh) groupDetails[code]?.let { return it }
         val svc = KernelGate.groupService() ?: return groupDetails[code]
         val p = Promise<Boolean>()
-        val bucket = detailWaiters.getOrPut(code) { CopyOnWriteArrayList() }
-        bucket.add(p)
+        addDetailWaiter(code, p)
         try {
             svc.getGroupDetailInfo(code, GroupInfoSource.KDATACARD, IOperateCallback { c, m ->
-                if (c != 0) PicoLog.w("getGroupDetailInfo code=$c $m")
+                if (c != 0) {
+                    PicoLog.w("getGroupDetailInfo code=$c $m")
+                    p.resolve(false)
+                }
             })
+            p.await(Config.kernelTimeoutMs)
         } catch (t: Throwable) {
             PicoLog.d("getGroupDetailInfo failed: " + t.message)
-            bucket.remove(p)
-            return groupDetails[code]
+        } finally {
+            removeDetailWaiter(code, p)
         }
-        p.await(Config.kernelTimeoutMs)
-        bucket.remove(p)
         return groupDetails[code]
     }
 
-    private fun requestGroupList(force: Boolean): Boolean {
+    private fun requestGroupList(force: Boolean, waiter: Promise<Boolean>): Boolean {
         val svc = KernelGate.groupService() ?: return false
         return try {
-            // 这个回调只说明"请求发出去了",真正的数据走 onGroupListUpdate
+            // 这个回调只说明"请求发出去了",真正的数据走 onGroupListUpdate;
+            // 若直接返回错误码,立刻唤醒等待者避免白等 30s 超时。
             svc.getGroupList(force, IOperateCallback { code, msg ->
-                if (code != 0) PicoLog.w("getGroupList code=$code $msg")
+                if (code != 0) {
+                    PicoLog.w("getGroupList code=$code $msg")
+                    waiter.resolve(false)
+                }
             })
             true
         } catch (t: Throwable) {
             PicoLog.w("getGroupList threw: " + t.message)
             false
         }
+    }
+
+    private fun addGroupWaiter(p: Promise<Boolean>) = synchronized(waiterLock) {
+        groupWaiters.add(p)
+    }
+
+    private fun removeGroupWaiter(p: Promise<Boolean>) = synchronized(waiterLock) {
+        groupWaiters.remove(p)
+    }
+
+    private fun drainGroupWaiters(value: Boolean) {
+        val toRelease = synchronized(waiterLock) {
+            if (groupWaiters.isEmpty()) return
+            val snap = groupWaiters
+            groupWaiters = ArrayList()
+            snap
+        }
+        for (w in toRelease) w.resolve(value)
+    }
+
+    private fun addDetailWaiter(code: Long, p: Promise<Boolean>) = synchronized(waiterLock) {
+        detailWaiters.getOrPut(code) { ArrayList() }.add(p)
+    }
+
+    private fun removeDetailWaiter(code: Long, p: Promise<Boolean>) = synchronized(waiterLock) {
+        val bucket = detailWaiters[code] ?: return
+        bucket.remove(p)
+        if (bucket.isEmpty()) detailWaiters.remove(code)
+    }
+
+    private fun drainDetailWaiters(code: Long, value: Boolean) {
+        val toRelease = synchronized(waiterLock) {
+            detailWaiters.remove(code)
+        } ?: return
+        for (w in toRelease) w.resolve(value)
     }
 
     // ---------------- 好友 ----------------
@@ -242,12 +294,6 @@ object ContactStore {
     }
 
     // ---------------- 杂项 ----------------
-
-    private fun releaseAll(waiters: MutableCollection<Promise<Boolean>>?) {
-        if (waiters == null) return
-        for (w in waiters) w.resolve(true)
-        waiters.clear()
-    }
 
     fun stats(): JSONObject = JSONObject()
         .put("groups", groups.size)

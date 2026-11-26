@@ -14,49 +14,50 @@ import java.util.concurrent.TimeUnit
 /**
  * 节流已读上报(P0)。
  *
- * 实证背景:Watch QQ 9.0.7 上对免打扰群(shield_flag=4),若长期不向服务端上报已读,
- * 服务端未读数累积超过阈值(如 30 条)后会停止下推 `OlPushService.MsgPush`。
- * `IKernelMsgService.setMsgRead(Contact, IOperateCallback)` 在原生层对应 `is_local=0`,
- * 会触发 `SendReadReport` 发送 `trpc.msg.msg_svc.MsgService.SsoReadedReport` 推进服务端
- * `read_msg_seq`(不可使用 `setLocalMsgRead`,后者 `is_local=1` 不发网络包)。
- *
- * 防风控约束:
+ * 防风控与并发约束:
  *  - 按 `(chatType, peerUid)` 聚合,单会话达到 `readReportBatch`(默认 10)或距首批未读超过
  *    `readReportIntervalSec`(默认 60s)才合并上报 1 次;
- *  - 全局强制最小间隔(`readReportMinGapMs`,默认 1500ms) + 每分钟滑窗上限
- *    (`readReportMaxPerMin`,默认 18 次);
- *  - 在独立守护线程 `pico-read-report` 串行执行,绝不阻塞内核回调线程或 `pico-msgpipe`;
- *  - 会话丢失/换号时通过 [reset] 清空会话态并递增 epoch,防止跨号串单。
+ *  - 自动上报受全局最小间隔(`readReportMinGapMs`) + 每分钟滑窗上限(`readReportMaxPerMin`)约束;
+ *    手工 `markReadNow` 使用独立限流窗口,不饿死自动上报;
+ *  - 通过单调 `inboundSeq`/`reportedSeq` + `inFlightCount` 消除 `markReadNow` 与 `tick` 并发双重扣减;
+ *  - 所有时长/冷却/窗口均基于单调时钟 `System.nanoTime()`,免疫墙钟回跳;
+ *  - LRU 淘汰优先回收 `pending == 0` 的空闲会话,绝不把零未读会话提升为 MRU。
  */
 object ReadReporter {
 
     private const val MAX_CONVERSATIONS = 512
-    private const val RATE_WINDOW_MS = 60_000L
+    private const val RATE_WINDOW_NS = 60_000_000_000L
     private const val CALLBACK_TIMEOUT_MS = 10_000L
 
     private data class ConvKey(val chatType: Int, val peerUid: String)
 
     private class ConvState(
         var pending: Int = 0,
-        var firstPendingAt: Long = 0L,
-        var lastReportAt: Long = 0L,
-        var lastMsgAt: Long = 0L,
-        var backoffUntil: Long = 0L
+        var inboundSeq: Long = 0L,
+        var reportedSeq: Long = 0L,
+        var inFlightCount: Int = 0,
+        var hasFirstPending: Boolean = false,
+        var firstPendingAtNs: Long = 0L,
+        var hasLastReport: Boolean = false,
+        var lastReportAtNs: Long = 0L,
+        var hasBackoff: Boolean = false,
+        var backoffUntilNs: Long = 0L
     )
 
     private val lock = Any()
-    private val conversations = object : LinkedHashMap<ConvKey, ConvState>(64, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<ConvKey, ConvState>?): Boolean =
-            size > MAX_CONVERSATIONS
-    }
-    private val sendTimestamps = ArrayDeque<Long>()
+    // 插入序(非 access-order):防止读取/清零 pending==0 的会话时将其提升至 MRU 反而淘汰有未读的会话
+    private val conversations = LinkedHashMap<ConvKey, ConvState>(64, 0.75f, false)
+    private val autoSendTimestamps = ArrayDeque<Long>()
+    private val manualSendTimestamps = ArrayDeque<Long>()
     private val wakeup = Semaphore(0)
 
     @Volatile
     private var running = false
 
     private var epoch: Long = 0L
-    private var lastGlobalSendAt: Long = 0L
+    private var hasAutoSend: Boolean = false
+    private var lastAutoSendAtNs: Long = 0L
+    private var lastReportWallAt: Long = 0L
 
     fun start() {
         synchronized(this) {
@@ -71,18 +72,39 @@ object ReadReporter {
     fun onInboundMessage(chatType: Int, peerUid: String) {
         if (chatType != 1 && chatType != 2) return
         if (peerUid.isEmpty() || !Config.autoMarkRead) return
-        val now = System.currentTimeMillis()
+        val nowNs = System.nanoTime()
         var shouldWake = false
         synchronized(lock) {
             val key = ConvKey(chatType, peerUid)
-            val st = conversations[key] ?: ConvState().also { conversations[key] = it }
-            st.pending++
-            if (st.firstPendingAt == 0L) st.firstPendingAt = now
-            st.lastMsgAt = now
+            val existing = conversations.remove(key)
+            val st = existing ?: ConvState()
+            conversations[key] = st
+            st.inboundSeq++
+            st.pending = (st.inboundSeq - st.reportedSeq).toInt().coerceAtLeast(0)
+            if (!st.hasFirstPending) {
+                st.hasFirstPending = true
+                st.firstPendingAtNs = nowNs
+            }
             if (st.pending >= Config.readReportBatch) shouldWake = true
+            trimConversationsLocked()
         }
         if (shouldWake && wakeup.availablePermits() == 0) {
             wakeup.release()
+        }
+    }
+
+    /** 优先淘汰零未读且无在途 RPC 的空闲条目;若全部有未读再淘汰最旧条目。 */
+    private fun trimConversationsLocked() {
+        if (conversations.size <= MAX_CONVERSATIONS) return
+        val idleIt = conversations.entries.iterator()
+        while (conversations.size > MAX_CONVERSATIONS && idleIt.hasNext()) {
+            val st = idleIt.next().value
+            if (st.pending == 0 && st.inFlightCount == 0) idleIt.remove()
+        }
+        val anyIt = conversations.entries.iterator()
+        while (conversations.size > MAX_CONVERSATIONS && anyIt.hasNext()) {
+            val st = anyIt.next().value
+            if (st.inFlightCount == 0) anyIt.remove()
         }
     }
 
@@ -103,28 +125,59 @@ object ReadReporter {
         val msgService = KernelGate.msgService() ?: return false to "msgService unavailable"
 
         val key = ConvKey(chatType, peerUid)
+        val nowNs = System.nanoTime()
+        val manualCap = maxOf(Config.readReportMaxPerMin, 30)
         val snapEpoch: Long
-        val snapPending: Int
+        val snapSeq: Long
+        val hadEntry: Boolean
         synchronized(lock) {
+            pruneWindowLocked(manualSendTimestamps, nowNs)
+            if (manualSendTimestamps.size >= manualCap) {
+                return false to "manual read report rate limit exceeded ($manualCap/min)"
+            }
+            manualSendTimestamps.addLast(nowNs)
             snapEpoch = epoch
-            snapPending = conversations[key]?.pending ?: 0
-            recordGlobalAttemptLocked(System.currentTimeMillis())
+            val st = conversations[key]
+            if (st != null) {
+                st.inFlightCount++
+                snapSeq = st.inboundSeq
+                hadEntry = true
+            } else {
+                snapSeq = 0L
+                hadEntry = false
+            }
         }
 
-        val (ok, detail) = invokeSetMsgRead(msgService, chatType, peerUid)
-        val now = System.currentTimeMillis()
-        if (ok) {
-            synchronized(lock) {
-                if (epoch == snapEpoch) {
-                    val st = conversations[key]
-                    if (st != null) {
-                        st.pending = (st.pending - snapPending).coerceAtLeast(0)
-                        st.lastReportAt = now
-                        st.firstPendingAt = if (st.pending > 0) now else 0L
-                        st.backoffUntil = 0L
+        val (ok, detail) = try {
+            invokeSetMsgRead(msgService, chatType, peerUid)
+        } catch (t: Throwable) {
+            if (hadEntry) releaseInFlight(key, snapEpoch)
+            throw t
+        }
+
+        val finishedAtNs = System.nanoTime()
+        val finishedWall = System.currentTimeMillis()
+        synchronized(lock) {
+            if (epoch == snapEpoch) {
+                val st = conversations[key]
+                if (st != null) {
+                    if (hadEntry && st.inFlightCount > 0) st.inFlightCount--
+                    if (ok) {
+                        if (snapSeq > st.reportedSeq) st.reportedSeq = snapSeq
+                        st.pending = (st.inboundSeq - st.reportedSeq).toInt().coerceAtLeast(0)
+                        st.hasLastReport = true
+                        st.lastReportAtNs = finishedAtNs
+                        st.hasFirstPending = st.pending > 0
+                        st.firstPendingAtNs = if (st.pending > 0) finishedAtNs else 0L
+                        st.hasBackoff = false
+                        st.backoffUntilNs = 0L
                     }
                 }
             }
+            if (ok) lastReportWallAt = finishedWall
+        }
+
+        if (ok) {
             Counters.onReadReportSent()
             PicoLog.i("manual read report ok chat=$chatType peer=$peerUid")
         } else {
@@ -132,6 +185,15 @@ object ReadReporter {
             PicoLog.w("manual read report failed chat=$chatType peer=$peerUid $detail")
         }
         return ok to detail
+    }
+
+    private fun releaseInFlight(key: ConvKey, snapEpoch: Long) {
+        synchronized(lock) {
+            if (epoch == snapEpoch) {
+                val st = conversations[key]
+                if (st != null && st.inFlightCount > 0) st.inFlightCount--
+            }
+        }
     }
 
     private fun loop() {
@@ -161,66 +223,95 @@ object ReadReporter {
         if (!Config.autoMarkRead || KernelGate.state != KernelGate.State.ONLINE) return 2000L
         val msgService = KernelGate.msgService() ?: return 2000L
 
-        val now = System.currentTimeMillis()
+        val nowNs = System.nanoTime()
         val batch = Config.readReportBatch
         val intervalMs = Config.readReportIntervalMs
+        val intervalNs = TimeUnit.MILLISECONDS.toNanos(intervalMs)
         val minGapMs = Config.readReportMinGapMs
         val maxPerMin = Config.readReportMaxPerMin
 
         var targetKey: ConvKey? = null
         var snapPending = 0
+        var snapSeq = 0L
         var snapEpoch = 0L
         var rateWaitMs = 0L
 
         synchronized(lock) {
-            pruneRateWindowLocked(now)
+            pruneWindowLocked(autoSendTimestamps, nowNs)
 
-            // 优先选 pending 最多且达到批次或超时阈值的会话(避免热点群逼近 30 未读)
+            // 优先选 pending 最多且达到批次或超时阈值的非在途会话(避免热点群逼近 30 未读)
             var bestPending = 0
-            var bestFirstAt = Long.MAX_VALUE
+            var bestFirstElapsedNs = -1L
             for ((k, st) in conversations) {
-                if (st.pending <= 0 || now < st.backoffUntil) continue
-                val baseAt = if (st.lastReportAt > 0L) maxOf(st.lastReportAt, st.firstPendingAt) else st.firstPendingAt
-                val due = st.pending >= batch || (baseAt > 0L && now - baseAt >= intervalMs)
+                if (st.pending <= 0 || st.inFlightCount > 0) continue
+                if (st.hasBackoff && (st.backoffUntilNs - nowNs) > 0L) continue
+                val baseAtNs = when {
+                    st.hasLastReport && st.hasFirstPending ->
+                        if (st.lastReportAtNs - st.firstPendingAtNs >= 0L) st.lastReportAtNs else st.firstPendingAtNs
+                    st.hasFirstPending -> st.firstPendingAtNs
+                    st.hasLastReport -> st.lastReportAtNs
+                    else -> nowNs
+                }
+                val elapsedMs = (nowNs - baseAtNs).coerceAtLeast(0L) / 1_000_000L
+                val due = st.pending >= batch || (st.hasFirstPending && elapsedMs >= intervalMs)
                 if (!due) continue
-                if (st.pending > bestPending || (st.pending == bestPending && st.firstPendingAt < bestFirstAt)) {
+                val firstElapsedNs = if (st.hasFirstPending) (nowNs - st.firstPendingAtNs).coerceAtLeast(0L) else 0L
+                if (st.pending > bestPending || (st.pending == bestPending && firstElapsedNs > bestFirstElapsedNs)) {
                     targetKey = k
                     bestPending = st.pending
-                    bestFirstAt = st.firstPendingAt
+                    bestFirstElapsedNs = firstElapsedNs
                 }
             }
-            if (targetKey == null) return 1000L
+            val chosenKey = targetKey ?: return 1000L
 
-            // 全局最小间隔 + 每分钟滑窗上限
-            val gapRemain = minGapMs - (now - lastGlobalSendAt)
-            if (lastGlobalSendAt > 0L && gapRemain > 0L) {
+            // 全局最小间隔 + 每分钟滑窗上限(仅统计自动上报)
+            val gapElapsedMs = if (hasAutoSend) (nowNs - lastAutoSendAtNs).coerceAtLeast(0L) / 1_000_000L else minGapMs
+            val gapRemain = minGapMs - gapElapsedMs
+            if (hasAutoSend && gapRemain > 0L) {
                 rateWaitMs = gapRemain
-            } else if (sendTimestamps.size >= maxPerMin) {
-                val oldest = sendTimestamps.peekFirst() ?: now
-                rateWaitMs = ((oldest + RATE_WINDOW_MS) - now).coerceAtLeast(500L)
+            } else if (autoSendTimestamps.size >= maxPerMin) {
+                val oldestNs = autoSendTimestamps.peekFirst() ?: nowNs
+                val remainMs = ((oldestNs + RATE_WINDOW_NS) - nowNs) / 1_000_000L
+                rateWaitMs = remainMs.coerceAtLeast(500L)
             } else {
-                snapPending = bestPending
+                val st = conversations[chosenKey] ?: return 1000L
+                st.inFlightCount++
+                snapPending = st.pending
+                snapSeq = st.inboundSeq
                 snapEpoch = epoch
-                recordGlobalAttemptLocked(now)
+                recordAutoAttemptLocked(nowNs)
             }
         }
 
         if (rateWaitMs > 0L) return rateWaitMs
         val key = targetKey ?: return 1000L
 
-        val (ok, detail) = invokeSetMsgRead(msgService, key.chatType, key.peerUid)
-        val finishedAt = System.currentTimeMillis()
+        val (ok, detail) = try {
+            invokeSetMsgRead(msgService, key.chatType, key.peerUid)
+        } catch (t: Throwable) {
+            releaseInFlight(key, snapEpoch)
+            throw t
+        }
+
+        val finishedAtNs = System.nanoTime()
+        val finishedWall = System.currentTimeMillis()
         if (ok) {
             synchronized(lock) {
                 if (epoch == snapEpoch) {
                     val st = conversations[key]
                     if (st != null) {
-                        st.pending = (st.pending - snapPending).coerceAtLeast(0)
-                        st.lastReportAt = finishedAt
-                        st.firstPendingAt = if (st.pending > 0) finishedAt else 0L
-                        st.backoffUntil = 0L
+                        if (st.inFlightCount > 0) st.inFlightCount--
+                        if (snapSeq > st.reportedSeq) st.reportedSeq = snapSeq
+                        st.pending = (st.inboundSeq - st.reportedSeq).toInt().coerceAtLeast(0)
+                        st.hasLastReport = true
+                        st.lastReportAtNs = finishedAtNs
+                        st.hasFirstPending = st.pending > 0
+                        st.firstPendingAtNs = if (st.pending > 0) finishedAtNs else 0L
+                        st.hasBackoff = false
+                        st.backoffUntilNs = 0L
                     }
                 }
+                lastReportWallAt = finishedWall
             }
             Counters.onReadReportSent()
             PicoLog.d("read report ok chat=${key.chatType} peer=${key.peerUid} cleared=$snapPending")
@@ -229,10 +320,14 @@ object ReadReporter {
                 if (epoch == snapEpoch) {
                     val st = conversations[key]
                     if (st != null) {
+                        if (st.inFlightCount > 0) st.inFlightCount--
                         // 失败时强制退避一个周期(即使 pending>=batch),避免热点会话反复打 RPC
-                        st.lastReportAt = finishedAt
-                        st.firstPendingAt = finishedAt
-                        st.backoffUntil = finishedAt + intervalMs
+                        st.hasLastReport = true
+                        st.lastReportAtNs = finishedAtNs
+                        st.hasFirstPending = st.pending > 0
+                        st.firstPendingAtNs = finishedAtNs
+                        st.hasBackoff = true
+                        st.backoffUntilNs = finishedAtNs + intervalNs
                     }
                 }
             }
@@ -264,31 +359,32 @@ object ReadReporter {
         return if (res.first == 0) true to "ok" else false to "code=${res.first} ${res.second}"
     }
 
-    private fun pruneRateWindowLocked(now: Long) {
-        while (sendTimestamps.isNotEmpty()) {
-            val head = sendTimestamps.peekFirst() ?: break
-            if (now - head >= RATE_WINDOW_MS) sendTimestamps.removeFirst() else break
+    private fun pruneWindowLocked(window: ArrayDeque<Long>, nowNs: Long) {
+        while (window.isNotEmpty()) {
+            val headNs = window.peekFirst() ?: break
+            if ((nowNs - headNs).coerceAtLeast(0L) >= RATE_WINDOW_NS) window.removeFirst() else break
         }
     }
 
-    private fun recordGlobalAttemptLocked(now: Long) {
-        pruneRateWindowLocked(now)
-        lastGlobalSendAt = now
-        sendTimestamps.addLast(now)
+    private fun recordAutoAttemptLocked(nowNs: Long) {
+        pruneWindowLocked(autoSendTimestamps, nowNs)
+        hasAutoSend = true
+        lastAutoSendAtNs = nowNs
+        autoSendTimestamps.addLast(nowNs)
     }
 
     fun stats(): JSONObject {
-        val now = System.currentTimeMillis()
+        val nowNs = System.nanoTime()
         var pendingConvs = 0
         var pendingMsgs = 0
         var tracked = 0
         var windowCount = 0
         var lastSend = 0L
         synchronized(lock) {
-            pruneRateWindowLocked(now)
+            pruneWindowLocked(autoSendTimestamps, nowNs)
             tracked = conversations.size
-            windowCount = sendTimestamps.size
-            lastSend = lastGlobalSendAt
+            windowCount = autoSendTimestamps.size
+            lastSend = lastReportWallAt
             for (st in conversations.values) {
                 if (st.pending > 0) {
                     pendingConvs++

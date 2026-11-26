@@ -1,6 +1,9 @@
 package pico.onebot
 
+import android.app.Application
 import android.content.Context
+import android.os.Build
+import android.util.Log
 import pico.onebot.action.MsgActions
 import pico.onebot.action.SystemActions
 import pico.onebot.core.Config
@@ -17,6 +20,7 @@ import pico.onebot.msg.MsgIdStore
 import pico.onebot.net.HttpServer
 import pico.onebot.net.WsClient
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * 启动编排。被 [pico.onebot.hook.PicoAppHook] 从宿主 Application 里调一次。
@@ -34,8 +38,7 @@ object PicoBoot {
     var startedAt: Long = 0
         private set
 
-    @Volatile
-    private var started = false
+    private val started = AtomicBoolean(false)
 
     @Volatile
     private var server: HttpServer? = null
@@ -46,8 +49,9 @@ object PicoBoot {
     private val onebotServers = ArrayList<HttpServer>()
     private val reverseClients = ArrayList<WsClient>()
 
-    /** 配置项 id -> 真正起来的监听 / 反向客户端 / 绑定失败原因。WebUI 的状态只看这三张表。 */
+    /** 配置项 id -> 真正起来的监听 / 实际生效的 token / 反向客户端 / 绑定失败原因。WebUI 的状态只看这几张表。 */
     private val listenerById = LinkedHashMap<String, HttpServer>()
+    private val listenerTokenById = LinkedHashMap<String, String>()
     private val reverseById = LinkedHashMap<String, WsClient>()
     private val bindErrorById = LinkedHashMap<String, String>()
 
@@ -72,15 +76,10 @@ object PicoBoot {
     fun bindError(id: String): String? = synchronized(this) { bindErrorById[id] }
 
     /**
-     * 当前真正在 listening 的 OneBot 端口与它的 token。
+     * 当前真正在 listening 的 OneBot 端口与它的实时 token。
      *
-     * 媒体外链必须指向一个**真实有服务**的端口:老实现用 `Config.port`(第一个启用的
-     * 正向 WS 配置项),纯反向 WS / 纯 HTTP 上报部署下那个端口根本没人监听,上游取图
-     * 直接 connection refused。
-     *
-     * 选择顺序:**非回环监听优先**。两个监听项并存时(例如 `127.0.0.1:3001` 无 token
-     * + `0.0.0.0:3002` 有 token),先前按插入序取第一个会得到只在回环上可达的端口,
-     * 拼出的 `http://<LAN_IP>:3001/...` 从别的机器根本连不上。
+     * 直接返回该运行中 [HttpServer] 启动时绑定的 token(而不是现查 Config),
+     * 避免 AdminApi 改完配置尚未 reloadNetwork 时媒体 URL 与实际鉴权口令失同步。
      *
      * @return (host, port, token);没有任何 OneBot 监听时返回 null。
      */
@@ -88,13 +87,7 @@ object PicoBoot {
         var loopback: Triple<String, Int, String>? = null
         for ((id, server) in listenerById) {
             if (!server.running) continue
-            val token = Config.wsServers().let { arr ->
-                (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }.firstOrNull { it.optString("id") == id }
-            }?.optString("token", "")
-                ?: Config.httpServers().let { arr ->
-                    (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }.firstOrNull { it.optString("id") == id }
-                }?.optString("token", "")
-                ?: ""
+            val token = listenerTokenById[id] ?: ""
             val candidate = Triple(server.host, server.port, token)
             if (!Config.isLoopbackHost(server.host)) return@synchronized candidate
             if (loopback == null) loopback = candidate
@@ -115,15 +108,20 @@ object PicoBoot {
     )
 
     fun start(ctx: Context) {
-        if (started) return
+        if (started.get()) return
         QimeiCompat.installSignatureCompat(ctx)
         val proc = currentProcessName()
-        if (proc != null && proc != ctx.packageName) {
+        if (proc.isNullOrBlank()) {
+            // fail-closed: 无法确认进程名时绝不在未知子进程中拉起主栈
+            Log.w(PicoLog.TAG, "PicoBoot: unable to determine process name, skipping boot")
+            return
+        }
+        if (proc != ctx.packageName) {
             if (proc.endsWith(":MSF")) QimeiCompat.startMsf(ctx)
             // 子进程(:MSF / :P_OPT)不启动任何东西
             return
         }
-        started = true
+        if (!started.compareAndSet(false, true)) return
         startedAt = System.currentTimeMillis()
         Thread({ bootSafely(ctx) }, "pico-boot").apply { isDaemon = true }.start()
     }
@@ -159,13 +157,14 @@ object PicoBoot {
         pico.onebot.action.InfoActions.register()
         PicoLog.i("actions registered: " + pico.onebot.action.ActionRouter.names().size)
 
-
         for (warning in Config.validateNetwork()) {
             PicoLog.w("unsafe network config loaded from file: $warning")
         }
 
         reloadNetwork()
-        if (onebotServers.isNotEmpty()) KernelGate.setState(KernelGate.State.TRANSPORT_UP)
+        if (synchronized(this) { onebotServers.isNotEmpty() }) {
+            KernelGate.setState(KernelGate.State.TRANSPORT_UP)
+        }
 
         // WebUI 独立监听(6099),静态页 + /api/*
         try {
@@ -190,6 +189,7 @@ object PicoBoot {
             try {
                 Thread.sleep(delay)
             } catch (t: InterruptedException) {
+                Thread.currentThread().interrupt()
                 return
             }
         }
@@ -200,7 +200,8 @@ object PicoBoot {
             UinUidStore.save()
         })
 
-        PicoLog.i("PicoOnebot ready: ${onebotServers.size} server(s), ${reverseClients.size} reverse WS client(s)")
+        val (srvCount, revCount) = synchronized(this) { onebotServers.size to reverseClients.size }
+        PicoLog.i("PicoOnebot ready: $srvCount server(s), $revCount reverse WS client(s)")
     }
 
     @Synchronized
@@ -210,6 +211,7 @@ object PicoBoot {
         onebotServers.forEach { it.stop() }
         onebotServers.clear()
         listenerById.clear()
+        listenerTokenById.clear()
         reverseById.clear()
         bindErrorById.clear()
         pico.onebot.net.Transport.closeAll()
@@ -220,9 +222,19 @@ object PicoBoot {
             val o = servers.optJSONObject(i) ?: continue
             if (!o.optBoolean("enabled", true)) continue
             val id = o.optString("id")
-            val host = o.optString("host", "0.0.0.0")
-            val port = o.optInt("port", 3001)
-            val token = o.optString("token", "")
+            val host = if (o.isNull("host")) "0.0.0.0" else o.optString("host", "0.0.0.0").trim()
+            val port = if (o.isNull("port")) -1 else o.optInt("port", 3001)
+            if (host.isEmpty()) {
+                errors.add("正向 WS $id: 监听地址不能为空")
+                bindErrorById[id] = "监听地址不能为空"
+                continue
+            }
+            if (port !in 1..65535) {
+                errors.add("正向 WS $host:$port: 端口必须在 1-65535 之间")
+                bindErrorById[id] = "端口无效"
+                continue
+            }
+            val token = if (o.isNull("token")) "" else o.optString("token", "")
             // 非回环 + 空 token 意味着任何人都能调 /api/pico 改配置、读 token、
             // 触发 logout。这里必须拒绝监听,而不是像以前那样只打一条 warn 就照常起。
             if (!Config.isLoopbackHost(host) && token.isBlank()) {
@@ -240,6 +252,7 @@ object PicoBoot {
                 hs.start()
                 onebotServers.add(hs)
                 listenerById[id] = hs
+                listenerTokenById[id] = token
             } catch (t: Throwable) {
                 errors.add("正向 WS $host:$port: ${t.message}")
                 bindErrorById[id] = t.message ?: t.javaClass.simpleName
@@ -252,13 +265,19 @@ object PicoBoot {
             val o = httpServers.optJSONObject(i) ?: continue
             if (!o.optBoolean("enabled", true)) continue
             val id = o.optString("id")
-            val host = o.optString("host", "0.0.0.0")
-            val port = o.optInt("port", 0)
-            if (port <= 0) {
+            val host = if (o.isNull("host")) "0.0.0.0" else o.optString("host", "0.0.0.0").trim()
+            val port = if (o.isNull("port")) -1 else o.optInt("port", 0)
+            if (host.isEmpty()) {
+                errors.add("HTTP $id: 监听地址不能为空")
+                bindErrorById[id] = "监听地址不能为空"
+                continue
+            }
+            if (port !in 1..65535) {
+                errors.add("HTTP $host:$port: 端口必须在 1-65535 之间")
                 bindErrorById[id] = "端口无效"
                 continue
             }
-            val token = o.optString("token", "")
+            val token = if (o.isNull("token")) "" else o.optString("token", "")
             if (!Config.isLoopbackHost(host) && token.isBlank()) {
                 errors.add("HTTP $host:$port: 非回环监听必须配置 Access Token(已拒绝监听)")
                 bindErrorById[id] = "缺少 Access Token,已拒绝监听"
@@ -275,6 +294,7 @@ object PicoBoot {
                 hs.start()
                 onebotServers.add(hs)
                 listenerById[id] = hs
+                listenerTokenById[id] = token
             } catch (t: Throwable) {
                 errors.add("HTTP $host:$port: ${t.message}")
                 bindErrorById[id] = t.message ?: t.javaClass.simpleName
@@ -289,8 +309,14 @@ object PicoBoot {
             val o = clients.optJSONObject(i) ?: continue
             if (!o.optBoolean("enabled", true)) continue
             val id = o.optString("id")
-            val url = o.optString("url", "")
-            val c = WsClient(url, o.optString("token", ""), actionDispatcher, o.optLong("reconnectInterval", 3000), id)
+            val url = if (o.isNull("url")) "" else o.optString("url", "").trim()
+            if (url.isEmpty()) {
+                errors.add("反向 WS $id: 目标地址不能为空")
+                bindErrorById[id] = "目标地址为空"
+                continue
+            }
+            val token = if (o.isNull("token")) "" else o.optString("token", "")
+            val c = WsClient(url, token, actionDispatcher, o.optLong("reconnectInterval", 3000), id)
             reverseClients.add(c)
             reverseById[id] = c
             c.start()
@@ -307,12 +333,28 @@ object PicoBoot {
         return ReloadResult(errors, onebotServers.size, reverseClients.size, reporters)
     }
 
-    /** /proc/self/cmdline 是判断进程名最不依赖框架的办法。 */
-    fun currentProcessName(): String? = try {
-        val raw = File("/proc/self/cmdline").readBytes()
-        val end = raw.indexOf(0.toByte()).let { if (it < 0) raw.size else it }
-        String(raw, 0, end, Charsets.UTF_8).trim()
-    } catch (t: Throwable) {
-        null
+    /** 优先读 /proc/self/cmdline,失败时回退至 Application.getProcessName() (API 28+) 与 ActivityThread。 */
+    fun currentProcessName(): String? {
+        try {
+            val raw = File("/proc/self/cmdline").readBytes()
+            val end = raw.indexOf(0.toByte()).let { if (it < 0) raw.size else it }
+            val name = String(raw, 0, end, Charsets.UTF_8).trim()
+            if (name.isNotEmpty()) return name
+        } catch (_: Throwable) {
+        }
+        if (Build.VERSION.SDK_INT >= 28) {
+            try {
+                val name = Application.getProcessName()
+                if (!name.isNullOrBlank()) return name.trim()
+            } catch (_: Throwable) {
+            }
+        }
+        return try {
+            val cls = Class.forName("android.app.ActivityThread")
+            val name = cls.getDeclaredMethod("currentProcessName").invoke(null) as? String
+            name?.trim()?.takeIf { it.isNotEmpty() }
+        } catch (_: Throwable) {
+            null
+        }
     }
 }

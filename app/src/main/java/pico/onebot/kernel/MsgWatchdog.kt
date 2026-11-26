@@ -5,6 +5,7 @@ import org.json.JSONObject
 import pico.onebot.core.Config
 import pico.onebot.core.Counters
 import pico.onebot.core.PicoLog
+import java.util.concurrent.TimeUnit
 
 /**
  * 入站消息静默可观测性与保守 `startMsgSync()` 兜底看门狗(P0)。
@@ -17,20 +18,20 @@ import pico.onebot.core.PicoLog
  *     收到任意新入站消息立即复位退避计数;
  *  3) 暴露按需运维入口 [triggerSyncNow] 及只读最近会话未读摘要 [recentContactSummary]。
  *
- * 绝不高频轮询,绝不调用不存在的桌面端 `*AddActiveChat` 或纯本地 `getAioFirstViewLatestMsgs`。
+ * 所有时长/冷却/退避均采用单调时钟 `System.nanoTime()`,免疫墙钟回跳;墙钟仅用于外部诊断时间戳。
  */
 object MsgWatchdog {
 
     private const val MAX_TRACKED_CONVS = 512
     private const val WATCH_TICK_MS = 15_000L
-    private const val MANUAL_SYNC_COOLDOWN_MS = 5_000L
+    private const val MANUAL_SYNC_COOLDOWN_NS = 5_000_000_000L
     private const val RECENT_SCAN_LIMIT = 50
     private const val RECENT_TOP_UNREAD_LIMIT = 10
 
     private data class ConvKey(val chatType: Int, val peerUid: String)
 
     private class ConvActivity(
-        var lastRecvAt: Long,
+        var lastRecvAtWall: Long,
         var lastMsgSeq: Long,
         var recvCount: Long
     )
@@ -44,11 +45,14 @@ object MsgWatchdog {
     @Volatile
     private var running = false
 
-    private var lastRecvAt: Long = 0L
+    private var lastRecvAtWall: Long = 0L
+    private var lastRecvAtNs: Long = 0L
     private var hasReceivedAnyInSession: Boolean = false
     private var silenceSyncAttempts: Int = 0
-    private var nextSyncAllowedAt: Long = 0L
-    private var lastManualSyncAt: Long = 0L
+    private var hasNextSyncAllowed: Boolean = false
+    private var nextSyncAllowedAtNs: Long = 0L
+    private var hasManualSync: Boolean = false
+    private var lastManualSyncAtNs: Long = 0L
 
     fun start() {
         synchronized(this) {
@@ -61,20 +65,23 @@ object MsgWatchdog {
 
     /** 收到非自发入站消息时打点,并立即复位本轮静默退避。 */
     fun onInboundMessage(chatType: Int, peerUid: String, msgSeq: Long) {
-        val now = System.currentTimeMillis()
-        Counters.onInboundRecv(now)
+        val nowWall = System.currentTimeMillis()
+        val nowNs = System.nanoTime()
         synchronized(lock) {
-            lastRecvAt = now
+            lastRecvAtWall = nowWall
+            lastRecvAtNs = nowNs
             hasReceivedAnyInSession = true
             silenceSyncAttempts = 0
-            nextSyncAllowedAt = 0L
+            hasNextSyncAllowed = false
+            nextSyncAllowedAtNs = 0L
+            Counters.onInboundRecv(nowWall)
             if (peerUid.isNotEmpty() && (chatType == 1 || chatType == 2)) {
                 val key = ConvKey(chatType, peerUid)
                 val cur = conversations[key]
                 if (cur == null) {
-                    conversations[key] = ConvActivity(now, msgSeq, 1L)
+                    conversations[key] = ConvActivity(nowWall, msgSeq, 1L)
                 } else {
-                    cur.lastRecvAt = now
+                    cur.lastRecvAtWall = nowWall
                     if (msgSeq > cur.lastMsgSeq) cur.lastMsgSeq = msgSeq
                     cur.recvCount++
                 }
@@ -86,36 +93,45 @@ object MsgWatchdog {
     fun reset() {
         synchronized(lock) {
             conversations.clear()
-            lastRecvAt = 0L
+            lastRecvAtWall = 0L
+            lastRecvAtNs = 0L
             hasReceivedAnyInSession = false
             silenceSyncAttempts = 0
-            nextSyncAllowedAt = 0L
+            hasNextSyncAllowed = false
+            nextSyncAllowedAtNs = 0L
+            Counters.resetLastRecvAt()
         }
-        Counters.resetLastRecvAt()
         PicoLog.d("msg watchdog reset")
     }
 
     /** 当前连续静默时长(ms);尚未收过入站消息时返回 0。 */
     fun silenceMs(): Long {
-        val last = synchronized(lock) { lastRecvAt }
-        if (last <= 0L) return 0L
-        return (System.currentTimeMillis() - last).coerceAtLeast(0L)
+        val hasRecv: Boolean
+        val lastNs: Long
+        synchronized(lock) {
+            hasRecv = hasReceivedAnyInSession
+            lastNs = lastRecvAtNs
+        }
+        if (!hasRecv) return 0L
+        return (System.nanoTime() - lastNs).coerceAtLeast(0L) / 1_000_000L
     }
 
-    /** 手工触发一次 `IKernelMsgService.startMsgSync()`(带 5s 防抖冷却)。 */
+    /** 手工触发一次 `IKernelMsgService.startMsgSync()`(带 5s 单调时钟防抖冷却)。 */
     fun triggerSyncNow(reason: String): Pair<Boolean, String> {
         if (!KernelGate.ready) return false to "kernel not ready (${KernelGate.state})"
         val msgService = KernelGate.msgService() ?: return false to "msgService unavailable"
-        val now = System.currentTimeMillis()
+        val nowNs = System.nanoTime()
+        val nowWall = System.currentTimeMillis()
         synchronized(lock) {
-            if (lastManualSyncAt > 0L && now - lastManualSyncAt < MANUAL_SYNC_COOLDOWN_MS) {
+            if (hasManualSync && (nowNs - lastManualSyncAtNs).coerceAtLeast(0L) < MANUAL_SYNC_COOLDOWN_NS) {
                 return false to "sync cooldown active, please retry in a few seconds"
             }
-            lastManualSyncAt = now
+            hasManualSync = true
+            lastManualSyncAtNs = nowNs
         }
         return try {
             msgService.startMsgSync()
-            Counters.onSyncTriggered(now)
+            Counters.onSyncTriggered(nowWall)
             PicoLog.i("startMsgSync() triggered ($reason)")
             true to "ok"
         } catch (t: Throwable) {
@@ -148,27 +164,29 @@ object MsgWatchdog {
         if (KernelGate.state != KernelGate.State.ONLINE) return
         val msgService = KernelGate.msgService() ?: return
 
-        val now = System.currentTimeMillis()
+        val nowNs = System.nanoTime()
+        val nowWall = System.currentTimeMillis()
         val attemptNum: Int
         val silentMs: Long
         synchronized(lock) {
-            if (!hasReceivedAnyInSession || lastRecvAt <= 0L) return
+            if (!hasReceivedAnyInSession) return
             if (silenceSyncAttempts >= maxAttempts) return
-            silentMs = (now - lastRecvAt).coerceAtLeast(0L)
+            silentMs = (nowNs - lastRecvAtNs).coerceAtLeast(0L) / 1_000_000L
             if (silenceSyncAttempts == 0) {
                 if (silentMs < thresholdMs) return
             } else {
-                if (now < nextSyncAllowedAt) return
+                if (hasNextSyncAllowed && (nextSyncAllowedAtNs - nowNs) > 0L) return
             }
             silenceSyncAttempts++
             attemptNum = silenceSyncAttempts
             // 退避:第 1 次在 1x 阈值(10m)触发后,第 2 次等 2x(20m),第 3 次等 3x(30m)
-            nextSyncAllowedAt = now + thresholdMs * (attemptNum + 1L)
+            hasNextSyncAllowed = true
+            nextSyncAllowedAtNs = nowNs + TimeUnit.MILLISECONDS.toNanos(thresholdMs) * (attemptNum + 1L)
         }
 
         try {
             msgService.startMsgSync()
-            Counters.onSyncTriggered(now)
+            Counters.onSyncTriggered(nowWall)
             PicoLog.w(
                 "msg silence watchdog: silent=${silentMs / 1000}s, triggered startMsgSync() " +
                     "attempt=$attemptNum/$maxAttempts"
@@ -224,37 +242,45 @@ object MsgWatchdog {
     }
 
     fun stats(): JSONObject {
-        val now = System.currentTimeMillis()
-        val last: Long
+        val nowWall = System.currentTimeMillis()
+        val nowNs = System.nanoTime()
+        val lastWall: Long
+        val hasRecv: Boolean
+        val lastNs: Long
         val attempts: Int
-        val nextAt: Long
+        val nextAtWall: Long
         val tracked: Int
         val topConvs = JSONArray()
         synchronized(lock) {
-            last = lastRecvAt
+            lastWall = lastRecvAtWall
+            hasRecv = hasReceivedAnyInSession
+            lastNs = lastRecvAtNs
             attempts = silenceSyncAttempts
-            nextAt = nextSyncAllowedAt
+            nextAtWall = if (hasNextSyncAllowed) {
+                val remainMs = (nextSyncAllowedAtNs - nowNs).coerceAtLeast(0L) / 1_000_000L
+                nowWall + remainMs
+            } else 0L
             tracked = conversations.size
-            val sorted = conversations.entries.sortedByDescending { it.value.lastRecvAt }.take(20)
+            val sorted = conversations.entries.sortedByDescending { it.value.lastRecvAtWall }.take(20)
             for ((k, v) in sorted) {
                 topConvs.put(
                     JSONObject()
                         .put("chat_type", k.chatType)
                         .put("peer_uid", k.peerUid)
-                        .put("last_recv_at", v.lastRecvAt)
+                        .put("last_recv_at", v.lastRecvAtWall)
                         .put("last_msg_seq", v.lastMsgSeq)
                         .put("recv_count", v.recvCount)
                 )
             }
         }
-        val silent = if (last > 0L) (now - last).coerceAtLeast(0L) else 0L
+        val silent = if (hasRecv) (nowNs - lastNs).coerceAtLeast(0L) / 1_000_000L else 0L
         return JSONObject()
-            .put("last_recv_at", last)
+            .put("last_recv_at", lastWall)
             .put("silence_ms", silent)
             .put("sync_triggered", Counters.syncTriggered())
             .put("last_sync_at", Counters.lastSyncAt())
             .put("silence_sync_attempts", attempts)
-            .put("silence_sync_next_at", nextAt)
+            .put("silence_sync_next_at", nextAtWall)
             .put("silence_sync_threshold_sec", Config.silenceSyncThresholdMs / 1000L)
             .put("silence_sync_max_attempts", Config.silenceSyncMaxAttempts)
             .put("tracked_conversations", tracked)

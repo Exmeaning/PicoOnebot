@@ -3,11 +3,14 @@ package pico.onebot.core
 import android.system.Os
 import android.system.OsConstants
 import java.io.File
+import java.io.FileOutputStream
 
 object ContainerRestart {
+    private const val COOLDOWN_NS = 30_000_000_000L
     private val marker = File("/data/local/tmp/pico-qq-restart.ready")
     private val container = File("/system/etc/pico-container")
-    private var lastRequestAt = 0L
+    private var hasLastRequest = false
+    private var lastRequestAtNs = 0L
 
     fun available(): Boolean = try {
         val info = Os.lstat(marker.path)
@@ -23,14 +26,23 @@ object ContainerRestart {
     @Synchronized
     fun request(): Boolean {
         check(available()) { "仅支持已启用重启守护服务的 PicoOnebot 容器" }
-        val now = System.currentTimeMillis()
+        val nowNs = System.nanoTime()
+        val nowWallSec = System.currentTimeMillis() / 1000
         val request = File(Config.dataDir, "restart-qq.request")
-        if (request.exists() || now - lastRequestAt < 30_000) return false
+        if (request.exists() || (hasLastRequest && (nowNs - lastRequestAtNs).coerceAtLeast(0L) < COOLDOWN_NS)) {
+            return false
+        }
+        Config.dataDir.mkdirs()
         val temporary = File(Config.dataDir, "restart-qq.request.tmp")
         try {
-            temporary.writeText((now / 1000).toString())
+            FileOutputStream(temporary).use { fos ->
+                fos.write(nowWallSec.toString().toByteArray(Charsets.UTF_8))
+                fos.flush()
+                fos.fd.sync()
+            }
             check(temporary.renameTo(request)) { "无法提交 QQ 重启请求" }
-            lastRequestAt = now
+            hasLastRequest = true
+            lastRequestAtNs = nowNs
         } finally {
             temporary.delete()
         }

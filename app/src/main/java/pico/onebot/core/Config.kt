@@ -1,10 +1,13 @@
 package pico.onebot.core
 
 import android.content.Context
+import android.system.Os
 import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
 import java.net.URI
 import java.security.MessageDigest
 import java.security.SecureRandom
@@ -25,6 +28,7 @@ object Config {
     const val DEFAULT_WEBUI_PASSWORD = "picopico"
     private const val PASSWORD_ITERATIONS = 120_000
     private const val PASSWORD_BITS = 256
+    private const val OWNER_RW_MODE = 0b110_000_000 // 0600
 
     @Volatile
     private var root: JSONObject = JSONObject()
@@ -34,30 +38,91 @@ object Config {
 
     private var file: File? = null
 
+    @Synchronized
     fun load(ctx: Context) {
         dataDir = File(ctx.filesDir, DIR_NAME).apply { mkdirs() }
-        val external = File("/sdcard/$DIR_NAME/config.json")
         val internal = File(dataDir, "config.json")
-        val f = if (external.isFile) external else internal
-        file = f
-        val raw = try {
-            if (f.isFile) JSONObject(f.readText()) else JSONObject()
-        } catch (t: Throwable) {
-            PicoLog.e("config parse failed, using defaults: " + f.absolutePath, t)
-            JSONObject()
+        val external = File("/sdcard/$DIR_NAME/config.json")
+        file = internal
+
+        val hasInternal = internal.isFile
+        val source: File? = when {
+            hasInternal -> internal
+            external.isFile -> external
+            else -> null
         }
-        root = if (raw.optInt("version", 0) >= 2) raw else migrateV1(raw, f)
-        fillDefaults()
-        save()
-        PicoLog.i("config v2 loaded from " + f.absolutePath)
+
+        if (source == null) {
+            val fresh = migrateV1(JSONObject())
+            fillDefaults(fresh)
+            sanitizeWebuiDir(fresh)
+            try {
+                persist(fresh)
+            } catch (t: Throwable) {
+                PicoLog.e("config initial persist failed", t)
+            }
+            root = fresh
+            PicoLog.i("config v2 initialized at " + internal.absolutePath)
+            return
+        }
+
+        val parsed = try {
+            JSONObject(source.readText(Charsets.UTF_8))
+        } catch (t: Throwable) {
+            PicoLog.e("config parse failed: " + source.absolutePath, t)
+            backupCorruptConfig(source)
+            // 绝不静默以未初始化的默认 picopico 配置覆盖磁盘上的损坏文件
+            val fallback = migrateV1(JSONObject())
+            fillDefaults(fallback)
+            sanitizeWebuiDir(fallback)
+            root = fallback
+            PicoLog.w("loaded in-memory defaults without overwriting corrupt config file")
+            return
+        }
+
+        val migratedFromV1 = parsed.optInt("version", 0) < 2
+        val next = if (migratedFromV1) migrateV1(parsed) else JSONObject(parsed.toString())
+        val beforeNormalize = next.toString()
+        fillDefaults(next)
+        val dirSanitized = sanitizeWebuiDir(next)
+        val importedFromExternal = !hasInternal && source == external
+        val needsPersist = importedFromExternal || migratedFromV1 || dirSanitized || next.toString() != beforeNormalize
+
+        if (needsPersist) {
+            try {
+                persist(next)
+            } catch (t: Throwable) {
+                PicoLog.e("config persist failed during load", t)
+            }
+        } else {
+            restrictPermissions(internal)
+        }
+        root = next
+        if (importedFromExternal) {
+            PicoLog.i("config v2 migrated one-time from /sdcard to " + internal.absolutePath)
+        } else {
+            PicoLog.i("config v2 loaded from " + internal.absolutePath)
+        }
+    }
+
+    private fun backupCorruptConfig(source: File) {
+        try {
+            val backup = File(dataDir, "config.json.corrupt." + System.currentTimeMillis())
+            val bytes = source.readBytes()
+            writePrivateBytes(backup, bytes)
+            PicoLog.w("corrupt config backed up to " + backup.absolutePath)
+        } catch (t: Throwable) {
+            PicoLog.e("corrupt config backup failed", t)
+        }
     }
 
     /** v1 -> v2。空对象也走这里,得到一份纯默认的 v2。 */
-    private fun migrateV1(v1: JSONObject, f: File): JSONObject {
+    private fun migrateV1(v1: JSONObject): JSONObject {
         if (v1.length() > 0) {
             try {
-                File(f.parentFile, "config.v1.json").writeText(v1.toString(2))
-                PicoLog.i("v1 config backed up to config.v1.json")
+                val backup = File(dataDir, "config.v1.json")
+                writePrivateBytes(backup, v1.toString(2).toByteArray(Charsets.UTF_8))
+                PicoLog.i("v1 config backed up to " + backup.absolutePath)
             } catch (t: Throwable) {
                 PicoLog.w("v1 backup failed: " + t.message)
             }
@@ -141,80 +206,70 @@ object Config {
         return v2
     }
 
-    private fun fillDefaults() {
-        if (!root.has("version")) root.put("version", 2)
-        if (!root.has("enable")) root.put("enable", true)
+    private fun fillDefaults(target: JSONObject) {
+        if (!target.has("version") || target.isNull("version")) target.put("version", 2)
+        if (!target.has("enable") || target.isNull("enable")) target.put("enable", true)
 
-        val webui = root.optJSONObject("webui") ?: JSONObject().also { root.put("webui", it) }
-        if (!webui.has("host")) webui.put("host", "0.0.0.0")
-        if (!webui.has("port")) webui.put("port", 6099)
+        val webui = target.optJSONObject("webui") ?: JSONObject().also { target.put("webui", it) }
+        if (!webui.has("host") || webui.isNull("host")) webui.put("host", "0.0.0.0")
+        if (!webui.has("port") || webui.isNull("port")) webui.put("port", 6099)
         migratePlaintextPassword(webui)
 
-        val net = root.optJSONObject("network") ?: JSONObject().also { root.put("network", it) }
-        if (!net.has("wsServers")) net.put("wsServers", JSONArray())
-        if (!net.has("wsClients")) net.put("wsClients", JSONArray())
-        if (!net.has("httpServers")) net.put("httpServers", JSONArray())
-        if (!net.has("httpClients")) net.put("httpClients", JSONArray())
+        val net = target.optJSONObject("network") ?: JSONObject().also { target.put("network", it) }
+        if (!net.has("wsServers") || net.isNull("wsServers")) net.put("wsServers", JSONArray())
+        if (!net.has("wsClients") || net.isNull("wsClients")) net.put("wsClients", JSONArray())
+        if (!net.has("httpServers") || net.isNull("httpServers")) net.put("httpServers", JSONArray())
+        if (!net.has("httpClients") || net.isNull("httpClients")) net.put("httpClients", JSONArray())
         fillConnectionIds(net)
         // 老配置没有这两个开关:按"保持既有行为"补默认值 —— WebSocket 一直开着,
         // CORS 一直回 *,否则升级后行为会莫名其妙地变。
         fillConnectionFlags(net)
 
-        val g = root.optJSONObject("general") ?: JSONObject().also { root.put("general", it) }
-        if (!g.has("logLevel")) g.put("logLevel", "info")
+        val g = target.optJSONObject("general") ?: JSONObject().also { target.put("general", it) }
+        if (!g.has("logLevel") || g.isNull("logLevel")) g.put("logLevel", "info")
         g.remove("showPanelOnStart")
-        if (!g.has("forwardMode")) g.put("forwardMode", "merge_one")
-        if (!g.has("forwardMergeHeader")) g.put("forwardMergeHeader", "〔合并转发〕")
-        if (!g.has("mediaBaseUrl")) g.put("mediaBaseUrl", "")
-        if (!g.has("mediaBase64Limit")) g.put("mediaBase64Limit", 4L * 1024 * 1024)
-        if (!g.has("sendRatePerSec")) g.put("sendRatePerSec", 5)
-        if (!g.has("kernelCallTimeoutMs")) g.put("kernelCallTimeoutMs", 30000)
-        if (!g.has("reverse_reconnect_min_ms")) g.put("reverse_reconnect_min_ms", 3000)
-        if (!g.has("reverse_reconnect_max_ms")) g.put("reverse_reconnect_max_ms", 60000)
-        if (!g.has("post_timeout_ms")) g.put("post_timeout_ms", 10000)
-        if (!g.has("post_queue_size")) g.put("post_queue_size", 1024)
-        if (!g.has("event_queue_size")) g.put("event_queue_size", 8192)
-        if (!g.has("kernel_probe_delay_ms")) g.put("kernel_probe_delay_ms", 5000)
-        if (!g.has("webui_dir")) g.put("webui_dir", "webui")
-        if (!g.has("autoMarkRead")) g.put("autoMarkRead", true)
-        if (!g.has("readReportBatch")) g.put("readReportBatch", 10)
-        if (!g.has("readReportIntervalSec")) g.put("readReportIntervalSec", 60L)
-        if (!g.has("readReportMinGapMs")) g.put("readReportMinGapMs", 1500L)
-        if (!g.has("readReportMaxPerMin")) g.put("readReportMaxPerMin", 18)
-        if (!g.has("silenceSyncThresholdSec")) g.put("silenceSyncThresholdSec", 600L)
-        if (!g.has("silenceSyncMaxAttempts")) g.put("silenceSyncMaxAttempts", 3)
+        if (!g.has("forwardMode") || g.isNull("forwardMode")) g.put("forwardMode", "merge_one")
+        if (!g.has("forwardMergeHeader") || g.isNull("forwardMergeHeader")) g.put("forwardMergeHeader", "〔合并转发〕")
+        if (!g.has("mediaBaseUrl") || g.isNull("mediaBaseUrl")) g.put("mediaBaseUrl", "")
+        if (!g.has("mediaBase64Limit") || g.isNull("mediaBase64Limit")) g.put("mediaBase64Limit", 4L * 1024 * 1024)
+        if (!g.has("sendRatePerSec") || g.isNull("sendRatePerSec")) g.put("sendRatePerSec", 5)
+        if (!g.has("kernelCallTimeoutMs") || g.isNull("kernelCallTimeoutMs")) g.put("kernelCallTimeoutMs", 30000)
+        if (!g.has("reverse_reconnect_min_ms") || g.isNull("reverse_reconnect_min_ms")) g.put("reverse_reconnect_min_ms", 3000)
+        if (!g.has("reverse_reconnect_max_ms") || g.isNull("reverse_reconnect_max_ms")) g.put("reverse_reconnect_max_ms", 60000)
+        if (!g.has("post_timeout_ms") || g.isNull("post_timeout_ms")) g.put("post_timeout_ms", 10000)
+        if (!g.has("post_queue_size") || g.isNull("post_queue_size")) g.put("post_queue_size", 1024)
+        if (!g.has("event_queue_size") || g.isNull("event_queue_size")) g.put("event_queue_size", 8192)
+        if (!g.has("kernel_probe_delay_ms") || g.isNull("kernel_probe_delay_ms")) g.put("kernel_probe_delay_ms", 5000)
+        if (!g.has("webui_dir") || g.isNull("webui_dir")) g.put("webui_dir", "webui")
+        if (!g.has("autoMarkRead") || g.isNull("autoMarkRead")) g.put("autoMarkRead", true)
+        if (!g.has("readReportBatch") || g.isNull("readReportBatch")) g.put("readReportBatch", 10)
+        if (!g.has("readReportIntervalSec") || g.isNull("readReportIntervalSec")) g.put("readReportIntervalSec", 60L)
+        if (!g.has("readReportMinGapMs") || g.isNull("readReportMinGapMs")) g.put("readReportMinGapMs", 1500L)
+        if (!g.has("readReportMaxPerMin") || g.isNull("readReportMaxPerMin")) g.put("readReportMaxPerMin", 18)
+        if (!g.has("silenceSyncThresholdSec") || g.isNull("silenceSyncThresholdSec")) g.put("silenceSyncThresholdSec", 600L)
+        if (!g.has("silenceSyncMaxAttempts") || g.isNull("silenceSyncMaxAttempts")) g.put("silenceSyncMaxAttempts", 3)
         // 进程级行为(原先误放在每条连接里,见 heartbeatInterval 的注释)。
         // 只在缺失时写入,不覆盖旧配置里已有的值。
-        //
-        // 注意:写入前必须先把老连接项里的同名值迁过来。否则 fillDefaults() 每次启动
-        // 都无条件补默认值,general 里就"永远有值",general*OrServer 的 primaryWsServer()
-        // 回落分支成了死代码 —— 老 v2 用户在 wsServers[0] 配的 heartbeat /
-        // messageFormat:"string" / reportSelfMessage:false 会被静默覆盖成默认值。
-        if (!g.has("heartbeat")) {
-            g.put("heartbeat", legacyServerField("heartbeat") { it.optLong("heartbeat", 5000) } ?: 5000)
+        if (!g.has("heartbeat") || g.isNull("heartbeat")) {
+            g.put("heartbeat", legacyServerField(target, "heartbeat") { it.optLong("heartbeat", 5000) } ?: 5000)
         }
-        if (!g.has("reportSelfMessage")) {
-            g.put("reportSelfMessage", legacyServerField("reportSelfMessage") { it.optBoolean("reportSelfMessage", true) } ?: true)
+        if (!g.has("reportSelfMessage") || g.isNull("reportSelfMessage")) {
+            g.put("reportSelfMessage", legacyServerField(target, "reportSelfMessage") { it.optBoolean("reportSelfMessage", true) } ?: true)
         }
-        if (!g.has("messageFormat")) {
-            g.put("messageFormat", legacyServerField("messageFormat") { it.optString("messageFormat", "array") } ?: "array")
+        if (!g.has("messageFormat") || g.isNull("messageFormat")) {
+            g.put("messageFormat", legacyServerField(target, "messageFormat") { it.optString("messageFormat", "array") } ?: "array")
         }
     }
 
     /**
      * 从旧连接项里取一个即将迁移到 `general` 的字段。
-     *
-     * 老配置把 heartbeat / messageFormat / reportSelfMessage 写在每条连接项里;
-     * 现在统一到 general 级,迁移时按"第一个显式写了该字段的启用项"取值,
-     * 找不到则返回 null 由调用方兜默认值。
      */
-    private fun <T> legacyServerField(key: String, read: (JSONObject) -> T): T? {
-        val arr = wsServers()
-        // 优先看启用的连接项(与 primaryWsServer 的语义一致),再兜所有项
+    private fun <T> legacyServerField(target: JSONObject, key: String, read: (JSONObject) -> T): T? {
+        val arr = target.optJSONObject("network")?.optJSONArray("wsServers") ?: return null
         var fallback: T? = null
         for (i in 0 until arr.length()) {
             val o = arr.optJSONObject(i) ?: continue
-            if (!o.has(key)) continue
+            if (!o.has(key) || o.isNull(key)) continue
             val value = read(o)
             if (o.optBoolean("enabled", true)) return value
             if (fallback == null) fallback = value
@@ -224,10 +279,9 @@ object Config {
 
     @Synchronized
     fun save() {
-        val f = file ?: return
+        if (file == null) return
         try {
-            f.parentFile?.mkdirs()
-            f.writeText(root.toString(2))
+            persist(root)
         } catch (t: Throwable) {
             PicoLog.e("config save failed", t)
         }
@@ -256,21 +310,34 @@ object Config {
         return arr.optJSONObject(0) ?: JSONObject()
     }
 
-    val webuiHost: String get() = webui().optString("host", "0.0.0.0")
-    val webuiPort: Int get() = webui().optInt("port", 6099)
-    val webuiPasswordInitialized: Boolean get() {
-        val w = webui()
-        return w.optBoolean("passwordInitialized", false) &&
-            w.optString("passwordSalt", "").isNotEmpty() && w.optString("passwordHash", "").isNotEmpty()
-    }
+    val webuiHost: String
+        get() = webui().let { w ->
+            if (w.isNull("host")) "0.0.0.0" else w.optString("host", "0.0.0.0").ifBlank { "0.0.0.0" }
+        }
+
+    val webuiPort: Int
+        get() = webui().optInt("port", 6099).let { if (it in 1..65535) it else 6099 }
+
+    val webuiPasswordInitialized: Boolean
+        get() {
+            val w = webui()
+            return w.optBoolean("passwordInitialized", false) &&
+                !w.isNull("passwordSalt") && !w.isNull("passwordHash") &&
+                w.optString("passwordSalt", "").isNotEmpty() && w.optString("passwordHash", "").isNotEmpty()
+        }
+
     fun verifyWebuiPassword(password: String): Boolean {
-        if (!webuiPasswordInitialized) {
+        val snap = root
+        val w = snap.optJSONObject("webui") ?: JSONObject()
+        val initialized = w.optBoolean("passwordInitialized", false) &&
+            !w.isNull("passwordSalt") && !w.isNull("passwordHash") &&
+            w.optString("passwordSalt", "").isNotEmpty() && w.optString("passwordHash", "").isNotEmpty()
+        if (!initialized) {
             return MessageDigest.isEqual(
                 password.toByteArray(Charsets.UTF_8),
                 DEFAULT_WEBUI_PASSWORD.toByteArray(Charsets.UTF_8)
             )
         }
-        val w = webui()
         return try {
             val salt = Base64.decode(w.optString("passwordSalt"), Base64.NO_WRAP)
             val expected = Base64.decode(w.optString("passwordHash"), Base64.NO_WRAP)
@@ -285,94 +352,251 @@ object Config {
     @Synchronized
     fun initializeWebuiPassword(password: String): Boolean {
         if (webuiPasswordInitialized) return false
-        val w = root.optJSONObject("webui") ?: JSONObject().also { root.put("webui", it) }
+        val next = JSONObject(root.toString())
+        val w = next.optJSONObject("webui") ?: JSONObject().also { next.put("webui", it) }
         storePasswordHash(w, password)
-        save()
-        return true
+        return try {
+            persist(next)
+            root = next
+            true
+        } catch (t: Throwable) {
+            PicoLog.e("webui password initialization persist failed", t)
+            false
+        }
     }
 
     /**
      * 修改已初始化的密码,**必须验证旧密码**。
      *
-     * docs/config/webui.md 承诺可在控制台修改密码,而实现原先只允许首次设置,
-     * 忘记密码后没有任何自救路径(配置文件里只有 PBKDF2 派生值)。
-     *
-     * @return true 已修改;false 旧密码不正确或尚未初始化(后者应走 initialize)。
+     * @return true 已修改并落盘;false 旧密码不正确、尚未初始化或落盘失败(保持原状态不变)。
      */
     @Synchronized
     fun changeWebuiPassword(currentPassword: String, newPassword: String): Boolean {
         if (!webuiPasswordInitialized) return false
         if (!verifyWebuiPassword(currentPassword)) return false
-        val w = root.optJSONObject("webui") ?: return false
+        val next = JSONObject(root.toString())
+        val w = next.optJSONObject("webui") ?: return false
         storePasswordHash(w, newPassword)
-        save()
-        return true
+        return try {
+            persist(next)
+            root = next
+            true
+        } catch (t: Throwable) {
+            PicoLog.e("webui password change persist failed", t)
+            false
+        }
     }
 
     /** 写回 WebUI 提交的 AppConfig(webui.host/port + network + general),token 不在此改。 */
     @Synchronized
     fun applyAppConfig(patch: JSONObject) {
         val previous = root
-        root = JSONObject(previous.toString())
-        try {
+        val next = JSONObject(previous.toString())
+        val prevNetwork = previous.optJSONObject("network") ?: JSONObject()
+
+        patch.optJSONObject("network")?.let { net ->
+            val netCopy = JSONObject(net.toString())
             // 先还原 "***" 掩码,再整块替换 network —— 顺序反了就会把掩码写成真值
-            patch.optJSONObject("network")?.let { net ->
-                restoreMaskedConnectionSecrets(net)
-                root.put("network", net)
-            }
-            patch.optJSONObject("general")?.let { g ->
-                // 保留不在表单里的调优项
-                val cur = root.optJSONObject("general") ?: JSONObject()
-                val keys = g.keys()
-                while (keys.hasNext()) {
-                    val k = keys.next()
+            restoreMaskedConnectionSecrets(netCopy, prevNetwork)
+            val netErrors = validateNetwork(netCopy)
+            require(netErrors.isEmpty()) { netErrors.joinToString("；") }
+            next.put("network", netCopy)
+        }
+        patch.optJSONObject("general")?.let { g ->
+            // 保留不在表单里的调优项
+            val cur = next.optJSONObject("general") ?: JSONObject()
+            val keys = g.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                if (k == "webui_dir" || k == "webuiDir") {
+                    val v = if (g.isNull(k)) "" else g.optString(k, "").trim()
+                    require(isSafeWebuiDirValue(v)) { "general.webui_dir 必须位于 webui 目录内" }
+                    cur.put("webui_dir", v)
+                    cur.remove("webuiDir")
+                } else {
                     cur.put(k, g.get(k))
                 }
-                root.put("general", cur)
             }
-            patch.optJSONObject("webui")?.let { w ->
-                val cur = root.optJSONObject("webui") ?: JSONObject()
-                if (w.has("host")) cur.put("host", w.get("host"))
-                if (w.has("port")) cur.put("port", w.get("port"))
-                root.put("webui", cur)
-            }
-            fillDefaults()
-            persist()
-        } catch (error: Throwable) {
-            root = previous
-            throw error
+            next.put("general", cur)
         }
+        patch.optJSONObject("webui")?.let { w ->
+            val webuiErrors = validateWebui(w)
+            require(webuiErrors.isEmpty()) { webuiErrors.joinToString("；") }
+            val cur = next.optJSONObject("webui") ?: JSONObject()
+            if (w.has("host") && !w.isNull("host")) cur.put("host", w.optString("host").trim())
+            if (w.has("port") && !w.isNull("port")) cur.put("port", w.optInt("port"))
+            next.put("webui", cur)
+        }
+        fillDefaults(next)
+        sanitizeWebuiDir(next)
+        persist(next)
+        root = next
     }
 
     @Synchronized
     fun replaceConfig(candidate: JSONObject) {
         require(candidate.optInt("version", 0) == 2) { "文件编辑仅支持 version: 2 配置" }
-        val errors = validateNetwork(candidate.optJSONObject("network") ?: JSONObject())
-        require(errors.isEmpty()) { errors.joinToString("；") }
         val previous = root
-        root = JSONObject(candidate.toString())
-        try {
-            fillDefaults()
-            persist()
-        } catch (error: Throwable) {
-            root = previous
-            throw error
+        val next = JSONObject(candidate.toString())
+
+        val webuiErrors = validateWebui(next.optJSONObject("webui"))
+        require(webuiErrors.isEmpty()) { webuiErrors.joinToString("；") }
+
+        validateWebuiDirField(next)
+
+        val netErrors = validateNetwork(next.optJSONObject("network") ?: JSONObject())
+        require(netErrors.isEmpty()) { netErrors.joinToString("；") }
+
+        // 禁止通过原始配置文件编辑绕过改密流程或重置密码派生值
+        preserveWebuiCredentials(previous, next)
+
+        fillDefaults(next)
+        sanitizeWebuiDir(next)
+        persist(next)
+        root = next
+    }
+
+    private fun preserveWebuiCredentials(previous: JSONObject, next: JSONObject) {
+        val prevWebui = previous.optJSONObject("webui")
+        val nextWebui = next.optJSONObject("webui") ?: JSONObject().also { next.put("webui", it) }
+        nextWebui.remove("token")
+        nextWebui.remove("tokenIsDefault")
+        val prevSalt = prevWebui?.takeIf { !it.isNull("passwordSalt") }?.optString("passwordSalt", "") ?: ""
+        val prevHash = prevWebui?.takeIf { !it.isNull("passwordHash") }?.optString("passwordHash", "") ?: ""
+        val prevInit = prevWebui?.optBoolean("passwordInitialized", false) == true &&
+            prevSalt.isNotEmpty() && prevHash.isNotEmpty()
+        if (prevInit) {
+            nextWebui.put("passwordInitialized", true)
+            nextWebui.put("passwordSalt", prevSalt)
+            nextWebui.put("passwordHash", prevHash)
+        } else {
+            nextWebui.put("passwordInitialized", false)
+            nextWebui.remove("passwordSalt")
+            nextWebui.remove("passwordHash")
         }
     }
 
-    private fun persist() {
+    private fun validateWebui(webui: JSONObject?): List<String> {
+        if (webui == null) return emptyList()
+        val errors = ArrayList<String>()
+        if (webui.has("host")) {
+            val host = if (webui.isNull("host")) "" else webui.optString("host", "").trim()
+            if (host.isEmpty()) errors.add("控制台监听地址不能为空")
+        }
+        if (webui.has("port")) {
+            val port = if (webui.isNull("port")) -1 else webui.optInt("port", -1)
+            if (port !in 1..65535) errors.add("控制台端口必须在 1-65535 之间")
+        }
+        return errors
+    }
+
+    private fun validateWebuiDirField(candidate: JSONObject) {
+        for (rootKey in arrayOf("webui_dir", "webuiDir")) {
+            if (candidate.has(rootKey)) {
+                val v = if (candidate.isNull(rootKey)) "" else candidate.optString(rootKey, "").trim()
+                require(isSafeWebuiDirValue(v)) { "general.webui_dir 必须位于 webui 目录内" }
+                candidate.remove(rootKey)
+            }
+        }
+        val g = candidate.optJSONObject("general") ?: return
+        for (key in arrayOf("webui_dir", "webuiDir")) {
+            if (g.has(key)) {
+                val v = if (g.isNull(key)) "" else g.optString(key, "").trim()
+                require(isSafeWebuiDirValue(v)) { "general.webui_dir 必须位于 webui 目录内" }
+                if (key == "webuiDir") {
+                    g.put("webui_dir", v)
+                    g.remove("webuiDir")
+                }
+            }
+        }
+    }
+
+    private fun sanitizeWebuiDir(target: JSONObject): Boolean {
+        var changed = false
+        for (rootKey in arrayOf("webui_dir", "webuiDir")) {
+            if (target.has(rootKey)) {
+                target.remove(rootKey)
+                changed = true
+            }
+        }
+        val g = target.optJSONObject("general") ?: return changed
+        if (g.has("webuiDir")) {
+            val v = if (g.isNull("webuiDir")) "" else g.optString("webuiDir", "").trim()
+            g.remove("webuiDir")
+            if (isSafeWebuiDirValue(v) && !g.has("webui_dir")) g.put("webui_dir", v)
+            changed = true
+        }
+        val cur = if (g.isNull("webui_dir")) "" else g.optString("webui_dir", "webui").trim()
+        if (!isSafeWebuiDirValue(cur)) {
+            PicoLog.w("unsafe general.webui_dir rejected, falling back to 'webui'")
+            g.put("webui_dir", "webui")
+            changed = true
+        }
+        return changed
+    }
+
+    private fun isSafeWebuiDirValue(raw: String): Boolean {
+        if (raw.isBlank() || raw.indexOf('\u0000') >= 0) return false
+        val normalized = raw.replace('\\', '/')
+        if (normalized.startsWith("/")) return false
+        if (normalized.split('/').any { it == ".." }) return false
+        if (!::dataDir.isInitialized) return normalized == "webui" || normalized.startsWith("webui/")
+        return try {
+            val base = File(dataDir, "webui").canonicalFile
+            val candidate = File(dataDir, normalized).canonicalFile
+            candidate.path == base.path || candidate.path.startsWith(base.path + File.separator)
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    private fun persist(snapshot: JSONObject) {
         val target = checkNotNull(file) { "配置文件尚未初始化" }
-        val temporary = File(target.parentFile, target.name + ".tmp")
+        val parent = target.parentFile
+        if (parent != null && !parent.exists()) {
+            check(parent.mkdirs() || parent.isDirectory) { "无法创建配置目录: ${parent.absolutePath}" }
+        }
+        val temporary = File(parent, "${target.name}.${System.nanoTime()}.tmp")
+        val bytes = snapshot.toString(2).toByteArray(Charsets.UTF_8)
         try {
-            temporary.writeText(root.toString(2), Charsets.UTF_8)
-            check(temporary.renameTo(target)) { "无法替换配置文件" }
+            writePrivateBytes(temporary, bytes)
+            if (!temporary.renameTo(target)) {
+                throw IOException("无法原子替换配置文件: ${target.absolutePath}")
+            }
+            restrictPermissions(target)
         } finally {
-            temporary.delete()
+            if (temporary.exists()) temporary.delete()
+        }
+    }
+
+    private fun writePrivateBytes(target: File, bytes: ByteArray) {
+        target.parentFile?.mkdirs()
+        FileOutputStream(target).use { fos ->
+            restrictPermissions(target)
+            fos.write(bytes)
+            fos.flush()
+            fos.fd.sync()
+        }
+        restrictPermissions(target)
+    }
+
+    private fun restrictPermissions(f: File) {
+        try {
+            Os.chmod(f.path, OWNER_RW_MODE)
+        } catch (_: Throwable) {
+            try {
+                f.setReadable(false, false)
+                f.setWritable(false, false)
+                f.setExecutable(false, false)
+                f.setReadable(true, true)
+                f.setWritable(true, true)
+            } catch (_: Throwable) {
+            }
         }
     }
 
     /**
-     * WebUI
+     * WebUI 网络配置校验。
      */
     fun validateNetwork(candidate: JSONObject = network()): List<String> {
         val errors = ArrayList<String>()
@@ -389,11 +613,16 @@ object Config {
             val o = arr.optJSONObject(i) ?: continue
             if (!o.optBoolean("enabled", true)) continue
             val name = o.optString("name", "$kind ${i + 1}")
-            val host = o.optString("host", "").trim()
+            val host = if (o.isNull("host")) "" else o.optString("host", "").trim()
+            val port = if (o.isNull("port")) -1 else o.optInt("port", -1)
+            val token = if (o.isNull("token")) "" else o.optString("token", "")
             if (host.isEmpty()) {
                 errors.add("$name: 监听地址不能为空")
-            } else if (!isLoopbackHost(host) && o.optString("token", "").isBlank()) {
+            } else if (!isLoopbackHost(host) && token.isBlank()) {
                 errors.add("$name: 非回环监听地址必须填写 Access Token")
+            }
+            if (port !in 1..65535) {
+                errors.add("$name: 端口必须在 1-65535 之间")
             }
         }
     }
@@ -404,11 +633,12 @@ object Config {
             val o = arr.optJSONObject(i) ?: continue
             if (!o.optBoolean("enabled", true)) continue
             val name = o.optString("name", "$kind ${i + 1}")
-            val url = o.optString("url", "").trim()
+            val url = if (o.isNull("url")) "" else o.optString("url", "").trim()
+            val token = if (o.isNull("token")) "" else o.optString("token", "")
             val host = try { URI(url).host ?: "" } catch (_: Throwable) { "" }
             if (host.isEmpty()) {
                 errors.add("$name: 目标地址无效")
-            } else if (!isLoopbackHost(host) && o.optString("token", "").isBlank()) {
+            } else if (!isLoopbackHost(host) && token.isBlank()) {
                 errors.add("$name: 非回环目标地址必须填写 Access Token")
             }
         }
@@ -425,16 +655,25 @@ object Config {
     }
 
     /** GET /api/config 不暴露密码派生值。 */
-    fun appConfigJson(): JSONObject = JSONObject()
-        .put(
-            "webui",
-            JSONObject()
-                .put("host", webuiHost)
-                .put("port", webuiPort)
-                .put("passwordInitialized", webuiPasswordInitialized)
-        )
-        .put("network", JSONObject(network().toString()))
-        .put("general", JSONObject(general().toString()))
+    fun appConfigJson(): JSONObject {
+        val snap = root
+        val w = snap.optJSONObject("webui") ?: JSONObject()
+        val host = if (w.isNull("host")) "0.0.0.0" else w.optString("host", "0.0.0.0").ifBlank { "0.0.0.0" }
+        val port = w.optInt("port", 6099).let { if (it in 1..65535) it else 6099 }
+        val init = w.optBoolean("passwordInitialized", false) &&
+            !w.isNull("passwordSalt") && !w.isNull("passwordHash") &&
+            w.optString("passwordSalt", "").isNotEmpty() && w.optString("passwordHash", "").isNotEmpty()
+        return JSONObject()
+            .put(
+                "webui",
+                JSONObject()
+                    .put("host", host)
+                    .put("port", port)
+                    .put("passwordInitialized", init)
+            )
+            .put("network", JSONObject((snap.optJSONObject("network") ?: JSONObject()).toString()))
+            .put("general", JSONObject((snap.optJSONObject("general") ?: JSONObject()).toString()))
+    }
 
     /** [redactedRaw] 使用的掩码;回写时原样带回来表示"保持原值不动"。 */
     private const val REDACTED_MASK = "***"
@@ -443,24 +682,25 @@ object Config {
         arrayOf("wsServers", "wsClients", "httpServers", "httpClients")
 
     fun redactedRaw(): JSONObject {
-        val copy = JSONObject(root.toString())
+        val snap = root
+        val copy = JSONObject(snap.toString())
         copy.remove("access_token")
         copy.optJSONObject("webui")?.apply {
+            val init = optBoolean("passwordInitialized", false) &&
+                !isNull("passwordSalt") && !isNull("passwordHash") &&
+                optString("passwordSalt", "").isNotEmpty() && optString("passwordHash", "").isNotEmpty()
             remove("token")
             remove("passwordSalt")
             remove("passwordHash")
-            put("passwordInitialized", webuiPasswordInitialized)
+            put("passwordInitialized", init)
         }
-        // 连接项里的 token / secret 与 webui 密码同级敏感:这个对象会经
-        // GET /api/pico/config 与 _pico_config 直接下发给调用方,原样返回等于把
-        // 所有 Access Token 明文交出去。
         copy.optJSONObject("network")?.let { net ->
             for (key in SECRET_CONNECTION_ARRAYS) {
                 val arr = net.optJSONArray(key) ?: continue
                 for (i in 0 until arr.length()) {
                     arr.optJSONObject(i)?.apply {
-                        if (optString("token", "").isNotEmpty()) put("token", REDACTED_MASK)
-                        if (optString("secret", "").isNotEmpty()) put("secret", REDACTED_MASK)
+                        if (!isNull("token") && optString("token", "").isNotEmpty()) put("token", REDACTED_MASK)
+                        if (!isNull("secret") && optString("secret", "").isNotEmpty()) put("secret", REDACTED_MASK)
                     }
                 }
             }
@@ -470,13 +710,8 @@ object Config {
 
     /**
      * 把 `GET /api/pico/config` 下发过的掩码原样还原成当前真值。
-     *
-     * 客户端常见的用法是"取回配置 → 改其中几项 → 整份 PUT 回来"。若不还原,
-     * 掩码 `***` 会被当成真 token 落盘,下次启动整条连接就鉴权失败了。
-     * 按连接项 `id` 对齐;新条目没有 id 匹配就保留客户端给的值。
      */
-    private fun restoreMaskedConnectionSecrets(incoming: JSONObject) {
-        val current = network()
+    private fun restoreMaskedConnectionSecrets(incoming: JSONObject, current: JSONObject) {
         for (key in SECRET_CONNECTION_ARRAYS) {
             val inArr = incoming.optJSONArray(key) ?: continue
             val curArr = current.optJSONArray(key) ?: continue
@@ -490,12 +725,8 @@ object Config {
                 val item = inArr.optJSONObject(i) ?: continue
                 val old = byId[item.optString("id", "")] ?: continue
                 for (field in arrayOf("token", "secret")) {
-                    if (item.optString(field, "") == REDACTED_MASK) {
-                        // 只有原本就有密文时才还原。否则用户给一个**本来没密码**的连接项
-                        // 填 "***" 会被还原成空串(看起来像"设置成功了"),而且会掩盖
-                        // 一个真实的输入错误 —— 这里保留客户端给的值并记一条日志,
-                        // 让它至少是可见的,而不是静默变成空凭证。
-                        val oldValue = old.optString(field, "")
+                    if (!item.isNull(field) && item.optString(field, "") == REDACTED_MASK) {
+                        val oldValue = if (old.isNull(field)) "" else old.optString(field, "")
                         if (oldValue.isNotEmpty()) {
                             item.put(field, oldValue)
                         } else {
@@ -514,14 +745,6 @@ object Config {
     val port: Int get() = primaryWsServer().optInt("port", 3001)
     val accessToken: String get() = primaryWsServer().optString("token", "")
 
-    /**
-     * 以下三项是**进程级**行为,不是连接级。
-     *
-     * WebUI 曾把它们渲染在每条连接的编辑表单里,但实现只读 `primaryWsServer()`
-     * —— 反向 WS 部署下该数组为空,于是一律落默认值:关不掉自身消息上报、
-     * `messageFormat=string` 无效、`heartbeat: 0` 也关不掉。现在明确改为
-     * `general` 级配置,并回落到旧连接项里的值以兼容老配置文件。
-     */
     val heartbeatInterval: Long
         get() = generalLongOrServer("heartbeat", "heartbeat", 5000)
 
@@ -533,27 +756,27 @@ object Config {
 
     private fun generalLongOrServer(generalKey: String, serverKey: String, def: Long): Long {
         val g = general()
-        if (g.has(generalKey)) return g.optLong(generalKey, def)
+        if (g.has(generalKey) && !g.isNull(generalKey)) return g.optLong(generalKey, def)
         val s = primaryWsServer()
-        return if (s.has(serverKey)) s.optLong(serverKey, def) else def
+        return if (s.has(serverKey) && !s.isNull(serverKey)) s.optLong(serverKey, def) else def
     }
 
     private fun generalBoolOrServer(generalKey: String, serverKey: String, def: Boolean): Boolean {
         val g = general()
-        if (g.has(generalKey)) return g.optBoolean(generalKey, def)
+        if (g.has(generalKey) && !g.isNull(generalKey)) return g.optBoolean(generalKey, def)
         val s = primaryWsServer()
-        return if (s.has(serverKey)) s.optBoolean(serverKey, def) else def
+        return if (s.has(serverKey) && !s.isNull(serverKey)) s.optBoolean(serverKey, def) else def
     }
 
     private fun generalStrOrServer(generalKey: String, serverKey: String, def: String): String {
         val g = general()
-        if (g.has(generalKey)) return g.optString(generalKey, def)
+        if (g.has(generalKey) && !g.isNull(generalKey)) return g.optString(generalKey, def)
         val s = primaryWsServer()
-        return if (s.has(serverKey)) s.optString(serverKey, def) else def
+        return if (s.has(serverKey) && !s.isNull(serverKey)) s.optString(serverKey, def) else def
     }
 
-    val kernelTimeoutMs: Long get() = long("kernelCallTimeoutMs", 30000)
-    val eventQueueSize: Int get() = int("event_queue_size", 8192)
+    val kernelTimeoutMs: Long get() = long("kernelCallTimeoutMs", 30000).coerceAtLeast(1000L)
+    val eventQueueSize: Int get() = int("event_queue_size", 8192).coerceIn(16, 65536)
     val sendRatePerSec: Int get() = int("sendRatePerSec", 5)
     val autoMarkRead: Boolean get() = bool("autoMarkRead", true)
     val readReportBatch: Int get() = int("readReportBatch", 10).coerceAtLeast(1)
@@ -566,7 +789,23 @@ object Config {
             return if (sec <= 0L) 0L else sec.coerceAtLeast(60L) * 1000L
         }
     val silenceSyncMaxAttempts: Int get() = int("silenceSyncMaxAttempts", 3).coerceIn(0, 10)
-    val webuiDir: File get() = File(dataDir, str("webui_dir", "webui"))
+    val webuiDir: File
+        get() {
+            val base = File(dataDir, "webui")
+            val raw = str("webui_dir", "webui").trim()
+            if (!isSafeWebuiDirValue(raw)) return base
+            return try {
+                val baseCanon = base.canonicalFile
+                val target = File(dataDir, raw.replace('\\', '/')).canonicalFile
+                if (target.path == baseCanon.path || target.path.startsWith(baseCanon.path + File.separator)) {
+                    target
+                } else {
+                    baseCanon
+                }
+            } catch (_: Throwable) {
+                base
+            }
+        }
     /** WebUI 文件管理器以当前生效配置文件所在的 pico-onebot 目录为根。 */
     val fileManagerDir: File get() = file?.parentFile ?: dataDir
     val activeConfigFile: File? get() = file
@@ -582,7 +821,7 @@ object Config {
         for (i in 0 until arr.length()) {
             val o = arr.optJSONObject(i) ?: continue
             if (!o.optBoolean("enabled", true)) continue
-            val u = o.optString("url", "")
+            val u = if (o.isNull("url")) "" else o.optString("url", "")
             if (u.isNotEmpty()) out.add(u)
         }
         return out
@@ -604,17 +843,23 @@ object Config {
         else -> null
     }
 
+    private fun optNonNull(obj: JSONObject, key: String): Any? {
+        if (!obj.has(key) || obj.isNull(key)) return null
+        val v = obj.opt(key)
+        return if (v == null || v === JSONObject.NULL) null else v
+    }
+
     private fun lookup(key: String): Any? {
-        val g = root.optJSONObject("general")
+        val snap = root
+        val g = snap.optJSONObject("general")
         if (g != null) {
-            if (g.has(key)) return g.opt(key)
+            optNonNull(g, key)?.let { return it }
             val camel = toCamel(key)
-            if (camel != key && g.has(camel)) return g.opt(camel)
+            if (camel != key) optNonNull(g, camel)?.let { return it }
             val snake = toSnake(key)
-            if (snake != key && g.has(snake)) return g.opt(snake)
+            if (snake != key) optNonNull(g, snake)?.let { return it }
         }
-        if (root.has(key)) return root.opt(key)
-        return null
+        return optNonNull(snap, key)
     }
 
     private fun toCamel(s: String): String {
@@ -638,22 +883,19 @@ object Config {
 
     private fun flatUrls(v: Any?): List<String> = when (v) {
         is String -> if (v.isEmpty()) emptyList() else listOf(v)
-        is JSONArray -> (0 until v.length()).mapNotNull { i -> v.optString(i, "").ifEmpty { null } }
+        is JSONArray -> (0 until v.length()).mapNotNull { i ->
+            if (v.isNull(i)) null else v.optString(i, "").ifEmpty { null }
+        }
         else -> emptyList()
     }
 
-    /**
-     * 每个连接项都必须有**唯一**的 id:运行时的监听/反向连接表按 id 索引,
-     * WebUI 也按 id 回报真实状态。手写配置文件漏了 id 或重复了,状态就会张冠李戴,
-     * 所以在这里补齐(WebUI 新建时自带 id,这条只兜手写的底)。
-     */
     private fun fillConnectionIds(net: JSONObject) {
         val seen = HashSet<String>()
         for (key in arrayOf("wsServers", "wsClients", "httpServers", "httpClients")) {
             val arr = net.optJSONArray(key) ?: continue
             for (i in 0 until arr.length()) {
                 val o = arr.optJSONObject(i) ?: continue
-                val id = o.optString("id")
+                val id = if (o.isNull("id")) "" else o.optString("id")
                 if (id.isEmpty() || !seen.add(id)) {
                     var fresh = newId()
                     while (!seen.add(fresh)) fresh = newId()
@@ -663,21 +905,13 @@ object Config {
         }
     }
 
-    /**
-     * 补齐监听项的 `cors` / `websocket` 开关。
-     *
-     * 老配置里没有这两个字段。缺省必须与**升级前实际行为**一致,否则用户在
-     * 没做任何操作的情况下会发现 CORS 头没了、或者 WS 连不上:
-     *   - wsServers:两者一直开启
-     *   - httpServers:CORS 一直开启;WS 升级此前也是接受的(同一 HttpServer)
-     */
     private fun fillConnectionFlags(net: JSONObject) {
         fun fill(key: String, cors: Boolean, websocket: Boolean) {
             val arr = net.optJSONArray(key) ?: return
             for (i in 0 until arr.length()) {
                 val o = arr.optJSONObject(i) ?: continue
-                if (!o.has("cors")) o.put("cors", cors)
-                if (!o.has("websocket")) o.put("websocket", websocket)
+                if (!o.has("cors") || o.isNull("cors")) o.put("cors", cors)
+                if (!o.has("websocket") || o.isNull("websocket")) o.put("websocket", websocket)
             }
         }
         fill("wsServers", cors = true, websocket = true)
@@ -689,11 +923,12 @@ object Config {
     ).take(8)
 
     private fun migratePlaintextPassword(webui: JSONObject) {
-        if (webui.optString("passwordSalt", "").isNotEmpty() &&
-            webui.optString("passwordHash", "").isNotEmpty()) {
+        val hasSalt = !webui.isNull("passwordSalt") && webui.optString("passwordSalt", "").isNotEmpty()
+        val hasHash = !webui.isNull("passwordHash") && webui.optString("passwordHash", "").isNotEmpty()
+        if (hasSalt && hasHash) {
             webui.put("passwordInitialized", true)
         } else {
-            val legacy = webui.optString("token", "")
+            val legacy = if (webui.isNull("token")) "" else webui.optString("token", "")
             if (legacy.isNotEmpty() && legacy != DEFAULT_WEBUI_PASSWORD) {
                 storePasswordHash(webui, legacy)
             } else {
@@ -708,8 +943,9 @@ object Config {
 
     private fun storePasswordHash(webui: JSONObject, password: String) {
         val salt = ByteArray(16).also { SecureRandom().nextBytes(it) }
+        val derived = passwordHash(password, salt)
         webui.put("passwordSalt", Base64.encodeToString(salt, Base64.NO_WRAP))
-        webui.put("passwordHash", Base64.encodeToString(passwordHash(password, salt), Base64.NO_WRAP))
+        webui.put("passwordHash", Base64.encodeToString(derived, Base64.NO_WRAP))
         webui.put("passwordInitialized", true)
         webui.remove("token")
         webui.remove("tokenIsDefault")
