@@ -86,7 +86,12 @@ object AdminApi {
                             .put("last_sync_at", Counters.lastSyncAt())
                     )
                 } else {
-                    Ob.failed(Ob.RC_KERNEL_ERROR, "触发消息同步失败: $detail")
+                    val rc = when {
+                        detail.startsWith("kernel not ready") || detail.startsWith("msgService unavailable") -> Ob.RC_NOT_READY
+                        detail.startsWith("sync cooldown") || detail.startsWith("timeout") -> Ob.RC_TIMEOUT
+                        else -> Ob.RC_KERNEL_ERROR
+                    }
+                    Ob.failed(rc, "触发消息同步失败: $detail")
                 }
             }
 
@@ -119,12 +124,37 @@ object AdminApi {
         val d = SystemActions.diagnostics()
         val kernel = d.optJSONObject("kernel") ?: JSONObject()
 
-        val transportReady = Transport.count() > 0 || HttpReporter.targetCount() > 0 || PicoBoot.mediaUrlAvailable()
-        check(
-            "transport",
-            transportReady,
-            "connections=" + Transport.count() + " reporters=" + HttpReporter.targetCount()
-        )
+        var enabledListeners = 0
+        var runningListeners = 0
+        var failedListeners = 0
+        fun inspectListeners(arr: JSONArray) {
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                if (!o.optBoolean("enabled", true)) continue
+                enabledListeners++
+                val id = o.optString("id")
+                if (PicoBoot.listening(id)) {
+                    runningListeners++
+                } else {
+                    failedListeners++
+                }
+            }
+        }
+        inspectListeners(Config.wsServers())
+        inspectListeners(Config.httpServers())
+
+        val activeConns = Transport.count()
+        val eventConsumers = Transport.eventConsumerCount()
+        val reporters = HttpReporter.targetCount()
+        val transportReady = failedListeners == 0 && (runningListeners > 0 || activeConns > 0 || reporters > 0)
+        val transportDetail = buildString {
+            append("listeners=").append(runningListeners).append('/').append(enabledListeners)
+            append(" connections=").append(activeConns)
+            append(" event_consumers=").append(eventConsumers)
+            append(" reporters=").append(reporters)
+            if (failedListeners > 0) append(" bind_errors=").append(failedListeners)
+        }
+        check("transport", transportReady, transportDetail)
         check("session", kernel.optBoolean("session", false), "KernelServiceUtil 返回的会话对象")
         check("logged_in", kernel.optBoolean("logged_in", false), "AppRuntime.isLogin && uin>0")
         check("msg_listener", kernel.optLong("listener_id", 0) != 0L, "listenerId=" + kernel.optLong("listener_id", 0))

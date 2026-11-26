@@ -57,15 +57,17 @@ object EventBus {
             }
             try {
                 val text = e.toString()
-                val hasConsumers = Transport.count() > 0 || pico.onebot.net.HttpReporter.targetCount() > 0
-                Transport.broadcast(text)
+                val isMeta = e.optString("post_type") == "meta_event"
+                val wsDelivered = Transport.broadcast(text, isMeta)
+                val hasHttpConsumer = pico.onebot.net.HttpReporter.targetCount() > 0
                 pico.onebot.net.HttpReporter.offer(text)
+                val hasConsumers = wsDelivered || hasHttpConsumer
                 if (hasConsumers) {
                     delivered.incrementAndGet()
-                    if (e.optString("post_type") != "meta_event") PicoLog.d("event -> " + brief(e))
+                    if (!isMeta) PicoLog.d("event -> " + brief(e))
                 } else {
                     noConsumer.incrementAndGet()
-                    if (e.optString("post_type") != "meta_event") {
+                    if (!isMeta) {
                         PicoLog.w("event has no active WS/HTTP consumer: " + brief(e))
                     }
                 }

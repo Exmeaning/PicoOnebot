@@ -9,6 +9,7 @@ import pico.onebot.core.PicoLog
 import pico.onebot.proto.Ob
 import java.io.BufferedInputStream
 import java.io.ByteArrayOutputStream
+import java.io.EOFException
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
@@ -21,6 +22,7 @@ import java.net.SocketTimeoutException
 import java.net.URI
 import java.net.URLDecoder
 import java.security.MessageDigest
+import java.util.Locale
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.SynchronousQueue
@@ -172,11 +174,11 @@ class HttpServer(
 
             val requestLine = readLineWithDeadline(sock, ins, headerDeadlineNanos) ?: return
             val parts = requestLine.split(" ")
-            if (parts.size < 2) {
+            if (parts.size < 2 || parts[0].isEmpty() || parts[1].isEmpty()) {
                 writeText(out, 400, "text/plain", "malformed request line")
                 return
             }
-            val method = parts[0].uppercase()
+            val method = parts[0].uppercase(Locale.ROOT)
             val rawPath = parts[1]
 
             val headers = HashMap<String, String>()
@@ -198,7 +200,7 @@ class HttpServer(
                     writeText(out, 400, "text/plain", "malformed header")
                     return
                 }
-                val name = line.substring(0, idx).trim().lowercase()
+                val name = line.substring(0, idx).trim().lowercase(Locale.ROOT)
                 val value = line.substring(idx + 1).trim()
                 if (name == "content-length") {
                     if (contentLengthSeen != null && contentLengthSeen != value) {
@@ -231,7 +233,7 @@ class HttpServer(
                 return
             }
 
-            val upgrade = headers["upgrade"]?.lowercase()
+            val upgrade = headers["upgrade"]?.lowercase(Locale.ROOT)
             if (upgrade == "websocket" && role == Role.ONEBOT && !allowWebSocket) {
                 writeText(out, 400, "text/plain", "websocket disabled for this listener")
                 return
@@ -587,7 +589,7 @@ class HttpServer(
             val body = if (method == "GET") ByteArray(0) else readBody(ins, headers, MAX_BODY_BYTES)
             val params = try {
                 when {
-                    body.isNotEmpty() && (headers["content-type"] ?: "").lowercase().contains("json") ->
+                    body.isNotEmpty() && (headers["content-type"] ?: "").lowercase(Locale.ROOT).contains("json") ->
                         JSONObject(String(body, Charsets.UTF_8))
                     body.isNotEmpty() -> mapToJson(parseQuery(String(body, Charsets.UTF_8)))
                     else -> mapToJson(query)
@@ -741,7 +743,7 @@ class HttpServer(
 
     private fun isJsonContentType(contentType: String?): Boolean {
         if (contentType.isNullOrBlank()) return false
-        val mediaType = contentType.substringBefore(';').trim().lowercase()
+        val mediaType = contentType.substringBefore(';').trim().lowercase(Locale.ROOT)
         return mediaType == "application/json" || mediaType.endsWith("+json")
     }
 
@@ -751,9 +753,9 @@ class HttpServer(
         } catch (_: Throwable) {
             return false
         }
-        val scheme = uri.scheme?.lowercase() ?: return false
+        val scheme = uri.scheme?.lowercase(Locale.ROOT) ?: return false
         if (scheme != "http" && scheme != "https") return false
-        val originHost = uri.host?.trim()?.removePrefix("[")?.removeSuffix("]")?.lowercase() ?: return false
+        val originHost = uri.host?.trim()?.removePrefix("[")?.removeSuffix("]")?.lowercase(Locale.ROOT) ?: return false
         if (originHost.isEmpty()) return false
         if (Config.isLoopbackHost(originHost)) return true
         if (hostHeader.isNullOrBlank()) return false
@@ -774,7 +776,7 @@ class HttpServer(
         if (s.startsWith("[")) {
             val end = s.indexOf(']')
             if (end <= 1) return null
-            val host = s.substring(1, end).lowercase()
+            val host = s.substring(1, end).lowercase(Locale.ROOT)
             val rest = s.substring(end + 1)
             if (rest.isEmpty()) return host to null
             if (!rest.startsWith(":")) return null
@@ -783,11 +785,18 @@ class HttpServer(
         }
         val colon = s.lastIndexOf(':')
         if (colon > 0 && s.indexOf(':') == colon) {
-            val host = s.substring(0, colon).lowercase()
+            val host = s.substring(0, colon).lowercase(Locale.ROOT)
             val p = s.substring(colon + 1).toIntOrNull() ?: return null
             return host to p
         }
-        return s.lowercase() to null
+        return s.lowercase(Locale.ROOT) to null
+    }
+
+    private fun parseStrictContentLength(raw: String): Long {
+        if (raw.isEmpty() || !raw.all { it in '0'..'9' }) {
+            throw HttpError(400, "invalid Content-Length")
+        }
+        return raw.toLongOrNull() ?: throw HttpError(413, "Content-Length exceeds limit")
     }
 
     private fun validateBodyFraming(headers: Map<String, String>) {
@@ -797,17 +806,16 @@ class HttpServer(
             throw HttpError(400, "conflicting Transfer-Encoding and Content-Length")
         }
         if (hasTe) {
-            val codings = headers["transfer-encoding"]!!.split(',').map { it.trim().lowercase() }.filter { it.isNotEmpty() }
-            if (codings.isEmpty() || codings.last() != "chunked") {
+            val codings = headers["transfer-encoding"]!!
+                .split(',')
+                .map { it.trim().lowercase(Locale.ROOT) }
+                .filter { it.isNotEmpty() }
+            if (codings.size != 1 || codings[0] != "chunked") {
                 throw HttpError(400, "unsupported Transfer-Encoding")
             }
         }
         if (hasCl) {
-            val raw = headers["content-length"]!!.trim()
-            val len = raw.toLongOrNull()
-            if (len == null || len < 0L) {
-                throw HttpError(400, "invalid Content-Length")
-            }
+            parseStrictContentLength(headers["content-length"]!!.trim())
         }
     }
 
@@ -821,41 +829,46 @@ class HttpServer(
      * 读请求体,对非法/超长 Content-Length 显式抛 HttpError(400/413),绝不静默截断或降级成空体。
      */
     private fun readBody(ins: InputStream, headers: Map<String, String>, maxBytes: Int): ByteArray {
-        val te = headers["transfer-encoding"]?.lowercase()
+        val te = headers["transfer-encoding"]
         if (te != null) return readChunkedBody(ins, maxBytes)
         val rawLen = headers["content-length"]?.trim() ?: return ByteArray(0)
-        val len = rawLen.toLongOrNull() ?: throw HttpError(400, "invalid Content-Length")
-        if (len < 0L) throw HttpError(400, "negative Content-Length")
+        val len = parseStrictContentLength(rawLen)
         if (len == 0L) return ByteArray(0)
         if (len > maxBytes.toLong()) throw HttpError(413, "request body exceeds $maxBytes bytes")
         val buf = ByteArray(len.toInt())
-        WsFrame.readFully(ins, buf)
+        try {
+            WsFrame.readFully(ins, buf)
+        } catch (_: EOFException) {
+            throw HttpError(400, "truncated request body")
+        }
         return buf
     }
 
     /**
-     * 解析 chunked 编码,严格校验块长、总长、块尾空行与 trailer 行数上限。
+     * 解析 chunked 编码,严格校验块长、总长、块尾空行与 trailer 行数及总字节上限。
      */
     private fun readChunkedBody(ins: InputStream, maxBytes: Int): ByteArray {
         val out = ByteArrayOutputStream()
         while (true) {
             val sizeLine = WsFrame.readLine(ins) ?: throw HttpError(400, "chunked body truncated: missing size line")
             val hex = sizeLine.substringBefore(';').trim()
-            val size = hex.toLongOrNull(16)
-                ?: throw HttpError(400, "chunked body malformed: bad chunk size '$hex'")
-            if (size < 0L) {
-                throw HttpError(400, "chunked body malformed: negative chunk size")
+            if (hex.isEmpty() || !hex.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) {
+                throw HttpError(400, "chunked body malformed: bad chunk size '$hex'")
             }
+            val size = hex.toLongOrNull(16)
+                ?: throw HttpError(413, "chunked body too large")
             if (size > maxBytes.toLong()) {
                 throw HttpError(413, "chunked body too large")
             }
             if (size == 0L) {
                 var trailers = 0
+                var trailerBytes = 0
                 while (true) {
                     val trailer = WsFrame.readLine(ins)
                         ?: throw HttpError(400, "chunked body truncated: missing trailer terminator")
                     if (trailer.isEmpty()) break
-                    if (++trailers > MAX_CHUNK_TRAILERS) {
+                    trailerBytes += trailer.length + 2
+                    if (++trailers > MAX_CHUNK_TRAILERS || trailerBytes > MAX_HEADER_BYTES) {
                         throw HttpError(431, "too many chunked trailers")
                     }
                 }
@@ -865,7 +878,11 @@ class HttpServer(
                 throw HttpError(413, "chunked body too large")
             }
             val chunk = ByteArray(size.toInt())
-            WsFrame.readFully(ins, chunk)
+            try {
+                WsFrame.readFully(ins, chunk)
+            } catch (_: EOFException) {
+                throw HttpError(400, "chunked body truncated")
+            }
             out.write(chunk)
             val term = WsFrame.readLine(ins)
             if (term == null || term.isNotEmpty()) {
@@ -902,21 +919,25 @@ class HttpServer(
     }
 
     private fun sanitizeFilename(name: String): String {
-        val sb = StringBuilder(name.length)
-        for (c in name) {
+        val base = name.substringAfterLast('/').substringAfterLast('\\')
+        val sb = StringBuilder(minOf(base.length, 128))
+        for (c in base) {
+            if (sb.length >= 128) break
             if (c.code in 0x20..0x7E && c != '"' && c != '\\' && c != '/' && c != ';') {
-                sb.append(c)
-            } else if (c.code > 0x7E) {
                 sb.append(c)
             }
         }
-        return sb.toString().ifBlank { "media" }
+        val cleaned = sb.toString().trim().trimStart('.')
+        return cleaned.ifBlank { "media" }
     }
 
     private fun writeCorsPreflight(out: OutputStream) {
         try {
             val head = StringBuilder()
                 .append("HTTP/1.1 204 No Content\r\n")
+                .append("X-Content-Type-Options: nosniff\r\n")
+                .append("X-Frame-Options: DENY\r\n")
+                .append("Referrer-Policy: no-referrer\r\n")
                 .append("Access-Control-Allow-Origin: *\r\n")
                 .append("Access-Control-Allow-Methods: GET, POST, PUT, OPTIONS\r\n")
                 .append("Access-Control-Allow-Headers: Authorization, Content-Type\r\n")
@@ -939,21 +960,25 @@ class HttpServer(
         try {
             val safeName = sanitizeFilename(f.name)
             val mime = mimeOf(f.name)
+            val expectedLen = f.length()
             val head = StringBuilder()
                 .append("HTTP/1.1 200 OK\r\n")
                 .append("Content-Type: ").append(mime).append("\r\n")
-                .append("Content-Length: ").append(f.length()).append("\r\n")
+                .append("Content-Length: ").append(expectedLen).append("\r\n")
                 .append("Content-Disposition: inline; filename=\"").append(safeName).append("\"\r\n")
-                .apply { appendCommonHeaders(this, mime) }
+                .apply { appendCommonHeaders(this, mime, noStore = false) }
                 .append("Connection: close\r\n\r\n")
                 .toString()
             out.write(head.toByteArray(Charsets.UTF_8))
             f.inputStream().use { ins ->
                 val buf = ByteArray(64 * 1024)
-                while (true) {
-                    val n = ins.read(buf)
+                var remaining = expectedLen
+                while (remaining > 0L) {
+                    val toRead = minOf(buf.size.toLong(), remaining).toInt()
+                    val n = ins.read(buf, 0, toRead)
                     if (n < 0) break
                     out.write(buf, 0, n)
+                    remaining -= n
                 }
             }
             out.flush()
@@ -962,7 +987,7 @@ class HttpServer(
         }
     }
 
-    private fun mimeOf(name: String): String = when (name.substringAfterLast('.', "").lowercase()) {
+    private fun mimeOf(name: String): String = when (name.substringAfterLast('.', "").lowercase(Locale.ROOT)) {
         "jpg", "jpeg" -> "image/jpeg"
         "png" -> "image/png"
         "gif" -> "image/gif"
@@ -975,13 +1000,11 @@ class HttpServer(
         else -> "application/octet-stream"
     }
 
-    private fun appendCommonHeaders(sb: StringBuilder, type: String) {
+    private fun appendCommonHeaders(sb: StringBuilder, type: String, noStore: Boolean = false) {
         sb.append("X-Content-Type-Options: nosniff\r\n")
+        sb.append("X-Frame-Options: DENY\r\n")
         sb.append("Referrer-Policy: no-referrer\r\n")
-        if (role == Role.WEBUI) {
-            sb.append("X-Frame-Options: DENY\r\n")
-        }
-        if (type.startsWith("application/json")) {
+        if (noStore || type.startsWith("application/json", ignoreCase = true)) {
             sb.append("Cache-Control: no-store\r\n")
         }
         if (allowCors) {
@@ -998,6 +1021,8 @@ class HttpServer(
         403 -> "Forbidden"
         404 -> "Not Found"
         405 -> "Method Not Allowed"
+        408 -> "Request Timeout"
+        409 -> "Conflict"
         413 -> "Payload Too Large"
         414 -> "URI Too Long"
         415 -> "Unsupported Media Type"
@@ -1005,7 +1030,10 @@ class HttpServer(
         429 -> "Too Many Requests"
         431 -> "Request Header Fields Too Large"
         500 -> "Internal Server Error"
+        501 -> "Not Implemented"
+        502 -> "Bad Gateway"
         503 -> "Service Unavailable"
+        504 -> "Gateway Timeout"
         else -> "Error"
     }
 
@@ -1015,7 +1043,7 @@ class HttpServer(
                 .append("HTTP/1.1 ").append(code).append(' ').append(reasonPhrase(code)).append("\r\n")
                 .append("Content-Type: ").append(type).append("\r\n")
                 .append("Content-Length: ").append(body.size).append("\r\n")
-                .apply { appendCommonHeaders(this, type) }
+                .apply { appendCommonHeaders(this, type, noStore = code >= 400) }
                 .append("Connection: close\r\n\r\n")
                 .toString()
             out.write(head.toByteArray(Charsets.UTF_8))

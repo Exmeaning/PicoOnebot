@@ -82,6 +82,7 @@ object SystemActions {
             Ob.ok(JSONObject().put("refreshed", refreshed))
         }
         ActionRouter.register("_pico_sync_msg") {
+            if (!KernelGate.ready) return@register Ob.notReady("_pico_sync_msg")
             val (ok, detail) = MsgWatchdog.triggerSyncNow("action:_pico_sync_msg")
             if (ok) {
                 Ob.ok(
@@ -91,10 +92,18 @@ object SystemActions {
                         .put("last_sync_at", Counters.lastSyncAt())
                 )
             } else {
-                Ob.failed(Ob.RC_KERNEL_ERROR, "触发消息同步失败: $detail")
+                val rc = when {
+                    detail.startsWith("kernel not ready") || detail.startsWith("msgService unavailable") -> Ob.RC_NOT_READY
+                    detail.startsWith("sync cooldown") || detail.startsWith("timeout") -> Ob.RC_TIMEOUT
+                    else -> Ob.RC_KERNEL_ERROR
+                }
+                Ob.failed(rc, "触发消息同步失败: $detail")
             }
         }
     }
+
+    private const val QR_TTL_SEC = 85
+    private const val QR_REFRESH_WAIT_NS = 3_000_000_000L
 
     private fun getQr(params: JSONObject): JSONObject {
         if (KernelGate.state == KernelGate.State.ONLINE) {
@@ -107,15 +116,47 @@ object SystemActions {
         }
         val forceRefresh = params.optBoolean("refresh", false)
         if (forceRefresh) {
-            PicoLoginManager.refreshQr()
-        }
-        val url = PicoLoginManager.getOrRefreshQr(if (forceRefresh) 3000 else 1000)
-        val info = PicoLoginManager.info()
-        if (url != null) {
-            info.put("status", "ok")
+            val beforeGen = PicoLoginManager.currentQrSnapshot().generation
+            if (PicoLoginManager.refreshQr()) {
+                val deadlineNs = System.nanoTime() + QR_REFRESH_WAIT_NS
+                while ((deadlineNs - System.nanoTime()) > 0L) {
+                    val cur = PicoLoginManager.currentQrSnapshot()
+                    if (cur.generation > beforeGen && !cur.expired && !cur.url.isNullOrEmpty()) {
+                        break
+                    }
+                    try {
+                        Thread.sleep(50)
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        break
+                    }
+                }
+            }
         } else {
-            info.put("status", "waiting_qr")
+            PicoLoginManager.getOrRefreshQr(1000)
         }
+        val snap = PicoLoginManager.currentQrSnapshot()
+        val ageSec = if (snap.receivedAtWallMs <= 0L) {
+            -1
+        } else {
+            ((System.nanoTime() - snap.receivedAtNs).coerceAtLeast(0L) / 1_000_000_000L).toInt()
+        }
+        val expired = snap.expired || (ageSec > QR_TTL_SEC)
+        val hasQr = !snap.url.isNullOrEmpty()
+        val status = when {
+            !hasQr -> "waiting_qr"
+            expired -> "expired"
+            else -> "ok"
+        }
+        val info = JSONObject()
+            .put("url", snap.url ?: "")
+            .put("expired", expired)
+            .put("age_seconds", ageSec)
+            .put("has_qr", hasQr)
+            .put("scanned", snap.scanned)
+            .put("has_fragment", PicoLoginManager.qrFragmentRef?.get() != null)
+            .put("has_state_fragment", PicoLoginManager.hasLoginEntry)
+            .put("status", status)
         return Ob.ok(info)
     }
 

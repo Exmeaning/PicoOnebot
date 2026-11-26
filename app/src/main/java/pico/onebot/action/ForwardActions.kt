@@ -113,10 +113,14 @@ object ForwardActions {
             }
             val node = try {
                 toNode(seg.optJSONObject("data") ?: JSONObject(), i)
+            } catch (t: MsgCodec.BadSegmentParam) {
+                return Ob.failed(Ob.RC_BAD_PARAM, "node[$i] 参数非法: " + (t.message ?: ""))
             } catch (t: MsgCodec.UnsupportedSegment) {
                 return Ob.failed(Ob.RC_UNSUPPORTED, "node[$i] 含不支持的段: " + t.type)
             } catch (t: pico.onebot.media.MediaFiles.ResolveError) {
                 return Ob.failed(Ob.RC_BAD_PARAM, "node[$i] 媒体来源无法读取: " + t.message)
+            } catch (t: pico.onebot.media.MediaDownloader.DownloadError) {
+                return Ob.failed(Ob.RC_KERNEL_ERROR, "node[$i] 媒体下载失败: " + t.message)
             } catch (t: pico.onebot.media.MediaBuilder.BuildError) {
                 return Ob.failed(Ob.RC_KERNEL_ERROR, "node[$i] 媒体元素构造失败: " + t.message)
             } catch (t: NodeError) {
@@ -155,15 +159,28 @@ object ForwardActions {
         return Node(shown, ArrayList(rec.elements ?: emptyList()))
     }
 
+    private data class LoadResult(val code: Int, val msg: String, val records: ArrayList<MsgRecord>?)
+
     private fun loadRecord(chatType: Int, peerUid: String, msgId: Long): MsgRecord? {
         val svc = KernelGate.msgService() ?: return null
-        val result = Promise<ArrayList<MsgRecord>>()
+        val result = Promise<LoadResult>()
         return try {
             svc.getMsgsByMsgId(
                 Contact(chatType, peerUid, ""), arrayListOf(msgId),
-                IMsgOperateCallback { _, _, records -> result.resolve(records) }
+                IMsgOperateCallback { code, msg, records ->
+                    result.resolve(LoadResult(code, msg ?: "", records))
+                }
             )
-            result.await(Config.kernelTimeoutMs)?.firstOrNull()
+            val res = result.await(Config.kernelTimeoutMs)
+            if (res == null) {
+                PicoLog.w("加载被引用消息超时 msgId=$msgId")
+                null
+            } else if (res.code != 0) {
+                PicoLog.w("加载被引用消息失败 msgId=$msgId code=${res.code} ${res.msg}")
+                null
+            } else {
+                res.records?.firstOrNull()
+            }
         } catch (t: Throwable) {
             PicoLog.w("加载被引用消息失败 msgId=$msgId", t)
             null
@@ -185,8 +202,11 @@ object ForwardActions {
         }
         val resp = MsgActions.sendElements(dst, chatType, merged)
         if (resp.optInt("retcode", -1) == 0) {
-            (resp.optJSONObject("data") ?: JSONObject()).put("mode", MODE_MERGE)
+            val data = resp.optJSONObject("data") ?: JSONObject().also { resp.put("data", it) }
+            data.put("mode", MODE_MERGE)
                 .put("nodes", nodes.size)
+            val msgId = data.optInt("message_id", 0)
+            if (msgId != 0) data.put("message_ids", JSONArray().put(msgId))
             PicoLog.i("forward merge_one: " + nodes.size + " 个节点拼成一条")
         }
         return resp
@@ -217,6 +237,14 @@ object ForwardActions {
                 failed.optInt("retcode", Ob.RC_KERNEL_ERROR),
                 "逐条转发在第 " + (ids.length() + 1) + "/" + nodes.size + " 条中断: " +
                     failed.optString("message")
+            ).put(
+                "data",
+                JSONObject()
+                    .put("message_id", lastId)
+                    .put("message_ids", ids)
+                    .put("mode", MODE_SEPARATE)
+                    .put("sent_count", ids.length())
+                    .put("total_count", nodes.size)
             )
         }
         PicoLog.i("forward separate: 发出 " + ids.length() + " 条")

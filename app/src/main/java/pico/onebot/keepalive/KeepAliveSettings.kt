@@ -8,10 +8,22 @@ import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
 import android.widget.Toast
+import java.util.Locale
 
 object KeepAliveSettings {
 
     fun isAccessibilityEnabled(ctx: Context): Boolean {
+        val masterEnabled = try {
+            Settings.Secure.getInt(
+                ctx.contentResolver,
+                Settings.Secure.ACCESSIBILITY_ENABLED,
+                0
+            ) == 1
+        } catch (_: Throwable) {
+            false
+        }
+        if (!masterEnabled) return false
+
         val expected = ComponentName(ctx, PicoKeepAliveService::class.java)
         val enabled = try {
             Settings.Secure.getString(
@@ -58,7 +70,7 @@ object KeepAliveSettings {
     }
 
     fun openBackgroundSettings(ctx: Context) {
-        val candidates = when (Build.MANUFACTURER.lowercase()) {
+        val candidates = when (Build.MANUFACTURER.orEmpty().lowercase(Locale.ROOT)) {
             "xiaomi", "redmi" -> listOf(
                 ComponentName(
                     "com.miui.securitycenter",
@@ -107,7 +119,6 @@ object KeepAliveSettings {
     private fun open(ctx: Context, intent: Intent, showError: Boolean = true): Boolean {
         return try {
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            if (intent.resolveActivity(ctx.packageManager) == null) throw IllegalStateException("unsupported")
             ctx.startActivity(intent)
             true
         } catch (_: Throwable) {

@@ -13,6 +13,7 @@ import pico.onebot.kernel.KernelGate
 import pico.onebot.kernel.NickStore
 import pico.onebot.kernel.UinUidStore
 import pico.onebot.media.MediaBuilder
+import pico.onebot.media.MediaDownloader
 import pico.onebot.media.MediaFiles
 import pico.onebot.media.MediaRefStore
 
@@ -45,6 +46,7 @@ object MsgCodec {
     const val AT_ONE = 2
 
     class UnsupportedSegment(val type: String) : RuntimeException("segment not supported yet: $type")
+    class BadSegmentParam(msg: String) : RuntimeException(msg)
 
     // ---------------- 内核 → OneBot ----------------
 
@@ -324,8 +326,19 @@ object MsgCodec {
 
     private fun escapeText(s: String) = s.replace("&", "&amp;").replace("[", "&#91;").replace("]", "&#93;")
     private fun escapeParam(s: String) = escapeText(s).replace(",", "&#44;")
-    private fun unescape(s: String) =
+    private fun unescapeText(s: String) =
+        s.replace("&#91;", "[").replace("&#93;", "]").replace("&amp;", "&")
+    private fun unescapeParam(s: String) =
         s.replace("&#44;", ",").replace("&#91;", "[").replace("&#93;", "]").replace("&amp;", "&")
+
+    private fun isValidCqType(type: String): Boolean {
+        if (type.isEmpty()) return false
+        for (c in type) {
+            val ok = (c in 'a'..'z') || (c in 'A'..'Z') || (c in '0'..'9') || c == '_' || c == '-' || c == '.'
+            if (!ok) return false
+        }
+        return true
+    }
 
     // ---------------- OneBot → 内核 ----------------
 
@@ -345,38 +358,52 @@ object MsgCodec {
         while (i < text.length) {
             val start = text.indexOf("[CQ:", i)
             if (start < 0) {
-                buf.append(text.substring(i))
+                buf.append(text, i, text.length)
                 break
             }
-            val end = text.indexOf(']', start)
+            val end = text.indexOf(']', start + 4)
             if (end < 0) {
-                buf.append(text.substring(i))
+                buf.append(text, i, text.length)
                 break
+            }
+            val innerOpen = text.indexOf('[', start + 4)
+            if (innerOpen in (start + 4) until end) {
+                buf.append(text, i, innerOpen)
+                i = innerOpen
+                continue
+            }
+            val body = text.substring(start + 4, end)
+            val comma = body.indexOf(',')
+            val type = if (comma < 0) body else body.substring(0, comma)
+            if (!isValidCqType(type)) {
+                buf.append(text, i, end + 1)
+                i = end + 1
+                continue
             }
             buf.append(text, i, start)
             if (buf.isNotEmpty()) {
-                arr.put(seg("text", JSONObject().put("text", unescape(buf.toString()))))
+                arr.put(seg("text", JSONObject().put("text", unescapeText(buf.toString()))))
                 buf.setLength(0)
             }
-            val body = text.substring(start + 4, end)
-            val parts = body.split(",")
-            val type = parts[0]
             val data = JSONObject()
-            for (p in 1 until parts.size) {
-                val kv = parts[p]
-                val eq = kv.indexOf('=')
-                if (eq > 0) data.put(kv.substring(0, eq), unescape(kv.substring(eq + 1)))
+            if (comma >= 0 && comma + 1 < body.length) {
+                val parts = body.substring(comma + 1).split(",")
+                for (kv in parts) {
+                    val eq = kv.indexOf('=')
+                    if (eq > 0) data.put(kv.substring(0, eq), unescapeParam(kv.substring(eq + 1)))
+                }
             }
             arr.put(seg(type, data))
             i = end + 1
         }
-        if (buf.isNotEmpty()) arr.put(seg("text", JSONObject().put("text", unescape(buf.toString()))))
+        if (buf.isNotEmpty()) arr.put(seg("text", JSONObject().put("text", unescapeText(buf.toString()))))
         return arr
     }
 
     /**
      * segments → MsgElement[]。
      * @throws UnsupportedSegment 遇到本阶段还做不到的段(调用方转成 retcode 1404)。
+     * @throws BadSegmentParam 已知消息段但参数缺失或非法(调用方转成 retcode 10001)。
      */
     fun toElements(segments: JSONArray): ArrayList<MsgElement> {
         val out = ArrayList<MsgElement>()
@@ -387,7 +414,12 @@ object MsgCodec {
             when (type) {
                 "text" -> out.add(textElement(optNonNullString(data, "text")))
                 "at" -> out.add(atElement(data))
-                "face" -> out.add(faceElement(optNonNullString(data, "id").trim().toIntOrNull() ?: 0))
+                "face" -> {
+                    val rawId = optNonNullString(data, "id").trim()
+                    val faceId = rawId.toIntOrNull()
+                        ?: throw BadSegmentParam("face 的 id 缺失或非法: $rawId")
+                    out.add(faceElement(faceId))
+                }
                 "reply" -> out.add(replyElement(data))
                 "image" -> {
                     val subType = if (!data.isNull("sub_type")) data.optInt("sub_type", 0)
@@ -422,7 +454,7 @@ object MsgCodec {
         val spec = listOf("file", "url", "path", "src")
             .map { optNonNullString(data, it).trim() }
             .firstOrNull { it.isNotEmpty() }
-            ?: throw UnsupportedSegment("$kind(没有 file/url/path)")
+            ?: throw BadSegmentParam("$kind 缺少 file/url/path")
         val looksLikeLocator = spec.startsWith("base64://", ignoreCase = true) ||
             spec.startsWith("http://", ignoreCase = true) ||
             spec.startsWith("https://", ignoreCase = true) ||
@@ -434,16 +466,25 @@ object MsgCodec {
                 // 本地已落地的优先
                 if (ref.localPath.isNotEmpty()) {
                     val f = java.io.File(ref.localPath)
-                    if (f.isFile) return f
+                    if (f.isFile && f.length() > 0L) return f
                 }
-                // 落在别处/已被清理时,直链是唯一还能用的来源(合并转发内的媒体
-                // 尤其如此 —— 内层 msgId 定位不到,只有 rkey 直链能下到原文件)。
+                // 合并转发内的图片没有可下载的会话 msgId,若带直链先尝试直链避免白等超时
                 if (ref.url.isNotEmpty()) {
                     try {
                         return MediaFiles.resolve(ref.url, ref.fileName)
                     } catch (t: Throwable) {
                         PicoLog.w("media ref url fallback failed for " + ref.fileName, t)
                     }
+                }
+                // 本地尚未下载(常见于刚收到的语音/视频/文件或 rkey 过期图片)时,回退到内核主动下载
+                if (ref.msgId != 0L && ref.elementId != 0L) {
+                    return MediaDownloader.fetch(
+                        ref.chatType,
+                        ref.peerUid,
+                        ref.msgId,
+                        ref.elementId,
+                        ref.localPath
+                    )
                 }
             }
         }
@@ -475,9 +516,9 @@ object MsgCodec {
             t.content = "@全体成员"
         } else {
             val uin = qq.toLongOrNull() ?: 0L
-            if (uin <= 0) throw UnsupportedSegment("at(qq 非法: $qq)")
+            if (uin <= 0) throw BadSegmentParam("at 的 qq 非法: $qq")
             val uid = UinUidStore.uid(uin)
-            if (uid.isEmpty()) throw UnsupportedSegment("at(uid 未知: $qq)")
+            if (uid.isEmpty()) throw BadSegmentParam("at 的 uid 未知: $qq")
             t.atType = AT_ONE
             t.atUid = uin
             t.atNtUid = uid
@@ -500,7 +541,7 @@ object MsgCodec {
 
     private fun replyElement(data: JSONObject): MsgElement {
         val id = optNonNullString(data, "id").trim().toIntOrNull() ?: 0
-        val entry = MsgIdStore.byMessageId(id) ?: throw UnsupportedSegment("reply(未知 message_id: $id)")
+        val entry = MsgIdStore.byMessageId(id) ?: throw BadSegmentParam("reply 的 message_id 未知: $id")
         val e = MsgElement()
         e.elementType = T_REPLY
         e.replyElement = ReplyElement().also {
@@ -574,6 +615,7 @@ object MsgCodec {
             .put("message_id", entry.messageId)
             .put("message_seq", rec.msgSeq)
             .put("real_id", entry.messageId)
+            .put("time", if (rec.msgTime > 0L) rec.msgTime else (System.currentTimeMillis() / 1000L))
             .put("user_id", senderUin)
             .put("message", formatted(segments))
             .put("raw_message", toCq(segments))

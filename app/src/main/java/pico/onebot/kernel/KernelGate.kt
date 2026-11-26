@@ -60,6 +60,15 @@ object KernelGate {
     @Volatile
     private var cachedSessionField: java.lang.reflect.Field? = null
 
+    @Volatile
+    private var cachedCandidateMethods: List<java.lang.reflect.Method> = emptyList()
+
+    @Volatile
+    private var cachedCandidateFields: List<java.lang.reflect.Field> = emptyList()
+
+    @Volatile
+    private var candidatesCached: Boolean = false
+
     /**
      * 会话代数。每次 [onSessionLost] 在锁内自增,用于让正在执行的 [probe] 与监听器注册立刻作废。
      */
@@ -155,7 +164,12 @@ object KernelGate {
 
     fun startWatch() {
         if (!watchStarted.compareAndSet(false, true)) return
-        Thread({ watchLoop() }, "pico-kernel-watch").apply { isDaemon = true }.start()
+        try {
+            Thread({ watchLoop() }, "pico-kernel-watch").apply { isDaemon = true }.start()
+        } catch (t: Throwable) {
+            watchStarted.set(false)
+            throw t
+        }
     }
 
     private fun wakeWatch() {
@@ -432,66 +446,121 @@ object KernelGate {
                 cachedSessionField = null
             }
         }
+        if (candidatesCached) {
+            val methodsSnap = cachedCandidateMethods
+            val fieldsSnap = cachedCandidateFields
+            if (methodsSnap.isNotEmpty() || fieldsSnap.isNotEmpty()) {
+                var okInvocations = 0
+                var lastThrow: String? = null
+                for (m in methodsSnap) {
+                    try {
+                        val v = m.invoke(null) as? IQQNTWrapperSession
+                        okInvocations++
+                        if (v != null) {
+                            cachedSessionMethod = m
+                            sessionProbe = "ok:method " + m.name + "()"
+                            return v
+                        }
+                    } catch (t: Throwable) {
+                        lastThrow = m.name + "(): " + t.javaClass.simpleName + " " + t.message
+                    }
+                }
+                for (f in fieldsSnap) {
+                    try {
+                        val v = f.get(null) as? IQQNTWrapperSession
+                        okInvocations++
+                        if (v != null) {
+                            cachedSessionField = f
+                            sessionProbe = "ok:field " + f.name
+                            return v
+                        }
+                    } catch (t: Throwable) {
+                        lastThrow = f.name + ": " + t.javaClass.simpleName + " " + t.message
+                    }
+                }
+                if (okInvocations > 0) {
+                    sessionProbe = "getter-returned-null(已缓存候选 ${methodsSnap.size + fieldsSnap.size} 个,登录前属正常)"
+                    return null
+                }
+                if (lastThrow != null) {
+                    candidatesCached = false
+                    cachedCandidateMethods = emptyList()
+                    cachedCandidateFields = emptyList()
+                }
+            }
+        }
         val cls = try {
             Class.forName(KERNEL_SERVICE_UTIL)
         } catch (_: Throwable) {
             sessionProbe = "class-missing:$KERNEL_SERVICE_UTIL(base APK 变了?)"
             return null
         }
-        var candidates = 0
-        var singleMethodCandidate: java.lang.reflect.Method? = null
-        var singleFieldCandidate: java.lang.reflect.Field? = null
+        val discoveredMethods = ArrayList<java.lang.reflect.Method>()
+        val discoveredFields = ArrayList<java.lang.reflect.Field>()
         var lastThrow: String? = null
 
-        val methods = try { cls.declaredMethods } catch (t: Throwable) {
+        val methods = try {
+            cls.declaredMethods
+        } catch (t: Throwable) {
             lastError = "findSession: " + t.javaClass.simpleName + " " + t.message
             sessionProbe = "throw:" + lastError
             return null
         }
         for (m in methods) {
-            if (!Modifier.isStatic(m.modifiers)) continue
-            if (m.parameterTypes.isNotEmpty()) continue
-            if (!IQQNTWrapperSession::class.java.isAssignableFrom(m.returnType)) continue
-            candidates++
             try {
+                if (!Modifier.isStatic(m.modifiers)) continue
+                if (m.parameterTypes.isNotEmpty()) continue
+                if (!IQQNTWrapperSession::class.java.isAssignableFrom(m.returnType)) continue
                 m.isAccessible = true
+                discoveredMethods.add(m)
                 val v = m.invoke(null) as? IQQNTWrapperSession
                 if (v != null) {
                     cachedSessionMethod = m
+                    cachedCandidateMethods = ArrayList(discoveredMethods)
+                    candidatesCached = true
                     sessionProbe = "ok:method " + m.name + "()"
                     return v
                 }
-                if (candidates == 1) singleMethodCandidate = m else singleMethodCandidate = null
             } catch (t: Throwable) {
                 lastThrow = m.name + "(): " + t.javaClass.simpleName + " " + t.message
-                singleMethodCandidate = null
             }
         }
 
         // 兜底:有些版本把会话放在静态字段上
-        val fields = try { cls.declaredFields } catch (_: Throwable) { emptyArray() }
+        val fields = try {
+            cls.declaredFields
+        } catch (_: Throwable) {
+            emptyArray()
+        }
         for (f in fields) {
-            if (!Modifier.isStatic(f.modifiers)) continue
-            if (!IQQNTWrapperSession::class.java.isAssignableFrom(f.type)) continue
-            candidates++
             try {
+                if (!Modifier.isStatic(f.modifiers)) continue
+                if (!IQQNTWrapperSession::class.java.isAssignableFrom(f.type)) continue
                 f.isAccessible = true
+                discoveredFields.add(f)
                 val v = f.get(null) as? IQQNTWrapperSession
                 if (v != null) {
                     cachedSessionField = f
+                    cachedCandidateMethods = ArrayList(discoveredMethods)
+                    cachedCandidateFields = ArrayList(discoveredFields)
+                    candidatesCached = true
                     sessionProbe = "ok:field " + f.name
                     return v
                 }
-                if (candidates == 1) singleFieldCandidate = f else singleFieldCandidate = null
             } catch (t: Throwable) {
                 lastThrow = f.name + ": " + t.javaClass.simpleName + " " + t.message
-                singleFieldCandidate = null
             }
         }
 
-        if (candidates == 1 && lastThrow == null) {
-            if (singleMethodCandidate != null) cachedSessionMethod = singleMethodCandidate
-            else if (singleFieldCandidate != null) cachedSessionField = singleFieldCandidate
+        val candidates = discoveredMethods.size + discoveredFields.size
+        if (candidates > 0) {
+            cachedCandidateMethods = discoveredMethods
+            cachedCandidateFields = discoveredFields
+            candidatesCached = true
+            if (candidates == 1 && lastThrow == null) {
+                if (discoveredMethods.size == 1) cachedSessionMethod = discoveredMethods[0]
+                else if (discoveredFields.size == 1) cachedSessionField = discoveredFields[0]
+            }
         }
 
         sessionProbe = when {

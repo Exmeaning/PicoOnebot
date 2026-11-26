@@ -11,8 +11,10 @@ import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.URI
+import java.net.URISyntaxException
 import java.security.MessageDigest
 import java.security.SecureRandom
+import java.util.Locale
 import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SNIHostName
 import javax.net.ssl.SSLPeerUnverifiedException
@@ -55,9 +57,31 @@ class WsClient(
             val portPart = if (u.port > 0) ":${u.port}" else ""
             val pathPart = u.rawPath ?: ""
             if (scheme.isNotEmpty() && host.isNotEmpty()) "$scheme://$host$portPart$pathPart"
-            else raw.substringBefore('?').substringBefore('#')
+            else redactUrlFallback(raw)
         } catch (_: Throwable) {
-            raw.substringBefore('?').substringBefore('#')
+            redactUrlFallback(raw)
+        }
+
+        private fun redactUrlFallback(raw: String): String {
+            val noQuery = raw.substringBefore('?').substringBefore('#')
+            val schemeEnd = noQuery.indexOf("://")
+            if (schemeEnd < 0) return noQuery
+            val authStart = schemeEnd + 3
+            val pathStart = noQuery.indexOf('/', authStart).let { if (it < 0) noQuery.length else it }
+            val authority = noQuery.substring(authStart, pathStart)
+            val atIdx = authority.lastIndexOf('@')
+            if (atIdx < 0) return noQuery
+            return noQuery.substring(0, authStart) + authority.substring(atIdx + 1) + noQuery.substring(pathStart)
+        }
+
+        private fun sanitizeError(t: Throwable, rawUrl: String, redactedUrl: String): String {
+            val rawMsg = if (t is URISyntaxException) t.reason else (t.message ?: "")
+            val scrubbed = if (rawUrl.isNotEmpty() && rawMsg.contains(rawUrl)) {
+                rawMsg.replace(rawUrl, redactedUrl)
+            } else {
+                rawMsg
+            }
+            return if (scrubbed.isEmpty()) t.javaClass.simpleName else t.javaClass.simpleName + " " + scrubbed
         }
     }
 
@@ -116,7 +140,7 @@ class WsClient(
                 establishedAtNanos = connectOnce(redactedUrl)
             } catch (t: Throwable) {
                 failed = true
-                if (running) PicoLog.w("reverse ws $redactedUrl failed: " + t.javaClass.simpleName + " " + t.message)
+                if (running) PicoLog.w("reverse ws $redactedUrl failed: " + sanitizeError(t, url, redactedUrl))
             } finally {
                 try {
                     socket?.close()
@@ -150,7 +174,7 @@ class WsClient(
 
     private fun connectOnce(redactedUrl: String): Long? {
         val uri = URI(url)
-        val scheme = uri.scheme?.lowercase() ?: ""
+        val scheme = uri.scheme?.lowercase(Locale.ROOT) ?: ""
         val secure = when (scheme) {
             "ws" -> false
             "wss" -> true
@@ -233,7 +257,9 @@ class WsClient(
         out.flush()
 
         val ins = BufferedInputStream(sock.getInputStream(), 8192)
-        val status = WsFrame.readLine(ins) ?: throw EOFException("no handshake response")
+        val handshakeDeadlineNanos = System.nanoTime() + 10_000_000_000L
+        val status = WsFrame.readLine(ins, WsFrame.MAX_LINE_BYTES, handshakeDeadlineNanos)
+            ?: throw EOFException("no handshake response")
         val statusCode = status.split(" ").getOrNull(1)?.toIntOrNull() ?: -1
         if (statusCode != 101) {
             throw IOException("handshake rejected: $status")
@@ -245,7 +271,7 @@ class WsClient(
         var headerCount = 0
         var headerBytes = 0
         while (true) {
-            val line = WsFrame.readLine(ins)
+            val line = WsFrame.readLine(ins, WsFrame.MAX_LINE_BYTES, handshakeDeadlineNanos)
                 ?: throw EOFException("handshake response truncated before end of headers")
             if (line.isEmpty()) break
             headerCount++
@@ -255,7 +281,7 @@ class WsClient(
             }
             val idx = line.indexOf(':')
             if (idx > 0) {
-                val name = line.substring(0, idx).trim().lowercase()
+                val name = line.substring(0, idx).trim().lowercase(Locale.ROOT)
                 val value = line.substring(idx + 1).trim()
                 when (name) {
                     "sec-websocket-accept" -> acceptHeader = value

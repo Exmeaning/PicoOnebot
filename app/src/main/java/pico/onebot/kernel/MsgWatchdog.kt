@@ -121,7 +121,6 @@ object MsgWatchdog {
         if (!KernelGate.ready) return false to "kernel not ready (${KernelGate.state})"
         val msgService = KernelGate.msgService() ?: return false to "msgService unavailable"
         val nowNs = System.nanoTime()
-        val nowWall = System.currentTimeMillis()
         synchronized(lock) {
             if (hasManualSync && (nowNs - lastManualSyncAtNs).coerceAtLeast(0L) < MANUAL_SYNC_COOLDOWN_NS) {
                 return false to "sync cooldown active, please retry in a few seconds"
@@ -131,7 +130,9 @@ object MsgWatchdog {
         }
         return try {
             msgService.startMsgSync()
-            Counters.onSyncTriggered(nowWall)
+            synchronized(lock) {
+                Counters.onSyncTriggered(System.currentTimeMillis())
+            }
             PicoLog.i("startMsgSync() triggered ($reason)")
             true to "ok"
         } catch (t: Throwable) {
@@ -165,7 +166,6 @@ object MsgWatchdog {
         val msgService = KernelGate.msgService() ?: return
 
         val nowNs = System.nanoTime()
-        val nowWall = System.currentTimeMillis()
         val attemptNum: Int
         val silentMs: Long
         synchronized(lock) {
@@ -186,7 +186,9 @@ object MsgWatchdog {
 
         try {
             msgService.startMsgSync()
-            Counters.onSyncTriggered(nowWall)
+            synchronized(lock) {
+                Counters.onSyncTriggered(System.currentTimeMillis())
+            }
             PicoLog.w(
                 "msg silence watchdog: silent=${silentMs / 1000}s, triggered startMsgSync() " +
                     "attempt=$attemptNum/$maxAttempts"
@@ -250,6 +252,8 @@ object MsgWatchdog {
         val attempts: Int
         val nextAtWall: Long
         val tracked: Int
+        val syncTriggered: Long
+        val lastSyncAt: Long
         val topConvs = JSONArray()
         synchronized(lock) {
             lastWall = lastRecvAtWall
@@ -261,6 +265,8 @@ object MsgWatchdog {
                 nowWall + remainMs
             } else 0L
             tracked = conversations.size
+            syncTriggered = Counters.syncTriggered()
+            lastSyncAt = Counters.lastSyncAt()
             val sorted = conversations.entries.sortedByDescending { it.value.lastRecvAtWall }.take(20)
             for ((k, v) in sorted) {
                 topConvs.put(
@@ -277,8 +283,8 @@ object MsgWatchdog {
         return JSONObject()
             .put("last_recv_at", lastWall)
             .put("silence_ms", silent)
-            .put("sync_triggered", Counters.syncTriggered())
-            .put("last_sync_at", Counters.lastSyncAt())
+            .put("sync_triggered", syncTriggered)
+            .put("last_sync_at", lastSyncAt)
             .put("silence_sync_attempts", attempts)
             .put("silence_sync_next_at", nextAtWall)
             .put("silence_sync_threshold_sec", Config.silenceSyncThresholdMs / 1000L)

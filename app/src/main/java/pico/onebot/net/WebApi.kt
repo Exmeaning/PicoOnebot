@@ -22,6 +22,7 @@ import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
 import java.security.SecureRandom
+import java.util.Locale
 
 /**
  * WebUI 后端(端口 6099 的 `/api/…`)。契约见 docs/design §5.1,前端 `web/src/lib/api.ts` 为准。
@@ -229,6 +230,8 @@ object WebApi {
                 path == "/api/qr/refresh" && method == "POST" -> Response(200, qr(true))
                 else -> Response(404, JSONObject().put("ok", false).put("message", "unknown route: $path"))
             }
+        } catch (_: JSONException) {
+            error(400, "请求内容不是合法 JSON")
         } catch (t: Throwable) {
             PicoLog.e("webapi $path failed", t)
             Response(500, JSONObject().put("ok", false).put("message", "内部服务错误"))
@@ -240,10 +243,11 @@ object WebApi {
         Response(200, JSONObject().put("_array", arr))
 
     /**
-     * 兼容公开方法:先校验会话令牌,单请求最多执行一次 PBKDF2,绝不对 `?token=` 跑 PBKDF2。
+     * 兼容公开方法:仅通过 Authorization 头校验(一般 HTTP 路由禁止 `?token=` 查串认证),
+     * 单请求最多执行一次 PBKDF2。日志流 WS 在 [HttpServer] 中显式开启 `allowQuerySession = true`。
      */
     fun authorized(headers: Map<String, String>, query: Map<String, String>): Boolean =
-        checkAuthorization(headers, query, "unknown", allowQuerySession = true).authorized
+        checkAuthorization(headers, query, "unknown", allowQuerySession = false).authorized
 
     internal fun checkAuthorization(
         headers: Map<String, String>,
@@ -515,18 +519,26 @@ object WebApi {
 
     internal fun registerLogStream(conn: WsConn, sessionToken: String?, expectedEpoch: Long): Boolean {
         val now = System.nanoTime()
-        synchronized(sessionsLock) {
+        val expiredStreams = ArrayList<WsConn>()
+        val registered = synchronized(sessionsLock) {
             logStreams.removeAll { it.conn.closed }
-            if (!Config.webuiPasswordInitialized) return false
-            if (sessionEpoch != expectedEpoch) return false
+            if (!Config.webuiPasswordInitialized) return@synchronized false
+            if (sessionEpoch != expectedEpoch) return@synchronized false
             if (sessionToken != null) {
                 val entry = sessions[sessionToken]
-                if (entry == null || isExpired(entry, now)) return false
+                if (entry == null) return@synchronized false
+                if (isExpired(entry, now)) {
+                    sessions.remove(sessionToken)
+                    collectStreamsForSessionLocked(sessionToken, expiredStreams)
+                    return@synchronized false
+                }
             }
-            if (logStreams.size >= MAX_LOG_STREAMS) return false
+            if (logStreams.size >= MAX_LOG_STREAMS) return@synchronized false
             logStreams.add(LogStreamEntry(conn, sessionToken))
-            return true
+            true
         }
+        for (c in expiredStreams) c.close()
+        return registered
     }
 
     internal fun unregisterLogStream(conn: WsConn) {
@@ -631,15 +643,20 @@ object WebApi {
                 if (listening) PicoBoot.networkAppliedAt else 0L, detail)
         }
 
+        fun formatHost(raw: String): String {
+            val h = raw.trim()
+            return if (h.contains(':') && !h.startsWith("[")) "[$h]" else h
+        }
+
         val ws = Config.wsServers()
         for (i in 0 until ws.length()) {
             val o = ws.optJSONObject(i) ?: continue
-            addListener(o, "ws-server", "正向 WS", "ws://" + o.optString("host") + ":" + o.optInt("port"))
+            addListener(o, "ws-server", "正向 WS", "ws://" + formatHost(o.optString("host")) + ":" + o.optInt("port"))
         }
         val hs = Config.httpServers()
         for (i in 0 until hs.length()) {
             val o = hs.optJSONObject(i) ?: continue
-            addListener(o, "http-server", "HTTP 服务", "http://" + o.optString("host") + ":" + o.optInt("port"))
+            addListener(o, "http-server", "HTTP 服务", "http://" + formatHost(o.optString("host")) + ":" + o.optInt("port"))
         }
         val wc = Config.wsClients()
         for (i in 0 until wc.length()) {
@@ -692,7 +709,11 @@ object WebApi {
             )
         }
         val previous = Config.raw().toString()
-        Config.applyAppConfig(patch)
+        try {
+            Config.applyAppConfig(patch)
+        } catch (err: IllegalArgumentException) {
+            return error(400, err.message ?: "配置无效")
+        }
         PicoLog.i("config updated via webui")
         return Response(200, applyRuntimeConfig(previous).put("ok", true))
     }
@@ -736,7 +757,7 @@ object WebApi {
 
         val entries = JSONArray()
         val children = dir.listFiles()?.sortedWith(
-            compareBy<File>({ !it.isDirectory }, { it.name.lowercase() })
+            compareBy<File>({ !it.isDirectory }, { it.name.lowercase(Locale.ROOT) })
         ) ?: emptyList()
         for (child in children) {
             if (isBlockedManagedPath(child)) continue
@@ -809,7 +830,7 @@ object WebApi {
         }
         val rawPath = req.optString("path", "")
         if (!req.has("content") || req.isNull("content")) return error(400, "缺少文件内容")
-        val content = req.getString("content")
+        val content = req.opt("content") as? String ?: return error(400, "文件内容必须为字符串")
         val bytes = content.toByteArray(Charsets.UTF_8)
         if (bytes.size > MAX_EDIT_BYTES) return error(413, "文件内容不能超过 1 MiB")
         val expectedModifiedAt = req.optLong("expectedModifiedAt", -1L)
@@ -860,7 +881,8 @@ object WebApi {
             } catch (err: IllegalArgumentException) {
                 return error(400, "配置无效: " + err.message)
             } catch (t: Throwable) {
-                return error(500, "文件保存失败: " + t.message)
+                PicoLog.e("webui putFile failed for $rawPath", t)
+                return error(500, "文件保存失败，请检查存储空间或权限")
             }
             savedSize = target.length()
             savedModifiedAt = target.lastModified()
@@ -955,7 +977,7 @@ object WebApi {
                 return true
             }
         }
-        val name = target.name.lowercase()
+        val name = target.name.lowercase(Locale.ROOT)
         if (name == "config.v1.json" || name.endsWith(".tmp") || name.startsWith("config.json.corrupt.")) {
             return true
         }
