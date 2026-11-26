@@ -7,6 +7,7 @@ import pico.onebot.core.PicoLog
 import pico.onebot.media.MediaDownloader
 import pico.onebot.media.MediaFiles
 import pico.onebot.media.MediaRefStore
+import pico.onebot.msg.MsgCodec
 import pico.onebot.proto.Ob
 import java.io.File
 import java.net.NetworkInterface
@@ -24,6 +25,8 @@ import java.net.NetworkInterface
  */
 object MediaActions {
 
+    private const val MAX_BASE64_RESPONSE_BYTES = 16L * 1024 * 1024
+
     fun register() {
         ActionRouter.register("get_image") { p -> fetch(p, "image") }
         ActionRouter.register("get_record") { p -> fetch(p, "record") }
@@ -33,7 +36,7 @@ object MediaActions {
 
     private fun fetch(p: JSONObject, kind: String): JSONObject {
         val key = listOf("file", "file_id", "id", "element_id", "md5")
-            .map { p.optString(it, "") }
+            .map { MsgCodec.optNonNullString(p, it).trim() }
             .firstOrNull { it.isNotEmpty() }
             ?: return Ob.failed(Ob.RC_BAD_PARAM, "需要 file / file_id / element_id")
 
@@ -72,23 +75,34 @@ object MediaActions {
             )
         }
 
+        val fileLen = f.length()
         val data = JSONObject()
             .put("file", f.absolutePath)
             .put("path", f.absolutePath)
             .put("file_name", ref.fileName)
-            .put("file_size", f.length())
+            .put("file_size", fileLen)
             .put("url", mediaUrl(MediaFiles.publish(f)))
 
-        // 小文件顺手给 base64,省掉上游再发一次 HTTP;大文件不给,否则一条应答几十兆
-        val limit = Config.long("media_base64_limit", 4L * 1024 * 1024)
-        if (p.optBoolean("base64", false) || f.length() <= limit) {
-            try {
-                data.put("base64", Base64.encodeToString(f.readBytes(), Base64.NO_WRAP))
-            } catch (t: Throwable) {
-                PicoLog.w("base64 encode failed for " + f.name, t)
+        // 小文件默认顺手给 base64,省掉上游再发一次 HTTP;显式 base64=false 时一律不编码,
+        // 显式 base64=true 也受硬上限约束,避免大文件整块读进宿主 QQ 堆内存导致 OOM。
+        val defaultLimit = Config.long("media_base64_limit", 4L * 1024 * 1024)
+            .coerceIn(0L, MAX_BASE64_RESPONSE_BYTES)
+        val wantBase64 = if (!p.isNull("base64")) p.optBoolean("base64", false) else fileLen <= defaultLimit
+        if (wantBase64) {
+            if (fileLen > MAX_BASE64_RESPONSE_BYTES) {
+                PicoLog.w(
+                    "skip base64 for " + f.name + ": " + fileLen + "B exceeds hard ceiling " +
+                        MAX_BASE64_RESPONSE_BYTES + "B"
+                )
+            } else {
+                try {
+                    data.put("base64", Base64.encodeToString(f.readBytes(), Base64.NO_WRAP))
+                } catch (t: Throwable) {
+                    PicoLog.w("base64 encode failed for " + f.name, t)
+                }
             }
         }
-        PicoLog.i("get_$kind -> " + f.absolutePath + " " + f.length() + "B")
+        PicoLog.i("get_$kind -> " + f.absolutePath + " " + fileLen + "B")
         return Ob.ok(data)
     }
 
@@ -100,8 +114,7 @@ object MediaActions {
      * 那个端口根本没人监听,返回的 URL 必然连不上。
      *
      * 监听项绑在通配地址上(`0.0.0.0` / `::`)时换成局域网 IP;绑在具体地址上时
-     * 就用那个地址 —— 与 [mediaUrl] 取 token 的是**同一个**监听项,不会出现
-     * "主机取 A 端口、口令取 B" 的错配。
+     * 就用那个地址。
      */
     fun baseUrl(): String {
         val configured = Config.str("media_base_url", "")
@@ -109,7 +122,8 @@ object MediaActions {
         val endpoint = pico.onebot.PicoBoot.activeOnebotEndpoint()
         val port = endpoint?.second ?: Config.port
         val host = endpoint?.first?.let(::externallyReachableHost) ?: localAddress()
-        return "http://" + host + ":" + port
+        val formattedHost = if (host.contains(':') && !host.startsWith("[")) "[$host]" else host
+        return "http://" + formattedHost + ":" + port
     }
 
     /** 监听地址本身能不能直接写进外链:通配地址 / 回环要替换成实际可达的 IP。 */
@@ -122,19 +136,10 @@ object MediaActions {
     /**
      * `/media/<token>` 的完整 URL。
      *
-     * `/media/` 在 OneBot 端口上是**需要鉴权**的(`HttpServer.serveHttp`),而老实现
-     * 直接把不带凭证的路径返回给上游 → 配了 token 的部署必然 401。这里把同一个
-     * 监听项的 token 作为 `access_token` 查询参数带上,保证上游拿到的 URL 真能下载。
+     * `/media/<token>` 由 128 位 `SecureRandom` 能力令牌直接鉴权，不再把监听器的主
+     * `serverToken` 拼进 `?access_token=`，避免跨监听端越权或泄露到日志/Referer。
      */
-    private fun mediaUrl(tokenPath: String): String {
-        // media_base_url 只改"主机前缀"(例如反代地址),文件仍由本进程的 HttpServer 提供,
-        // 所以鉴权规则是一样的:只要选中的监听项配了 token,就必须带上。
-        // 注意:反代若把请求转发给**另一个**监听项,口径仍可能不一致 —— 多监听项且
-        // 各自 token 不同时,请让反代统一转发到 media_base_url 对应的那个监听项。
-        val token = pico.onebot.PicoBoot.activeOnebotEndpoint()?.third ?: ""
-        return if (token.isEmpty()) baseUrl() + tokenPath
-        else baseUrl() + tokenPath + "?access_token=" + java.net.URLEncoder.encode(token, "UTF-8")
-    }
+    private fun mediaUrl(tokenPath: String): String = baseUrl() + tokenPath
 
     private fun localAddress(): String {
         try {

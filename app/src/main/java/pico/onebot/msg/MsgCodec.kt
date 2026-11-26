@@ -251,7 +251,7 @@ object MsgCodec {
         if (!raw.contains("com.tencent.multimsg")) return null
         return try {
             val detail = JSONObject(raw).optJSONObject("meta")?.optJSONObject("detail")
-            detail?.optString("resid", "")?.takeIf { it.isNotEmpty() }
+            detail?.let { optNonNullString(it, "resid") }?.takeIf { it.isNotEmpty() }
         } catch (t: Throwable) {
             null
         }
@@ -268,8 +268,24 @@ object MsgCodec {
     }
 
     private fun picUrl(raw: String?): String {
-        if (raw.isNullOrEmpty()) return ""
-        return if (raw.startsWith("http")) raw else "https://gchat.qpic.cn$raw"
+        val s = raw?.trim() ?: return ""
+        if (s.isEmpty()) return ""
+        return when {
+            s.startsWith("http://", ignoreCase = true) || s.startsWith("https://", ignoreCase = true) -> s
+            s.startsWith("/") && !s.startsWith("//") -> "https://gchat.qpic.cn$s"
+            else -> ""
+        }
+    }
+
+    /**
+     * Android `org.json.JSONObject.optString(key, "")` 在值为 `JSONObject.NULL` 时返回字面量 `"null"`。
+     * 统一经由这里读取字符串字段，把缺失与 JSON `null` 一律按 [def] 处理。
+     */
+    fun optNonNullString(obj: JSONObject, key: String, def: String = ""): String {
+        if (obj.isNull(key)) return def
+        val v = obj.opt(key) ?: return def
+        if (v === JSONObject.NULL) return def
+        return v.toString()
     }
 
     private fun seg(type: String, data: JSONObject): JSONObject =
@@ -288,17 +304,18 @@ object MsgCodec {
         val sb = StringBuilder()
         for (i in 0 until segments.length()) {
             val s = segments.optJSONObject(i) ?: continue
-            val type = s.optString("type")
+            val type = optNonNullString(s, "type")
             val data = s.optJSONObject("data") ?: JSONObject()
             if (type == "text") {
-                sb.append(escapeText(data.optString("text")))
+                sb.append(escapeText(optNonNullString(data, "text")))
                 continue
             }
             sb.append("[CQ:").append(type)
             val keys = data.keys()
             while (keys.hasNext()) {
                 val k = keys.next()
-                sb.append(",").append(k).append("=").append(escapeParam(data.optString(k)))
+                if (data.isNull(k)) continue
+                sb.append(",").append(k).append("=").append(escapeParam(optNonNullString(data, k)))
             }
             sb.append("]")
         }
@@ -313,11 +330,11 @@ object MsgCodec {
     // ---------------- OneBot → 内核 ----------------
 
     /** 接受 String(CQ 码)/ JSONArray(段数组)/ JSONObject(单段)。 */
-    fun normalize(message: Any?): JSONArray = when (message) {
-        null -> JSONArray()
-        is JSONArray -> message
-        is JSONObject -> JSONArray().put(message)
-        is String -> parseCq(message)
+    fun normalize(message: Any?): JSONArray = when {
+        message == null || message === JSONObject.NULL -> JSONArray()
+        message is JSONArray -> message
+        message is JSONObject -> JSONArray().put(message)
+        message is String -> parseCq(message)
         else -> parseCq(message.toString())
     }
 
@@ -365,26 +382,30 @@ object MsgCodec {
         val out = ArrayList<MsgElement>()
         for (i in 0 until segments.length()) {
             val s = segments.optJSONObject(i) ?: continue
-            val type = s.optString("type")
+            val type = optNonNullString(s, "type")
             val data = s.optJSONObject("data") ?: JSONObject()
             when (type) {
-                "text" -> out.add(textElement(data.optString("text")))
+                "text" -> out.add(textElement(optNonNullString(data, "text")))
                 "at" -> out.add(atElement(data))
-                "face" -> out.add(faceElement(data.optString("id").toIntOrNull() ?: 0))
+                "face" -> out.add(faceElement(optNonNullString(data, "id").trim().toIntOrNull() ?: 0))
                 "reply" -> out.add(replyElement(data))
-                "image" -> out.add(
-                    MediaBuilder.image(
-                        sourceOf(data, "image"),
-                        data.optInt("sub_type", data.optInt("subType", 0)),
-                        data.optString("summary", "")
+                "image" -> {
+                    val subType = if (!data.isNull("sub_type")) data.optInt("sub_type", 0)
+                    else data.optInt("subType", 0)
+                    out.add(
+                        MediaBuilder.image(
+                            sourceOf(data, "image"),
+                            subType,
+                            optNonNullString(data, "summary")
+                        )
                     )
-                )
+                }
                 "record", "voice" -> out.add(
                     MediaBuilder.record(sourceOf(data, "record"), data.optInt("duration", 0))
                 )
                 "video" -> out.add(MediaBuilder.video(sourceOf(data, "video")))
                 "file" -> out.add(
-                    MediaBuilder.file(sourceOf(data, "file"), data.optString("name", ""))
+                    MediaBuilder.file(sourceOf(data, "file"), optNonNullString(data, "name"))
                 )
                 else -> throw UnsupportedSegment(type)
             }
@@ -399,11 +420,14 @@ object MsgCodec {
      */
     private fun sourceOf(data: JSONObject, kind: String): java.io.File {
         val spec = listOf("file", "url", "path", "src")
-            .map { data.optString(it, "") }
+            .map { optNonNullString(data, it).trim() }
             .firstOrNull { it.isNotEmpty() }
             ?: throw UnsupportedSegment("$kind(没有 file/url/path)")
-        val looksLikeLocator = spec.startsWith("base64://") || spec.startsWith("http") ||
-            spec.startsWith("file://") || spec.startsWith("/")
+        val looksLikeLocator = spec.startsWith("base64://", ignoreCase = true) ||
+            spec.startsWith("http://", ignoreCase = true) ||
+            spec.startsWith("https://", ignoreCase = true) ||
+            spec.startsWith("file://", ignoreCase = true) ||
+            spec.startsWith("/")
         if (!looksLikeLocator) {
             val ref = MediaRefStore.get(spec)
             if (ref != null) {
@@ -423,7 +447,7 @@ object MsgCodec {
                 }
             }
         }
-        return MediaFiles.resolve(spec, data.optString("name", ""))
+        return MediaFiles.resolve(spec, optNonNullString(data, "name"))
     }
 
     /** 纯文本元素(合并转发拼接节点前缀时要用)。 */
@@ -440,7 +464,7 @@ object MsgCodec {
     }
 
     private fun atElement(data: JSONObject): MsgElement {
-        val qq = data.optString("qq")
+        val qq = optNonNullString(data, "qq").trim()
         val e = MsgElement()
         e.elementType = T_TEXT
         val t = TextElement()
@@ -457,7 +481,7 @@ object MsgCodec {
             t.atType = AT_ONE
             t.atUid = uin
             t.atNtUid = uid
-            val name = data.optString("name", "")
+            val name = optNonNullString(data, "name")
             t.content = if (name.isEmpty()) "@$qq" else "@$name"
         }
         e.textElement = t
@@ -475,7 +499,7 @@ object MsgCodec {
     }
 
     private fun replyElement(data: JSONObject): MsgElement {
-        val id = data.optString("id").toIntOrNull() ?: 0
+        val id = optNonNullString(data, "id").trim().toIntOrNull() ?: 0
         val entry = MsgIdStore.byMessageId(id) ?: throw UnsupportedSegment("reply(未知 message_id: $id)")
         val e = MsgElement()
         e.elementType = T_REPLY

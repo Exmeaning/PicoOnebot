@@ -5,8 +5,8 @@ import org.json.JSONObject
 import pico.onebot.core.Config
 import pico.onebot.core.PicoLog
 import java.io.File
+import java.io.FileOutputStream
 import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * OneBot 的 `message_id` 是 int32,NT 的消息标识是 `msgId`(u64)+ `msgSeq` + 会话。
@@ -49,29 +49,37 @@ object MsgIdStore {
 
     private var counter = 1
     private var dirty = 0
+    private var revision = 0L
+    private var lastWrittenRev = -1L
+    private var saveRunning = false
+    private var resaveNeeded = false
+    @Volatile
     private var file: File? = null
-    private val saveScheduled = AtomicBoolean(false)
     private val saveLock = Any()
     private val ioExecutor = Executors.newSingleThreadExecutor { r ->
         Thread(r, "pico-msgid-io").apply { isDaemon = true }
     }
 
+    @Synchronized
     fun load() {
         val f = File(Config.dataDir, "msgid.json")
         file = f
         if (!f.isFile) return
         try {
             val root = JSONObject(f.readText())
-            counter = root.optInt("counter", 1)
+            counter = root.optInt("counter", 1).coerceAtLeast(1)
             val arr = root.optJSONArray("entries") ?: JSONArray()
             for (i in 0 until arr.length()) {
                 val o = arr.optJSONObject(i) ?: continue
+                val messageId = o.optInt("message_id", 0)
+                if (messageId <= 0) continue
+                val peerUid = if (o.isNull("peer_uid")) "" else o.optString("peer_uid", "")
                 val e = Entry(
-                    o.optInt("message_id"),
+                    messageId,
                     o.optLong("msg_id"),
                     o.optLong("msg_seq"),
                     o.optInt("chat_type"),
-                    o.optString("peer_uid"),
+                    peerUid,
                     o.optLong("sender_uin"),
                     o.optLong("time")
                 )
@@ -85,13 +93,46 @@ object MsgIdStore {
 
     @Synchronized
     fun assign(msgId: Long, msgSeq: Long, chatType: Int, peerUid: String, senderUin: Long, time: Long): Entry {
-        if (msgId != 0L) byMsgId[msgId]?.let { return it }
+        if (msgId != 0L) {
+            byMsgId[msgId]?.let { existing ->
+                val newSeq = if (existing.msgSeq == 0L && msgSeq != 0L) msgSeq else existing.msgSeq
+                val newChatType = if (existing.chatType == 0 && chatType != 0) chatType else existing.chatType
+                val newPeerUid = if (existing.peerUid.isEmpty() && peerUid.isNotEmpty()) peerUid else existing.peerUid
+                val newSenderUin = if (existing.senderUin == 0L && senderUin != 0L) senderUin else existing.senderUin
+                val newTime = if (existing.time == 0L && time != 0L) time else existing.time
+                if (newSeq == existing.msgSeq &&
+                    newChatType == existing.chatType &&
+                    newPeerUid == existing.peerUid &&
+                    newSenderUin == existing.senderUin &&
+                    newTime == existing.time
+                ) {
+                    return existing
+                }
+                val updated = Entry(
+                    existing.messageId,
+                    existing.msgId,
+                    newSeq,
+                    newChatType,
+                    newPeerUid,
+                    newSenderUin,
+                    newTime
+                )
+                byMessageId[updated.messageId] = updated
+                byMsgId[updated.msgId] = updated
+                if (existing.msgSeq != 0L) {
+                    val oldSk = seqKey(existing.chatType, existing.peerUid, existing.msgSeq)
+                    if (bySeq[oldSk] === existing) bySeq.remove(oldSk)
+                }
+                if (updated.msgSeq != 0L) {
+                    bySeq[seqKey(updated.chatType, updated.peerUid, updated.msgSeq)] = updated
+                }
+                markDirtyLocked()
+                return updated
+            }
+        }
         val e = Entry(nextId(), msgId, msgSeq, chatType, peerUid, senderUin, time)
         put(e)
-        if (++dirty >= 50) {
-            dirty = 0
-            saveAsync()
-        }
+        markDirtyLocked()
         return e
     }
 
@@ -118,7 +159,7 @@ object MsgIdStore {
             if (!it.hasNext()) break
             val oldest = it.next().value
             it.remove()
-            if (oldest.msgId != 0L) byMsgId.remove(oldest.msgId)
+            if (oldest.msgId != 0L && byMsgId[oldest.msgId] === oldest) byMsgId.remove(oldest.msgId)
             if (oldest.msgSeq != 0L) {
                 val sk = seqKey(oldest.chatType, oldest.peerUid, oldest.msgSeq)
                 if (bySeq[sk] === oldest) bySeq.remove(sk)
@@ -135,39 +176,83 @@ object MsgIdStore {
         return id
     }
 
-    private fun saveAsync() {
-        if (!saveScheduled.compareAndSet(false, true)) return
-        ioExecutor.execute {
-            try {
-                save()
-            } finally {
-                saveScheduled.set(false)
+    private fun markDirtyLocked() {
+        revision++
+        dirty++
+        if (dirty >= 50) {
+            resaveNeeded = true
+            if (!saveRunning) {
+                saveRunning = true
+                ioExecutor.execute { drainSaves() }
             }
         }
     }
 
-    @Synchronized
-    private fun snapshot(): Pair<Int, List<Entry>> {
-        dirty = 0
-        return counter to ArrayList(byMessageId.values)
+    private fun drainSaves() {
+        var completedNormally = false
+        try {
+            while (true) {
+                val snap: Triple<Long, Int, List<Entry>>? = synchronized(this) {
+                    if (!resaveNeeded && dirty == 0) {
+                        saveRunning = false
+                        completedNormally = true
+                        null
+                    } else {
+                        resaveNeeded = false
+                        dirty = 0
+                        Triple(revision, counter, ArrayList(byMessageId.values))
+                    }
+                }
+                if (snap == null) return
+                writeSnapshot(snap.first, snap.second, snap.third)
+            }
+        } finally {
+            if (!completedNormally) {
+                synchronized(this) { saveRunning = false }
+            }
+        }
     }
 
     fun save() {
+        val snap = synchronized(this) {
+            resaveNeeded = false
+            dirty = 0
+            Triple(revision, counter, ArrayList(byMessageId.values))
+        }
+        writeSnapshot(snap.first, snap.second, snap.third)
+    }
+
+    private fun writeSnapshot(rev: Long, curCounter: Int, entries: List<Entry>) {
         val f = file ?: return
-        val (curCounter, entries) = snapshot()
         synchronized(saveLock) {
+            if (rev < lastWrittenRev) return
+            if (rev == lastWrittenRev && f.isFile) return
+            var tmp: File? = null
             try {
                 val arr = JSONArray()
                 for (e in entries) arr.put(e.toJson())
                 val payload = JSONObject().put("counter", curCounter).put("entries", arr).toString()
-                val tmp = File(f.parentFile, f.name + ".tmp")
-                tmp.writeText(payload)
-                if (!tmp.renameTo(f)) {
-                    f.writeText(payload)
-                    tmp.delete()
+                val parent = f.parentFile
+                if (parent != null && !parent.isDirectory) parent.mkdirs()
+                val tempFile = File.createTempFile(f.name + ".", ".tmp", parent)
+                tmp = tempFile
+                FileOutputStream(tempFile).use { fos ->
+                    fos.write(payload.toByteArray(Charsets.UTF_8))
+                    fos.flush()
+                    try {
+                        fos.fd.sync()
+                    } catch (_: Throwable) {
+                    }
+                }
+                if (!tempFile.renameTo(f)) {
+                    PicoLog.w("msgid store atomic rename failed: " + f.absolutePath)
+                } else {
+                    lastWrittenRev = rev
                 }
             } catch (t: Throwable) {
                 PicoLog.w("msgid store save failed", t)
+            } finally {
+                tmp?.delete()
             }
         }
     }

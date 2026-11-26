@@ -60,5 +60,10 @@ object MediaRefStore {
     }
 
     @Synchronized
+    fun reset() {
+        map.clear()
+    }
+
+    @Synchronized
     fun size(): Int = map.size
 }

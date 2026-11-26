@@ -24,11 +24,20 @@ import java.util.concurrent.atomic.AtomicLong
 object MediaDownloader {
 
     private val waiting = ConcurrentHashMap<String, Promise<String>>()
+    private val waitingLock = Any()
+    private val activeWaiters = HashMap<Promise<String>, Int>()
     private val started = AtomicLong()
     private val done = AtomicLong()
     private val failed = AtomicLong()
 
-    private fun key(msgId: Long, elementId: Long) = msgId.toString() + ":" + elementId
+    @Volatile
+    private var thumbSizeFieldChecked = false
+
+    @Volatile
+    private var thumbSizeField: java.lang.reflect.Field? = null
+
+    private fun key(msgId: Long, elementId: Long, thumb: Boolean) =
+        msgId.toString() + ":" + elementId + ":" + thumb
 
     class DownloadError(msg: String) : RuntimeException(msg)
 
@@ -53,41 +62,74 @@ object MediaDownloader {
             throw DownloadError("缺少 msgId/elementId,无法定位要下载的元素")
         }
 
-        val k = key(msgId, elementId)
-        val promise = waiting.getOrPut(k) { Promise() }
-        val req = RichMediaElementGetReq()
-        req.msgId = msgId
-        req.chatType = chatType
-        req.peerUid = peerUid
-        req.elementId = elementId
-        req.thumbSize = if (thumb) 750 else 0
-        req.downloadType = if (thumb) 2 else 1
-        req.filePath = ""
-        req.triggerType = 1
-        req.downSourceType = 0
-        req.fileModelId = 0
+        val k = key(msgId, elementId, thumb)
+        val promise: Promise<String>
+        val isInitiator: Boolean
+        synchronized(waitingLock) {
+            val cur = waiting[k]
+            if (cur != null) {
+                promise = cur
+                isInitiator = false
+            } else {
+                promise = Promise()
+                waiting[k] = promise
+                isInitiator = true
+            }
+            activeWaiters[promise] = (activeWaiters[promise] ?: 0) + 1
+        }
 
-        started.incrementAndGet()
         try {
-            svc.downloadRichMedia(req)
-        } catch (t: Throwable) {
-            waiting.remove(k)
-            throw DownloadError("downloadRichMedia 抛出: " + t.javaClass.simpleName + " " + t.message)
-        }
+            if (isInitiator) {
+                val req = RichMediaElementGetReq()
+                req.msgId = msgId
+                req.chatType = chatType
+                req.peerUid = peerUid
+                req.elementId = elementId
+                req.thumbSize = if (thumb) 750 else 0
+                req.downloadType = if (thumb) 2 else 1
+                req.filePath = ""
+                req.triggerType = 1
+                req.downSourceType = 0
+                req.fileModelId = 0
 
-        val path = promise.await(Config.kernelTimeoutMs)
-        waiting.remove(k)
-        if (path.isNullOrEmpty()) {
-            failed.incrementAndGet()
-            throw DownloadError("下载超时或内核未回调 (msgId=" + msgId + " elementId=" + elementId + ")")
+                started.incrementAndGet()
+                try {
+                    svc.downloadRichMedia(req)
+                } catch (t: Throwable) {
+                    promise.resolve("")
+                    throw DownloadError("downloadRichMedia 抛出: " + t.javaClass.simpleName + " " + t.message)
+                }
+            }
+
+            val path = try {
+                promise.await(Config.kernelTimeoutMs)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                failed.incrementAndGet()
+                throw DownloadError("下载等待被中断 (msgId=" + msgId + " elementId=" + elementId + ")")
+            }
+            if (path.isNullOrEmpty()) {
+                failed.incrementAndGet()
+                throw DownloadError("下载超时或内核未回调 (msgId=" + msgId + " elementId=" + elementId + ")")
+            }
+            val f = File(path)
+            if (!f.isFile) {
+                failed.incrementAndGet()
+                throw DownloadError("内核报完成但文件不在: " + path)
+            }
+            done.incrementAndGet()
+            return f
+        } finally {
+            synchronized(waitingLock) {
+                val left = (activeWaiters[promise] ?: 1) - 1
+                if (left <= 0) {
+                    activeWaiters.remove(promise)
+                    waiting.remove(k, promise)
+                } else {
+                    activeWaiters[promise] = left
+                }
+            }
         }
-        val f = File(path)
-        if (!f.isFile) {
-            failed.incrementAndGet()
-            throw DownloadError("内核报完成但文件不在: " + path)
-        }
-        done.incrementAndGet()
-        return f
     }
 
     /** 由 MsgListenerProxy 在内核回调线程上调用 —— 只做配对和唤醒,不做任何 IO。 */
@@ -101,9 +143,67 @@ object MediaDownloader {
         // 同一次下载会回调**两次**:先 status=4 带路径的成功,再 status=5 空路径的失败
         // (实测 err=2006024)。谁先到没有保证,所以空路径一律不当结论 —— 认了它就会把
         // 已经下好的文件报成失败。真失败交给调用方的超时兜底。
-        if (i.filePath.isNullOrEmpty()) return
-        val p = waiting[key(i.msgId, i.msgElementId)] ?: return
-        p.resolve(i.filePath)
+        val path = i.filePath
+        if (path.isNullOrEmpty()) return
+
+        val inferredThumb = inferThumb(i, path)
+        val primaryKey = key(i.msgId, i.msgElementId, inferredThumb ?: false)
+        val secondaryKey = key(i.msgId, i.msgElementId, !(inferredThumb ?: false))
+        val target: Promise<String>? = synchronized(waitingLock) {
+            val found = waiting[primaryKey]?.let { primaryKey to it }
+                ?: waiting[secondaryKey]?.let { secondaryKey to it }
+            if (found != null) {
+                waiting.remove(found.first, found.second)
+                found.second
+            } else {
+                null
+            }
+        }
+        target?.resolve(path)
+    }
+
+    /** 切号/会话失效时唤醒并清空所有挂起下载，避免调用线程干等 kernelTimeoutMs。 */
+    fun reset() {
+        val snapshot: List<Pair<String, Promise<String>>> = synchronized(waitingLock) {
+            val list = ArrayList<Pair<String, Promise<String>>>(waiting.size)
+            for ((k, p) in waiting) {
+                list.add(k to p)
+            }
+            for ((k, p) in list) {
+                waiting.remove(k, p)
+            }
+            list
+        }
+        for ((_, p) in snapshot) {
+            p.resolve("")
+        }
+    }
+
+    private fun inferThumb(i: Any, path: String): Boolean? {
+        if (!thumbSizeFieldChecked) {
+            thumbSizeField = try {
+                i.javaClass.getField("thumbSize")
+            } catch (_: Throwable) {
+                try {
+                    i.javaClass.getDeclaredField("thumbSize").apply { isAccessible = true }
+                } catch (_: Throwable) {
+                    null
+                }
+            }
+            thumbSizeFieldChecked = true
+        }
+        val field = thumbSizeField
+        if (field != null) {
+            val v = try {
+                field.getInt(i)
+            } catch (_: Throwable) {
+                -1
+            }
+            if (v > 0) return true
+            if (v == 0) return false
+        }
+        if (path.contains("/Thumb/", ignoreCase = true) || path.contains("_750")) return true
+        return null
     }
 
     fun stats(): Map<String, Long> = linkedMapOf(
