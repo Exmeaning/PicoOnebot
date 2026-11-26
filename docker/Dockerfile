@@ -37,7 +37,11 @@ RUN chmod 755 /stage/system/bin/pico-entrypoint.sh \
         /stage/system/bin/pico-boot.sh \
         /stage/system/bin/pico-doctor.sh \
         /stage/system/bin/pico-health.sh \
-    && chmod 644 /stage/system/etc/init/pico.rc
+        /stage/system/bin/pico-restart.sh \
+    && chmod 644 /stage/system/etc/init/pico.rc \
+        /stage/system/etc/pico-container \
+        /stage/system/etc/pico-auto-accept-privacy \
+        /stage/system/etc/pico-qimei-hosts
 
 # 4. Prepare APK if present in build context
 RUN mkdir -p /stage/opt/pico-onebot /stage/tmp
@@ -72,7 +76,7 @@ COPY --from=builder /stage/opt/ /opt/
 # Expose WebUI (6099), OneBot v11 (3001), ADB (5555)
 EXPOSE 6099 3001 5555
 
-# Entrypoint: Binder checks, kmsg relay to stdout, arch-aware libndk props, and exec /init (PID 1).
+# Entrypoint: Binder checks, optional kmsg relay (opt-in via PICO_LOG_KMSG), arch-aware libndk props, and exec /init (PID 1).
 # Must run on the static BusyBox: Android's own sh cannot start until /init has mounted /apex.
 ENTRYPOINT ["/system/bin/pico-bb/busybox", "sh", "/system/bin/pico-entrypoint.sh"]
 

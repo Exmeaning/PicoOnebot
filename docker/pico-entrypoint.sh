@@ -1,6 +1,6 @@
 #!/system/bin/pico-bb/sh
 # pico-entrypoint.sh: 容器启动入口脚本
-# 负责 Binder 设备校验、权限检查、kmsg 日志转发与启动 Android init (PID 1)。
+# 负责 Binder 设备校验、权限检查、可选 kmsg 日志转发与启动 Android init (PID 1)。
 #
 # 注意：本脚本在 /init 之前运行。此时 /apex 尚未挂载，Android 自带的 /system/bin/sh、stat、
 # grep 等全部动态链接到 /apex/com.android.runtime 下的 linker/libc，execve 会直接报
@@ -8,12 +8,15 @@
 # 且 PATH 里 BusyBox 必须排在 /system/bin 之前。
 #
 # 环境变量：
-#   PICO_LOG_KMSG=1|all|0   将 /dev/kmsg 转发至 stdout。默认 1 (关键日志)，all (全量)，0 (关闭)
+#   PICO_LOG_KMSG=0|1|all   将容器启动后的 /dev/kmsg 转发至 stdout。
+#                           默认 0 (关闭，避免泄露宿主机内核日志；pico-boot 已直接输出至容器 stdout)
+#                           1 (仅转发容器 Android init/核心服务新增日志，去重 pico-boot 输出)
+#                           all (转发启动后全量内核日志，仅用于排障，含宿主机共享内核输出)
 #   PICO_BINDER_STRICT=1    Binder 校验未通过时直接退出（默认 0，仅告警）
 
 export PATH=/system/bin/pico-bb:/system/bin:/system/xbin
 
-say() { echo "[pico-entrypoint] $*"; }
+say() { printf '[pico-entrypoint] %s\n' "$*"; }
 
 say "=============================================================="
 say "PicoOnebot All-in-One 容器启动"
@@ -60,23 +63,75 @@ else
     say "未检测到外部 Binder 节点映射，将通过 binderfs 自动挂载。"
 fi
 
-# ── 转发 /dev/kmsg 至 stdout ────────────────────────────────────────────────
-case "${PICO_LOG_KMSG:-1}" in
-    0) say "已禁用 kmsg 日志转发 (PICO_LOG_KMSG=0)。" ;;
+# ── 可选转发 /dev/kmsg 至 stdout ────────────────────────────────────────────
+# /dev/kmsg 属于宿主机共享内核环形缓冲：
+# - 默认关闭 (PICO_LOG_KMSG=0)，避免向容器 stdout 泄露无关宿主机内核日志；
+# - 开启 1/all 时记录容器启动时刻 (/proc/uptime)，丢弃历史宿主机记录并过滤已直接输出至 stdout 的 pico-boot 日志。
+kmsg_relay() {
+    _mode="$1"
+    _start_sec=0
+    if [ -r /proc/uptime ]; then
+        read -r _up _ < /proc/uptime 2>/dev/null || true
+        _up_int="${_up%%.*}"
+        case "$_up_int" in
+            ''|*[!0-9]*) _start_sec=0 ;;
+            *) _start_sec="$_up_int" ;;
+        esac
+    fi
+    cat /dev/kmsg 2>/dev/null | while IFS= read -r _line; do
+        # 跳过续行元数据 (以空格开头或不含分号)
+        case "$_line" in
+            ' '*) continue ;;
+            *';'*) ;;
+            *) continue ;;
+        esac
+        _hdr="${_line%%;*}"
+        _msg="${_line#*;}"
+        # 提取第 3 字段 (微秒时间戳) 并转为整秒，跳过容器启动之前的宿主机历史日志
+        _ts_field="${_hdr#*,}"
+        _ts_field="${_ts_field#*,}"
+        _ts_us="${_ts_field%%,*}"
+        case "$_ts_us" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        if [ "${#_ts_us}" -le 6 ]; then
+            _ts_sec=0
+        else
+            _ts_sec="${_ts_us%??????}"
+        fi
+        [ "$_ts_sec" -ge "$_start_sec" ] || continue
+        # 避免重复输出已直写 /proc/1/fd/1 的 pico-boot / pico-entrypoint 日志
+        case "$_msg" in
+            *'[pico-boot '*|*'[pico-entrypoint]'*) continue ;;
+        esac
+        if [ "$_mode" = "all" ]; then
+            printf '[kmsg] %s\n' "$_msg"
+        else
+            case "$_msg" in
+                init:*|*'servicemanager'*|*'surfaceflinger'*|*'zygote'*|*'keystore'*|*'redroid'*)
+                    printf '[kmsg] %s\n' "$_msg"
+                    ;;
+            esac
+        fi
+    done
+}
+
+case "${PICO_LOG_KMSG:-0}" in
+    0|'')
+        say "已禁用 kmsg 日志转发 (默认 PICO_LOG_KMSG=0，可设为 1 或 all 排障)。"
+        ;;
     all)
         if [ -r /dev/kmsg ]; then
-            say "已开启 kmsg 全量日志转发。"
-            ( cat /dev/kmsg 2>/dev/null | while IFS= read -r line; do echo "[kmsg] $line"; done ) &
+            say "WARN: 已开启 kmsg 全量日志转发 (仅转发启动后记录；注意 /dev/kmsg 包含宿主机内核输出)。"
+            kmsg_relay all &
         else
             say "WARN: /dev/kmsg 不可读，无法转发日志。"
         fi
         ;;
     *)
         if [ -r /dev/kmsg ]; then
-            say "已开启 kmsg 核心日志转发 (可通过 PICO_LOG_KMSG=all 开启全量)。"
-            ( cat /dev/kmsg 2>/dev/null \
-                | grep -i -E 'init:|binder|pico|servicemanager|surfaceflinger|zygote|keystore|permission denied|selinux' \
-                | while IFS= read -r line; do echo "[kmsg] $line"; done ) &
+            say "已开启 kmsg 核心 Android 服务日志转发 (已过滤历史宿主机记录与重复输出)。"
+            kmsg_relay core &
         else
             say "WARN: /dev/kmsg 不可读，无法转发日志。"
         fi
@@ -88,6 +143,7 @@ if [ ! -x /init ]; then
     exit 127
 fi
 
+# shellcheck source=docker/pico-network.sh
 . /system/bin/pico-network.sh
 
 # redroid 官方镜像的 ENTRYPOINT 是 ["/init","qemu=1","androidboot.hardware=redroid"]。

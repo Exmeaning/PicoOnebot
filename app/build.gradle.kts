@@ -50,7 +50,7 @@ android {
     defaultConfig {
         applicationId = "com.tencent.qqlite"
         minSdk = 21
-        targetSdk = 35
+        targetSdk = 34
         versionCode = 1
         versionName = picoVersion
 
@@ -87,6 +87,7 @@ dependencies {
     compileOnly(libs.androidx.appcompat)
     compileOnly(libs.androidx.fragment)
     compileOnly(libs.androidx.core)
+    testImplementation(libs.junit)
 }
 
 apkMixin {
