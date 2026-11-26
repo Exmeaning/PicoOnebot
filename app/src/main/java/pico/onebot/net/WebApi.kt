@@ -50,6 +50,7 @@ object WebApi {
     private data class LogStreamEntry(val conn: WsConn, val sessionToken: String?)
     private data class AuthFailureState(
         var failures: Int = 0,
+        var hasLockout: Boolean = false,
         var lockedUntilNanos: Long = 0L,
         var lastFailureNanos: Long = 0L
     )
@@ -58,7 +59,8 @@ object WebApi {
         val authorized: Boolean,
         val sessionToken: String? = null,
         val rateLimited: Boolean = false,
-        val retryAfterSec: Long = 0L
+        val retryAfterSec: Long = 0L,
+        val authEpoch: Long = 0L
     )
 
     /**
@@ -68,6 +70,7 @@ object WebApi {
     private val sessions = LinkedHashMap<String, SessionEntry>(64, 0.75f, false)
     private val logStreams = LinkedHashSet<LogStreamEntry>()
     private val sessionsLock = Any()
+    private var sessionEpoch: Long = 0L
 
     private val authFailures = LinkedHashMap<String, AuthFailureState>(64, 0.75f, true)
     private val globalFailWindow = ArrayDeque<Long>(GLOBAL_PBKDF2_MAX_FAILS + 1)
@@ -252,11 +255,17 @@ object WebApi {
         val queryCred = if (allowQuerySession) (query["token"] ?: "") else ""
 
         // 1. 优先 O(1) 校验已签发的会话令牌(零 PBKDF2 开销)
-        if (headerCred.isNotEmpty() && hasSession(headerCred)) {
-            return AuthCheck(authorized = true, sessionToken = headerCred)
+        if (headerCred.isNotEmpty()) {
+            val epoch = lookupSessionEpoch(headerCred)
+            if (epoch != null) {
+                return AuthCheck(authorized = true, sessionToken = headerCred, authEpoch = epoch)
+            }
         }
-        if (queryCred.isNotEmpty() && hasSession(queryCred)) {
-            return AuthCheck(authorized = true, sessionToken = queryCred)
+        if (queryCred.isNotEmpty()) {
+            val epoch = lookupSessionEpoch(queryCred)
+            if (epoch != null) {
+                return AuthCheck(authorized = true, sessionToken = queryCred, authEpoch = epoch)
+            }
         }
 
         // 2. 仅允许 Authorization 头回退校验密码(兼容运维脚本),且单请求最多跑一次 PBKDF2 并受限流保护;
@@ -266,9 +275,17 @@ object WebApi {
             if (waitSec > 0L) {
                 return AuthCheck(authorized = false, rateLimited = true, retryAfterSec = waitSec)
             }
+            val epochBefore = synchronized(sessionsLock) { sessionEpoch }
+            val initBefore = Config.webuiPasswordInitialized
             if (Config.verifyWebuiPassword(headerCred)) {
+                val stillValid = synchronized(sessionsLock) {
+                    sessionEpoch == epochBefore && Config.webuiPasswordInitialized == initBefore
+                }
+                if (!stillValid) {
+                    return AuthCheck(authorized = false)
+                }
                 recordAuthSuccess(clientIp)
-                return AuthCheck(authorized = true, sessionToken = null)
+                return AuthCheck(authorized = true, sessionToken = null, authEpoch = epochBefore)
             }
             recordAuthFailure(clientIp)
         }
@@ -286,17 +303,20 @@ object WebApi {
             pruneGlobalFailuresLocked(now)
             if (globalFailWindow.size >= GLOBAL_PBKDF2_MAX_FAILS) {
                 val oldest = globalFailWindow.first()
-                val remNs = (oldest + GLOBAL_PBKDF2_WINDOW_NS - now).coerceAtLeast(1_000_000_000L)
+                val remNs = ((oldest + GLOBAL_PBKDF2_WINDOW_NS) - now).coerceAtLeast(1_000_000_000L)
                 return (remNs + 999_999_999L) / 1_000_000_000L
             }
             val state = authFailures[clientIp] ?: return 0L
-            if (now - state.lastFailureNanos > AUTH_DECAY_NS) {
+            if ((now - state.lastFailureNanos) > AUTH_DECAY_NS) {
                 authFailures.remove(clientIp)
                 return 0L
             }
-            if (state.lockedUntilNanos > now) {
+            if (state.hasLockout) {
                 val remNs = state.lockedUntilNanos - now
-                return ((remNs + 999_999_999L) / 1_000_000_000L).coerceAtLeast(1L)
+                if (remNs > 0L) {
+                    return ((remNs + 999_999_999L) / 1_000_000_000L).coerceAtLeast(1L)
+                }
+                state.hasLockout = false
             }
             return 0L
         }
@@ -316,8 +336,9 @@ object WebApi {
                 }
                 authFailures[clientIp] = it
             }
-            if (now - state.lastFailureNanos > AUTH_DECAY_NS) {
+            if (state.failures > 0 && (now - state.lastFailureNanos) > AUTH_DECAY_NS) {
                 state.failures = 0
+                state.hasLockout = false
                 state.lockedUntilNanos = 0L
             }
             state.failures++
@@ -326,6 +347,7 @@ object WebApi {
                 val shift = (state.failures - AUTH_FREE_FAILURES - 1).coerceAtMost(9)
                 val lockMs = minOf(1_000L shl shift, AUTH_MAX_LOCKOUT_MS)
                 state.lockedUntilNanos = now + lockMs * 1_000_000L
+                state.hasLockout = true
             }
         }
     }
@@ -337,7 +359,7 @@ object WebApi {
     }
 
     private fun pruneGlobalFailuresLocked(now: Long) {
-        while (globalFailWindow.isNotEmpty() && now - globalFailWindow.first() > GLOBAL_PBKDF2_WINDOW_NS) {
+        while (globalFailWindow.isNotEmpty() && (now - globalFailWindow.first()) > GLOBAL_PBKDF2_WINDOW_NS) {
             globalFailWindow.removeFirst()
         }
     }
@@ -355,21 +377,27 @@ object WebApi {
         if (waitSec > 0L) {
             return error(429, "登录失败次数过多，请 ${waitSec} 秒后再试")
         }
+        val epochBefore = synchronized(sessionsLock) { sessionEpoch }
+        val initBefore = Config.webuiPasswordInitialized
         if (token.isNotEmpty() && Config.verifyWebuiPassword(token)) {
+            val session = newSessionIfEpoch(epochBefore, initBefore)
+                ?: return Response(401, JSONObject().put("ok", false).put("message", "密码已变更，请使用新密码重新登录"))
             recordAuthSuccess(clientIp)
-            val session = newSession()
-            return loginResponse(session)
+            return loginResponse(session, !initBefore)
         }
         recordAuthFailure(clientIp)
         return Response(401, JSONObject().put("ok", false).put("message", "密码不正确或会话已失效"))
     }
 
-    private fun loginResponse(session: String): Response =
+    private fun loginResponse(
+        session: String,
+        mustChangePassword: Boolean = !Config.webuiPasswordInitialized
+    ): Response =
         Response(
             200, JSONObject()
                 .put("ok", true)
                 .put("token", session)
-                .put("mustChangePassword", !Config.webuiPasswordInitialized)
+                .put("mustChangePassword", mustChangePassword)
         )
 
     private fun newSession(): String {
@@ -378,40 +406,64 @@ object WebApi {
         val now = System.nanoTime()
         val evictedStreams = ArrayList<WsConn>()
         synchronized(sessionsLock) {
-            pruneExpiredSessionsLocked(now, evictedStreams)
-            while (sessions.size >= SESSION_CAP) {
-                val oldest = sessions.keys.iterator()
-                if (!oldest.hasNext()) break
-                val evictedToken = oldest.next()
-                oldest.remove()
-                collectStreamsForSessionLocked(evictedToken, evictedStreams)
-            }
-            sessions[session] = SessionEntry(now, now)
+            insertSessionLocked(session, now, evictedStreams)
         }
         for (c in evictedStreams) c.close()
         return session
     }
 
-    private fun hasSession(token: String): Boolean {
+    /** 仅当会话代际与初始化状态均未变更时才签发新会话,彻底消除登录与改密/初始化的 TOCTOU 会话固定。 */
+    private fun newSessionIfEpoch(expectedEpoch: Long, expectedInitialized: Boolean): String? {
+        val bytes = ByteArray(32).also { secureRandom.nextBytes(it) }
+        val session = Base64.encodeToString(bytes, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
         val now = System.nanoTime()
-        val expiredStreams = ArrayList<WsConn>()
-        val valid = synchronized(sessionsLock) {
-            val entry = sessions[token] ?: return false
-            if (isExpired(entry, now)) {
-                sessions.remove(token)
-                collectStreamsForSessionLocked(token, expiredStreams)
+        val evictedStreams = ArrayList<WsConn>()
+        val minted = synchronized(sessionsLock) {
+            if (sessionEpoch != expectedEpoch || Config.webuiPasswordInitialized != expectedInitialized) {
                 false
             } else {
-                entry.lastSeenAtNanos = now
+                insertSessionLocked(session, now, evictedStreams)
                 true
             }
         }
+        for (c in evictedStreams) c.close()
+        return if (minted) session else null
+    }
+
+    private fun insertSessionLocked(session: String, now: Long, evictedStreams: MutableList<WsConn>) {
+        pruneExpiredSessionsLocked(now, evictedStreams)
+        while (sessions.size >= SESSION_CAP) {
+            val oldest = sessions.keys.iterator()
+            if (!oldest.hasNext()) break
+            val evictedToken = oldest.next()
+            oldest.remove()
+            collectStreamsForSessionLocked(evictedToken, evictedStreams)
+        }
+        sessions[session] = SessionEntry(now, now)
+    }
+
+    private fun hasSession(token: String): Boolean = lookupSessionEpoch(token) != null
+
+    private fun lookupSessionEpoch(token: String): Long? {
+        val now = System.nanoTime()
+        val expiredStreams = ArrayList<WsConn>()
+        val epoch = synchronized(sessionsLock) {
+            val entry = sessions[token] ?: return null
+            if (isExpired(entry, now)) {
+                sessions.remove(token)
+                collectStreamsForSessionLocked(token, expiredStreams)
+                null
+            } else {
+                entry.lastSeenAtNanos = now
+                sessionEpoch
+            }
+        }
         for (c in expiredStreams) c.close()
-        return valid
+        return epoch
     }
 
     private fun isExpired(entry: SessionEntry, now: Long): Boolean =
-        (now - entry.lastSeenAtNanos > SESSION_IDLE_TTL_NS) || (now - entry.createdAtNanos > SESSION_ABS_TTL_NS)
+        ((now - entry.lastSeenAtNanos) > SESSION_IDLE_TTL_NS) || ((now - entry.createdAtNanos) > SESSION_ABS_TTL_NS)
 
     private fun pruneExpiredSessionsLocked(now: Long, toClose: MutableList<WsConn>) {
         val it = sessions.entries.iterator()
@@ -448,6 +500,7 @@ object WebApi {
     private fun clearSessions() {
         val toClose: List<WsConn>
         synchronized(sessionsLock) {
+            sessionEpoch++
             sessions.clear()
             toClose = logStreams.map { it.conn }
             logStreams.clear()
@@ -460,10 +513,12 @@ object WebApi {
         logStreams.size
     }
 
-    internal fun registerLogStream(conn: WsConn, sessionToken: String?): Boolean {
+    internal fun registerLogStream(conn: WsConn, sessionToken: String?, expectedEpoch: Long): Boolean {
         val now = System.nanoTime()
         synchronized(sessionsLock) {
             logStreams.removeAll { it.conn.closed }
+            if (!Config.webuiPasswordInitialized) return false
+            if (sessionEpoch != expectedEpoch) return false
             if (sessionToken != null) {
                 val entry = sessions[sessionToken]
                 if (entry == null || isExpired(entry, now)) return false
@@ -1060,7 +1115,11 @@ object WebApi {
             return Response(200, JSONObject().put("ok", true).put("sessionsRevoked", true))
         }
         if (!Config.initializeWebuiPassword(token)) {
-            return Response(409, JSONObject().put("ok", false).put("message", "控制台密码已设置，不允许再次修改"))
+            return if (Config.webuiPasswordInitialized) {
+                Response(409, JSONObject().put("ok", false).put("message", "控制台密码已设置，不允许再次修改"))
+            } else {
+                error(500, "保存控制台密码失败，请检查存储空间或权限")
+            }
         }
         // 首次初始化密码必须撤销所有预初始化会话并轮换签发新会话令牌,封堵会话固定
         clearSessions()
@@ -1097,7 +1156,7 @@ object WebApi {
             val beforeUrl = PicoLoginManager.latestQrUrl
             if (PicoLoginManager.refreshQr()) {
                 val deadline = System.nanoTime() + QR_REFRESH_WAIT_NS
-                while (System.nanoTime() < deadline) {
+                while ((deadline - System.nanoTime()) > 0L) {
                     val curTime = PicoLoginManager.latestQrTime
                     val curUrl = PicoLoginManager.latestQrUrl
                     if (curTime > before && !curUrl.isNullOrBlank() && curUrl != beforeUrl) {

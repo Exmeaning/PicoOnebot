@@ -163,12 +163,12 @@ object WsFrame {
      * 读一行(以 \r\n 或 \n 结束,拒绝行中裸 \r 并限制最大长度与可选单调截止时间);流结束返回 null。
      */
     @Throws(IOException::class)
-    fun readLine(ins: InputStream, maxLen: Int = MAX_LINE_BYTES, deadlineNanos: Long = 0L): String? {
+    fun readLine(ins: InputStream, maxLen: Int = MAX_LINE_BYTES, deadlineNanos: Long? = null): String? {
         val sb = StringBuilder()
         var count = 0
         var prevCr = false
         while (true) {
-            if (deadlineNanos > 0L && System.nanoTime() > deadlineNanos) {
+            if (deadlineNanos != null && (System.nanoTime() - deadlineNanos) > 0L) {
                 throw SocketTimeoutException("line read deadline exceeded")
             }
             val b = ins.read()

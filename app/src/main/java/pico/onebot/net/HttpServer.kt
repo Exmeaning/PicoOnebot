@@ -274,7 +274,7 @@ class HttpServer(
                         writeText(out, 503, "text/plain", "too many log stream connections")
                         return
                     }
-                    serveLogStream(sock, ins, out, headers, auth.sessionToken)
+                    serveLogStream(sock, ins, out, headers, auth.sessionToken, auth.authEpoch)
                     return
                 }
                 if (!authorized(headers, query)) {
@@ -351,7 +351,8 @@ class HttpServer(
         ins: InputStream,
         out: OutputStream,
         headers: Map<String, String>,
-        sessionToken: String?
+        sessionToken: String?,
+        authEpoch: Long
     ) {
         if (!wsHandshake(out, headers)) return
         var conn: WsConn? = null
@@ -359,7 +360,7 @@ class HttpServer(
         try {
             val c = WsConn(sock, ins, out, sock.inetAddress.hostAddress + ":" + sock.port, WsConn.Role.EVENT, false)
             conn = c
-            if (!running || !WebApi.registerLogStream(c, sessionToken)) {
+            if (!running || !WebApi.registerLogStream(c, sessionToken, authEpoch)) {
                 return
             }
             // 先补发最近若干条,前端一连上就有内容

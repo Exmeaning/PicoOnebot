@@ -110,7 +110,7 @@ class WsClient(
         val maxBackoff = Config.long("reverse_reconnect_max_ms", 60000).coerceAtLeast(minBackoff)
         val redactedUrl = safeUrl(url)
         while (running) {
-            var establishedAtNanos = 0L
+            var establishedAtNanos: Long? = null
             var failed = false
             try {
                 establishedAtNanos = connectOnce(redactedUrl)
@@ -125,7 +125,7 @@ class WsClient(
                 socket = null
             }
             if (!running) return
-            val lastedMs = if (establishedAtNanos > 0L) {
+            val lastedMs = if (establishedAtNanos != null) {
                 ((System.nanoTime() - establishedAtNanos) / 1_000_000L).coerceAtLeast(0L)
             } else {
                 0L
@@ -148,7 +148,7 @@ class WsClient(
         }
     }
 
-    private fun connectOnce(redactedUrl: String): Long {
+    private fun connectOnce(redactedUrl: String): Long? {
         val uri = URI(url)
         val scheme = uri.scheme?.lowercase() ?: ""
         val secure = when (scheme) {
@@ -173,7 +173,7 @@ class WsClient(
                 rawSock.close()
             } catch (_: Throwable) {
             }
-            return 0L
+            return null
         }
         rawSock.connect(InetSocketAddress(host, port), 10_000)
 

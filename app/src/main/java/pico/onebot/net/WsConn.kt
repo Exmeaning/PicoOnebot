@@ -140,7 +140,7 @@ class WsConn(
         try {
             while (!closed) {
                 val now = System.nanoTime()
-                if (now >= nextPingAt) {
+                if ((now - nextPingAt) >= 0L) {
                     if (closed) return
                     if (!writeFrame(WsFrame.OP_PING, ByteArray(0))) return
                     nextPingAt = System.nanoTime() + PING_INTERVAL_NS
