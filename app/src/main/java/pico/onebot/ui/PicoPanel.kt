@@ -87,8 +87,13 @@ object PicoPanel {
         act.runOnUiThread { dismiss() }
     }
 
-    private var pendingUnsub: (() -> Unit)? = null
-    private var pendingActivityRef: WeakReference<Activity>? = null
+    private class PendingWaiter(val activityRef: WeakReference<Activity>) {
+        var unsub: (() -> Unit)? = null
+        var cancelled: Boolean = false
+        var fired: Boolean = false
+    }
+
+    private var pendingWaiter: PendingWaiter? = null
 
     /** 延迟在 MainActivity 上尝试弹面板,并在该 Activity 销毁时可精确取消回调避免泄漏。 */
     fun scheduleMaybeShow(activity: Activity, delayMs: Long = 1500L) {
@@ -132,49 +137,45 @@ object PicoPanel {
             if (shownInProcess) return
             if (KernelGate.state == KernelGate.State.ONLINE) {
                 shownInProcess = true
-                oldUnsub = pendingUnsub
-                pendingUnsub = null
-                pendingActivityRef = null
+                val prev = pendingWaiter
+                pendingWaiter = null
+                prev?.cancelled = true
+                oldUnsub = prev?.unsub
                 shouldShowNow = true
             } else {
-                if (pendingUnsub != null && pendingActivityRef?.get() === activity) return
-                oldUnsub = pendingUnsub
-                pendingUnsub = null
-                pendingActivityRef = null
+                val cur = pendingWaiter
+                if (cur != null && !cur.cancelled && cur.activityRef.get() === activity) return
+                oldUnsub = null
                 shouldShowNow = false
             }
         }
         oldUnsub?.invoke()
         if (shouldShowNow) {
-            show(activity)
+            showOnUiThread(activity)
             return
         }
 
         PicoLog.d("panel: not online yet, will show after ONLINE")
-        val ref = WeakReference(activity)
-        val holder = arrayOfNulls<() -> Unit>(1)
-        var firedBeforeAssign = false
+        // listener 仅捕获 WeakReference 包装的 waiter,绝不强引用 Activity
+        val waiter = PendingWaiter(WeakReference(activity))
         val listener: (KernelGate.State) -> Unit = { st ->
             if (st == KernelGate.State.ONLINE) {
                 var toCancel: (() -> Unit)? = null
                 val shouldDispatch = synchronized(stateLock) {
-                    val isOwner = (holder[0] != null && pendingUnsub === holder[0]) ||
-                        (holder[0] == null && pendingActivityRef?.get() === activity)
-                    if (!isOwner && holder[0] != null) {
+                    if (waiter.cancelled || waiter.fired) {
                         false
                     } else {
-                        toCancel = holder[0]
-                        if (toCancel == null) firedBeforeAssign = true
-                        if (pendingUnsub === holder[0] || pendingActivityRef?.get() === activity) {
-                            pendingUnsub = null
-                            pendingActivityRef = null
+                        waiter.fired = true
+                        toCancel = waiter.unsub
+                        if (pendingWaiter === waiter) {
+                            pendingWaiter = null
                         }
                         !shownInProcess
                     }
                 }
                 toCancel?.invoke()
                 if (shouldDispatch) {
-                    val act = ref.get()
+                    val act = waiter.activityRef.get()
                     if (act != null && !act.isFinishing && !act.isDestroyed) {
                         act.runOnUiThread {
                             try {
@@ -196,17 +197,55 @@ object PicoPanel {
             }
         }
         val registered = KernelGate.addStateListener(listener)
-        val cancelNow = synchronized(stateLock) {
-            holder[0] = registered
-            if (firedBeforeAssign || shownInProcess || activity.isFinishing || activity.isDestroyed) {
-                true
-            } else {
-                pendingUnsub = registered
-                pendingActivityRef = ref
-                false
+        var cancelRegistered = false
+        var supersededUnsub: (() -> Unit)? = null
+        var showAfterRegister = false
+        synchronized(stateLock) {
+            waiter.unsub = registered
+            when {
+                waiter.fired || waiter.cancelled || shownInProcess || activity.isFinishing || activity.isDestroyed -> {
+                    waiter.cancelled = true
+                    cancelRegistered = true
+                }
+                KernelGate.state == KernelGate.State.ONLINE -> {
+                    // 复查 ONLINE 消除释放锁到 addStateListener 之间的 TOCTOU 竞态
+                    waiter.cancelled = true
+                    cancelRegistered = true
+                    shownInProcess = true
+                    val prev = pendingWaiter
+                    pendingWaiter = null
+                    prev?.cancelled = true
+                    supersededUnsub = prev?.unsub
+                    showAfterRegister = true
+                }
+                else -> {
+                    val prev = pendingWaiter
+                    if (prev != null && !prev.cancelled && prev.activityRef.get() === activity) {
+                        waiter.cancelled = true
+                        cancelRegistered = true
+                    } else {
+                        if (prev != null) {
+                            prev.cancelled = true
+                            supersededUnsub = prev.unsub
+                        }
+                        pendingWaiter = waiter
+                    }
+                }
             }
         }
-        if (cancelNow) registered()
+        if (cancelRegistered) registered()
+        supersededUnsub?.invoke()
+        if (showAfterRegister) showOnUiThread(activity)
+    }
+
+    private fun showOnUiThread(activity: Activity) {
+        activity.runOnUiThread {
+            try {
+                if (!activity.isFinishing && !activity.isDestroyed) show(activity)
+            } catch (t: Throwable) {
+                PicoLog.e("panel: show failed", t)
+            }
+        }
     }
 
     fun show(activity: Activity) {
@@ -265,11 +304,12 @@ object PicoPanel {
         val shouldDismiss: Boolean
         synchronized(stateLock) {
             scheduled = scheduledShows.remove(activity)
-            val pendingOwner = pendingActivityRef?.get()
-            if (pendingOwner === activity || pendingOwner == null) {
-                unsubForThisActivity = pendingUnsub
-                pendingUnsub = null
-                pendingActivityRef = null
+            val cur = pendingWaiter
+            val pendingOwner = cur?.activityRef?.get()
+            if (cur != null && (pendingOwner === activity || pendingOwner == null)) {
+                cur.cancelled = true
+                pendingWaiter = null
+                unsubForThisActivity = cur.unsub
             } else {
                 unsubForThisActivity = null
             }
