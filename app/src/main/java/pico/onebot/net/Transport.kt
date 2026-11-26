@@ -3,6 +3,7 @@ package pico.onebot.net
 import org.json.JSONObject
 import pico.onebot.core.Config
 import pico.onebot.core.PicoLog
+import pico.onebot.proto.Ob
 import java.util.ArrayDeque
 import java.util.concurrent.CopyOnWriteArrayList
 
@@ -13,27 +14,51 @@ import java.util.concurrent.CopyOnWriteArrayList
 object Transport {
 
     private const val REPLAY_CAPACITY = 256
-    private const val REPLAY_MAX_AGE_MS = 60_000L
+    private const val REPLAY_MAX_AGE_NS = 60_000_000_000L
 
-    private data class BufferedEvent(val text: String, val ts: Long)
+    private data class BufferedEvent(val text: String, val tsNanos: Long)
 
     private val conns = CopyOnWriteArrayList<WsConn>()
     private val lock = Any()
     private val replayBuffer = ArrayDeque<BufferedEvent>(REPLAY_CAPACITY)
+    private var epoch: Long = 0L
+
+    fun currentEpoch(): Long = synchronized(lock) { epoch }
 
     fun add(c: WsConn) {
+        add(c, -1L)
+    }
+
+    /**
+     * 登记一条新的 OneBot WebSocket 连接。
+     * 若连接已关闭或热重载代际已过期,拒绝登记并确保返回 false。
+     */
+    fun add(c: WsConn, expectedEpoch: Long): Boolean {
         synchronized(lock) {
+            if (c.closed) return false
+            if (expectedEpoch >= 0L && expectedEpoch != epoch) return false
             conns.add(c)
             PicoLog.i("ws connected: " + c.tag + " role=" + c.role + " total=" + conns.size)
-            if (c.wantsEvents && Config.enabled && !c.closed && replayBuffer.isNotEmpty()) {
-                drainReplayLocked(c)
+            if (c.wantsEvents && Config.enabled && !c.closed) {
+                // OneBot v11: 每条新 WS 连接建立后推送一次 lifecycle.connect。
+                val connectEvent = Ob.event("meta_event")
+                    .put("meta_event_type", "lifecycle")
+                    .put("sub_type", "connect")
+                    .toString()
+                c.sendText(connectEvent)
+                if (!c.closed && replayBuffer.isNotEmpty()) {
+                    drainReplayLocked(c)
+                }
             }
+            return true
         }
     }
 
     fun remove(c: WsConn) {
-        if (conns.remove(c)) {
-            PicoLog.i("ws closed: " + c.tag + " total=" + conns.size)
+        synchronized(lock) {
+            if (conns.remove(c)) {
+                PicoLog.i("ws closed: " + c.tag + " total=" + conns.size)
+            }
         }
     }
 
@@ -42,7 +67,9 @@ object Transport {
             var delivered = false
             for (c in conns) {
                 if (c.closed) {
-                    remove(c)
+                    if (conns.remove(c)) {
+                        PicoLog.i("ws closed: " + c.tag + " total=" + conns.size)
+                    }
                     continue
                 }
                 if (c.wantsEvents && c.sendText(text)) {
@@ -56,7 +83,7 @@ object Transport {
     }
 
     private fun enqueueReplayLocked(text: String) {
-        val now = System.currentTimeMillis()
+        val now = System.nanoTime()
         pruneExpiredLocked(now)
         while (replayBuffer.size >= REPLAY_CAPACITY) {
             replayBuffer.removeFirst()
@@ -65,7 +92,7 @@ object Transport {
     }
 
     private fun drainReplayLocked(c: WsConn) {
-        val now = System.currentTimeMillis()
+        val now = System.nanoTime()
         pruneExpiredLocked(now)
         var replayed = 0
         while (replayBuffer.isNotEmpty()) {
@@ -79,10 +106,10 @@ object Transport {
         }
     }
 
-    private fun pruneExpiredLocked(now: Long) {
+    private fun pruneExpiredLocked(nowNanos: Long) {
         while (replayBuffer.isNotEmpty()) {
             val head = replayBuffer.peekFirst()
-            if (now - head.ts > REPLAY_MAX_AGE_MS) {
+            if (nowNanos - head.tsNanos > REPLAY_MAX_AGE_NS) {
                 replayBuffer.removeFirst()
             } else {
                 break
@@ -90,10 +117,13 @@ object Transport {
         }
     }
 
-    private fun isMetaEvent(text: String): Boolean = try {
-        JSONObject(text).optString("post_type") == "meta_event"
-    } catch (_: Throwable) {
-        false
+    private fun isMetaEvent(text: String): Boolean {
+        if (!text.contains("\"meta_event\"")) return false
+        return try {
+            JSONObject(text).optString("post_type") == "meta_event"
+        } catch (_: Throwable) {
+            false
+        }
     }
 
     fun count(): Int = conns.size
@@ -107,12 +137,17 @@ object Transport {
     }
 
     fun closeAll() {
-        for (c in conns) c.close()
-        conns.clear()
-        if (!Config.enabled) {
-            synchronized(lock) {
+        val snapshot: List<WsConn>
+        synchronized(lock) {
+            epoch++
+            snapshot = ArrayList(conns)
+            conns.clear()
+            if (!Config.enabled) {
                 replayBuffer.clear()
             }
+        }
+        for (c in snapshot) {
+            c.close()
         }
     }
 }

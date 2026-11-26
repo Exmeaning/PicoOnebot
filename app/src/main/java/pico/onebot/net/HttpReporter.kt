@@ -7,7 +7,9 @@ import pico.onebot.core.Config
 import pico.onebot.core.PicoLog
 import pico.onebot.kernel.KernelGate
 import java.io.ByteArrayOutputStream
+import java.io.InterruptedIOException
 import java.net.HttpURLConnection
+import java.net.URI
 import java.net.URL
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ThreadFactory
@@ -33,6 +35,11 @@ object HttpReporter {
 
     private class HttpStatusException(val code: Int, message: String) : java.io.IOException(message)
 
+    private const val MIN_TIMEOUT_MS = 1_000
+    private const val MAX_TIMEOUT_MS = 60_000
+    private const val MIN_QUEUE_SIZE = 16
+    private const val MAX_QUEUE_SIZE = 65_536
+
     private lateinit var queue: ArrayBlockingQueue<String>
     private val queueLock = Any()
 
@@ -41,8 +48,10 @@ object HttpReporter {
     private val dropped = AtomicLong()
     private val quickOps = AtomicLong()
     private val quickOpSeq = AtomicInteger()
+    private val workerGen = AtomicLong(0)
+
     private val quickOpExecutor = ThreadPoolExecutor(
-        2,
+        4,
         8,
         60L,
         TimeUnit.SECONDS,
@@ -58,7 +67,29 @@ object HttpReporter {
     @Volatile
     private var targets: List<Target> = emptyList()
 
+    @Volatile
+    private var activeConn: HttpURLConnection? = null
+
     private var worker: Thread? = null
+
+    private fun isHttpScheme(raw: String): Boolean = try {
+        val scheme = URI(raw).scheme?.lowercase()
+        scheme == "http" || scheme == "https"
+    } catch (_: Throwable) {
+        false
+    }
+
+    private fun safeUrl(raw: String): String = try {
+        val u = URI(raw)
+        val scheme = u.scheme ?: ""
+        val host = u.host ?: ""
+        val portPart = if (u.port > 0) ":${u.port}" else ""
+        val pathPart = u.rawPath ?: ""
+        if (scheme.isNotEmpty() && host.isNotEmpty()) "$scheme://$host$portPart$pathPart"
+        else raw.substringBefore('?').substringBefore('#')
+    } catch (_: Throwable) {
+        raw.substringBefore('?').substringBefore('#')
+    }
 
     @Synchronized
     fun start() {
@@ -66,8 +97,12 @@ object HttpReporter {
         val nextTargets = (0 until configured.length()).mapNotNull { i ->
             val item = configured.optJSONObject(i) ?: return@mapNotNull null
             if (!item.optBoolean("enabled", true)) return@mapNotNull null
-            val url = item.optString("url", "")
+            val url = item.optString("url", "").trim()
             if (url.isBlank()) return@mapNotNull null
+            if (!isHttpScheme(url)) {
+                PicoLog.w("skipping http report target with unsupported scheme: " + safeUrl(url))
+                return@mapNotNull null
+            }
             Target(url, item.optString("token", ""), item.optString("secret", ""))
         }
         targets = nextTargets
@@ -78,18 +113,26 @@ object HttpReporter {
         if (running) return
         synchronized(queueLock) {
             if (!::queue.isInitialized) {
-                queue = ArrayBlockingQueue(Config.int("post_queue_size", 1024))
+                val cap = Config.int("post_queue_size", 1024).coerceIn(MIN_QUEUE_SIZE, MAX_QUEUE_SIZE)
+                queue = ArrayBlockingQueue(cap)
             }
         }
+        val gen = workerGen.incrementAndGet()
         running = true
-        worker = Thread({ pump() }, "pico-report").apply { isDaemon = true; start() }
-        PicoLog.i("http report targets: " + nextTargets.joinToString(", ") { it.url })
+        worker = Thread({ pump(gen) }, "pico-report-$gen").apply { isDaemon = true; start() }
+        PicoLog.i("http report targets: " + nextTargets.joinToString(", ") { safeUrl(it.url) })
     }
 
     @Synchronized
     fun stop() {
         running = false
+        workerGen.incrementAndGet()
         targets = emptyList()
+        try {
+            activeConn?.disconnect()
+        } catch (_: Throwable) {
+        }
+        activeConn = null
         worker?.interrupt()
         worker = null
         synchronized(queueLock) {
@@ -116,43 +159,45 @@ object HttpReporter {
         }
     }
 
-    private fun pump() {
-        while (running) {
+    private fun pump(myGen: Long) {
+        while (running && workerGen.get() == myGen) {
             val text = try {
                 queue.take()
-            } catch (t: InterruptedException) {
+            } catch (_: InterruptedException) {
                 return
             }
+            if (!running || workerGen.get() != myGen) return
             for (target in targets) {
-                if (!running) return
-                postWithRetry(target, text)
+                if (!running || workerGen.get() != myGen) return
+                postWithRetry(target, text, myGen)
             }
         }
     }
 
-    private fun postWithRetry(target: Target, text: String) {
+    private fun postWithRetry(target: Target, text: String, myGen: Long) {
         val backoffs = longArrayOf(200L, 500L)
+        val displayUrl = safeUrl(target.url)
         var attempt = 0
-        while (true) {
+        while (running && workerGen.get() == myGen) {
             try {
-                val reply = postOnce(target, text)
+                val reply = postOnce(target, text, myGen)
                 posted.incrementAndGet()
                 if (!reply.isNullOrBlank()) dispatchQuickOp(text, reply)
                 return
             } catch (e: HttpStatusException) {
-                if (e.code in 400..499 || attempt >= backoffs.size || !running) {
+                if (e.code in 300..499 || attempt >= backoffs.size || !running || workerGen.get() != myGen) {
                     failed.incrementAndGet()
-                    PicoLog.w("report to ${target.url} failed: " + e.message)
+                    PicoLog.w("report to $displayUrl failed: HTTP ${e.code}")
                     return
                 }
-                PicoLog.d("report to ${target.url} retry #${attempt + 1}: " + e.message)
+                PicoLog.d("report to $displayUrl retry #${attempt + 1}: HTTP ${e.code}")
             } catch (t: Throwable) {
-                if (t !is java.io.IOException || attempt >= backoffs.size || !running) {
+                if (t !is java.io.IOException || attempt >= backoffs.size || !running || workerGen.get() != myGen) {
                     failed.incrementAndGet()
-                    PicoLog.w("report to ${target.url} failed: " + t.javaClass.simpleName + " " + t.message)
+                    PicoLog.w("report to $displayUrl failed: " + t.javaClass.simpleName + " " + t.message)
                     return
                 }
-                PicoLog.d("report to ${target.url} retry #${attempt + 1}: " + t.javaClass.simpleName + " " + t.message)
+                PicoLog.d("report to $displayUrl retry #${attempt + 1}: " + t.javaClass.simpleName + " " + t.message)
             }
             try {
                 Thread.sleep(backoffs[attempt++])
@@ -178,10 +223,17 @@ object HttpReporter {
         }
     }
 
-    private fun postOnce(target: Target, text: String): String? {
+    private fun postOnce(target: Target, text: String, myGen: Long): String? {
+        if (!running || workerGen.get() != myGen) throw InterruptedIOException("reporter stopped")
+        val parsed = URL(target.url)
+        val proto = parsed.protocol.lowercase()
+        if (proto != "http" && proto != "https") {
+            throw IllegalArgumentException("unsupported report URL scheme: $proto")
+        }
         val body = text.toByteArray(Charsets.UTF_8)
-        val conn = URL(target.url).openConnection() as HttpURLConnection
-        val timeout = Config.int("post_timeout_ms", 10000)
+        val conn = parsed.openConnection() as HttpURLConnection
+        val timeout = Config.int("post_timeout_ms", 10_000).coerceIn(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS)
+        conn.instanceFollowRedirects = false
         conn.requestMethod = "POST"
         conn.connectTimeout = timeout
         conn.readTimeout = timeout
@@ -194,14 +246,17 @@ object HttpReporter {
         if (target.secret.isNotEmpty()) {
             conn.setRequestProperty("X-Signature", "sha1=" + hmacSha1(target.secret, body))
         }
+        activeConn = conn
         try {
+            if (!running || workerGen.get() != myGen) throw InterruptedIOException("reporter stopped")
             conn.outputStream.use { it.write(body) }
             val code = conn.responseCode
             val stream = if (code in 200..299) conn.inputStream else conn.errorStream
             val resp = stream?.use { read(it) } ?: ""
-            if (code !in 200..299) throw HttpStatusException(code, "HTTP $code " + resp.take(200))
+            if (code !in 200..299) throw HttpStatusException(code, "HTTP $code")
             return resp
         } finally {
+            if (activeConn === conn) activeConn = null
             conn.disconnect()
         }
     }
@@ -237,13 +292,13 @@ object HttpReporter {
     private fun applyQuickOperation(eventText: String, replyText: String) {
         val op = try {
             JSONObject(replyText)
-        } catch (t: Throwable) {
+        } catch (_: Throwable) {
             return // 对端回了空 / 非 JSON,是正常的
         }
         if (op.length() == 0) return
         val event = try {
             JSONObject(eventText)
-        } catch (t: Throwable) {
+        } catch (_: Throwable) {
             return
         }
         if (event.optString("post_type") != "message") return
@@ -253,14 +308,21 @@ object HttpReporter {
             ActionRouter.call("delete_msg", JSONObject().put("message_id", event.optInt("message_id")))
         }
 
+        if (op.isNull("reply")) return
         val reply = op.opt("reply") ?: return
+        if (reply === JSONObject.NULL) return
+        if (reply is String && reply.isEmpty()) return
+
         val isGroup = event.optString("message_type") == "group"
+        val autoEscape = op.optBoolean("auto_escape", false)
         val params = JSONObject()
             .put("message_type", if (isGroup) "group" else "private")
-            .put("auto_escape", op.optBoolean("auto_escape", false))
+            .put("auto_escape", autoEscape)
         if (isGroup) params.put("group_id", event.optLong("group_id")) else params.put("user_id", event.optLong("user_id"))
 
-        // at_sender 只在群里有意义,并且要在**已有内容前面**插,不能整条替换掉
+        // at_sender 只在群里有意义,并且要在**已有内容前面**插,不能整条替换掉。
+        // 当 auto_escape=true 且 reply 为字符串时必须直接封装为纯 text 段,
+        // 避免 MsgCodec.normalize() 解析其中的 CQ 码造成 CQ 注入。
         val atUserId = event.optLong("user_id")
         if (isGroup && op.optBoolean("at_sender", false) && atUserId > 0) {
             val segs = JSONArray()
@@ -269,7 +331,14 @@ object HttpReporter {
                         .put("data", JSONObject().put("qq", atUserId.toString()))
                 )
                 .put(JSONObject().put("type", "text").put("data", JSONObject().put("text", " ")))
-            for (s in pico.onebot.msg.MsgCodec.normalize(reply)) segs.put(s)
+            if (autoEscape && reply is String) {
+                segs.put(
+                    JSONObject().put("type", "text")
+                        .put("data", JSONObject().put("text", reply))
+                )
+            } else {
+                for (s in pico.onebot.msg.MsgCodec.normalize(reply)) segs.put(s)
+            }
             params.put("message", segs)
         } else {
             params.put("message", reply)
@@ -291,5 +360,5 @@ object HttpReporter {
         .put("failed", failed.get())
         .put("dropped", dropped.get())
         .put("quick_ops", quickOps.get())
-        .put("pending", if (running) queue.size else 0)
+        .put("pending", if (running && ::queue.isInitialized) queue.size else 0)
 }
