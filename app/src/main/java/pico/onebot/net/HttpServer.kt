@@ -360,7 +360,7 @@ class HttpServer(
         var conn: WsConn? = null
         var unsub: (() -> Unit)? = null
         try {
-            val c = WsConn(sock, ins, out, sock.inetAddress.hostAddress + ":" + sock.port, WsConn.Role.EVENT, false)
+            val c = WsConn(sock, ins, out, (sock.inetAddress?.hostAddress ?: "unknown") + ":" + sock.port, WsConn.Role.EVENT, false)
             conn = c
             if (!running || !WebApi.registerLogStream(c, sessionToken, authEpoch)) {
                 return
@@ -496,7 +496,7 @@ class HttpServer(
         var conn: WsConn? = null
         var added = false
         try {
-            val c = WsConn(sock, ins, out, sock.inetAddress.hostAddress + ":" + sock.port, role, false, configId)
+            val c = WsConn(sock, ins, out, (sock.inetAddress?.hostAddress ?: "unknown") + ":" + sock.port, role, false, configId)
             conn = c
             if (!running || !Transport.add(c, transportEpoch)) {
                 return

@@ -45,9 +45,8 @@ abstract class PicoMsfNetProviderHook : com.tencent.mobileqq.msf.sdk.q.a() {
 @Mixin
 abstract class PicoKernelNetHook : KernelServiceImpl() {
 
-    override fun setOnNetworkChanged(type: NetStatusType?) {
-        val normalized = if (type != null) PicoNetCompat.normalizeKernelNetStatus(type) else null
-        super.setOnNetworkChanged(normalized)
+    override fun setOnNetworkChanged(type: NetStatusType) {
+        super.setOnNetworkChanged(PicoNetCompat.normalizeKernelNetStatus(type))
     }
 }
 

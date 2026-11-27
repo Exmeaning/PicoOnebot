@@ -108,10 +108,6 @@ object WebApi {
     ): List<String> {
         val candidateNet = patch.optJSONObject("network") ?: if (validateNetworkFallback) Config.network() else null
         val errors = if (candidateNet != null) Config.validateNetwork(candidateNet).toMutableList() else mutableListOf()
-        if (candidateNet != null) {
-            validateServerPorts(candidateNet.optJSONArray("wsServers"), "正向 WebSocket", errors)
-            validateServerPorts(candidateNet.optJSONArray("httpServers"), "HTTP 服务端", errors)
-        }
         patch.optJSONObject("webui")?.let { w ->
             if (w.has("host")) {
                 if (w.isNull("host") || w.optString("host", "").trim().isEmpty()) {
@@ -137,19 +133,6 @@ object WebApi {
         checkWebuiDirHolder(patch.optJSONObject("general"))
         checkWebuiDirHolder(patch)
         return errors
-    }
-
-    private fun validateServerPorts(arr: JSONArray?, kind: String, errors: MutableList<String>) {
-        if (arr == null) return
-        for (i in 0 until arr.length()) {
-            val o = arr.optJSONObject(i) ?: continue
-            if (!o.optBoolean("enabled", true)) continue
-            val name = o.optString("name", "$kind ${i + 1}")
-            val port = if (o.isNull("port")) -1 else o.optInt("port", -1)
-            if (port !in 1..65535) {
-                errors.add("$name: 端口必须在 1-65535 之间")
-            }
-        }
     }
 
     internal fun isKnownRoute(method: String, path: String): Boolean = when {

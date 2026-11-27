@@ -338,7 +338,7 @@ cmd_install() {
   local out; out="$("$ADB" -s "$(serial)" install "$apk" 2>&1 | tr -d '\r')"
   echo "$out" | grep -q "Success" || { log "安装失败:"; echo "$out" | grep -v Incremental; return 1; }
   adbx shell pm grant "$PKG" android.permission.POST_NOTIFICATIONS >/dev/null 2>&1 || true
-  adbx shell sh -c "mkdir -p /sdcard/pico-onebot && printf '%s\\n' pico-auto-accept-privacy-v1 > /sdcard/pico-onebot/auto-accept-privacy && printf '%s\\n' pico-auto-accept-privacy-v1 > /data/local/tmp/pico-auto-accept-privacy && chmod 0644 /data/local/tmp/pico-auto-accept-privacy" >/dev/null 2>&1 || true
+  adbx shell "printf '%s\n' pico-auto-accept-privacy-v1 > /data/local/tmp/pico-auto-accept-privacy && chmod 0644 /data/local/tmp/pico-auto-accept-privacy" >/dev/null 2>&1 || true
   cmd_restart
   # QIMEI 在首次进程启动时早于隐私页初始化。Hook 点击真实“同意”按钮后，
   # 等日志确认授权已经由 QQ 自己落盘，再重启一次主进程和 :MSF。
