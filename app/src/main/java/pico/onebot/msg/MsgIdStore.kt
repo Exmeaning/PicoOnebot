@@ -95,6 +95,8 @@ object MsgIdStore {
             if (activeUin == uin && file != null) return
             val snap = captureDirtySnapLocked()
             clearMemoryLocked()
+            activeUin = 0L
+            file = null
             snap
         }
         if (prevSnap != null) {

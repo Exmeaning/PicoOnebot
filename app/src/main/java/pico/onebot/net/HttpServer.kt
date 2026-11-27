@@ -437,10 +437,9 @@ class HttpServer(
     }
 
     private fun readLineWithDeadline(sock: Socket, ins: InputStream, deadlineNanos: Long): String? {
-        val remMs = (deadlineNanos - System.nanoTime()) / 1_000_000L
-        if (remMs <= 0L) throw SocketTimeoutException("request deadline exceeded")
-        sock.soTimeout = remMs.coerceIn(1L, Int.MAX_VALUE.toLong()).toInt()
-        return WsFrame.readLine(ins, WsFrame.MAX_LINE_BYTES, deadlineNanos)
+        return WsFrame.readLine(ins, WsFrame.MAX_LINE_BYTES, deadlineNanos) { timeoutMs ->
+            sock.soTimeout = timeoutMs
+        }
     }
 
     private fun readFullyWithDeadline(

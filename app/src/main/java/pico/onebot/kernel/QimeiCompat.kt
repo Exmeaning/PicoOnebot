@@ -126,7 +126,7 @@ object QimeiCompat {
     private object Api28SigningInfo {
         private val inPlaceFailureLogged = AtomicBoolean(false)
 
-        fun buildSigningInfo(sig: Signature): SigningInfo? {
+        fun buildSigningInfo(sig: Signature): Any? {
             val detailsClassNames = arrayOf(
                 "android.content.pm.SigningDetails",
                 "android.content.pm.PackageParser\$SigningDetails"

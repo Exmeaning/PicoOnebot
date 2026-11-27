@@ -10,6 +10,7 @@ import org.junit.Test
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.io.InputStream
 import java.net.SocketTimeoutException
 import java.nio.charset.StandardCharsets
 
@@ -87,6 +88,70 @@ class WsFrameTest {
             fail("Expected SocketTimeoutException when deadline has passed")
         } catch (_: SocketTimeoutException) {
             // expected
+        }
+    }
+
+    @Test
+    fun readLineShrinksSoTimeoutDynamicallyBeforeEachRead() {
+        // Verify 3-arg call remains compatible
+        val threeArg = WsFrame.readLine(
+            ByteArrayInputStream("ok\r\n".toByteArray(StandardCharsets.ISO_8859_1)),
+            WsFrame.MAX_LINE_BYTES,
+            System.nanoTime() + 5_000_000_000L
+        )
+        assertEquals("ok", threeArg)
+
+        // Slow stream delivering 3 bytes spaced apart should shrink soTimeout monotonically
+        val data = "hi\n".toByteArray(StandardCharsets.ISO_8859_1)
+        val slowStream = object : InputStream() {
+            private var pos = 0
+            override fun read(): Int {
+                if (pos >= data.size) return -1
+                if (pos > 0) Thread.sleep(25)
+                return data[pos++].toInt() and 0xFF
+            }
+        }
+        val recorded = ArrayList<Int>()
+        val deadline = System.nanoTime() + 1_000_000_000L
+        val line = WsFrame.readLine(slowStream, WsFrame.MAX_LINE_BYTES, deadline) { timeoutMs ->
+            recorded.add(timeoutMs)
+        }
+        assertEquals("hi", line)
+        assertTrue("Expected multiple soTimeout updates, got $recorded", recorded.size >= 2)
+        assertTrue("All soTimeouts must be >= 1, got $recorded", recorded.all { it >= 1 })
+        for (i in 1 until recorded.size) {
+            assertTrue(
+                "Expected non-increasing soTimeouts, got $recorded",
+                recorded[i] <= recorded[i - 1]
+            )
+        }
+        assertTrue(
+            "Expected final soTimeout (${recorded.last()}) < initial (${recorded.first()})",
+            recorded.last() < recorded.first()
+        )
+
+        // Stream that outlasts deadline throws SocketTimeoutException
+        val stallingStream = object : InputStream() {
+            private var calls = 0
+            override fun read(): Int {
+                calls++
+                Thread.sleep(30)
+                return 'x'.code
+            }
+        }
+        val shortRecorded = ArrayList<Int>()
+        try {
+            WsFrame.readLine(
+                stallingStream,
+                WsFrame.MAX_LINE_BYTES,
+                System.nanoTime() + 45_000_000L
+            ) { timeoutMs ->
+                shortRecorded.add(timeoutMs)
+            }
+            fail("Expected SocketTimeoutException once deadline expires mid-line")
+        } catch (_: SocketTimeoutException) {
+            assertTrue("Expected at least one soTimeout update before timeout", shortRecorded.isNotEmpty())
+            assertTrue("All soTimeouts must be >= 1, got $shortRecorded", shortRecorded.all { it >= 1 })
         }
     }
 

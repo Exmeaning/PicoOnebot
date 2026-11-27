@@ -11,10 +11,10 @@ object DeploymentAutomation {
         get() = markerMatches("/system/etc/pico-auto-accept-privacy", allowShellOwner = false) ||
             markerMatches("/data/local/tmp/pico-auto-accept-privacy", allowShellOwner = true)
 
-    /** 使用 O_NOFOLLOW 打开后基于同一 fd 做 fstat + 有界读取,消除 lstat->open TOCTOU。 */
+    /** 使用 O_NOFOLLOW + O_NONBLOCK 打开后基于同一 fd 做 fstat + 有界读取,消除 lstat->open TOCTOU 与 FIFO 阻塞。 */
     private fun markerMatches(path: String, allowShellOwner: Boolean): Boolean {
         val fd = try {
-            Os.open(path, OsConstants.O_RDONLY or OsConstants.O_NOFOLLOW, 0)
+            Os.open(path, OsConstants.O_RDONLY or OsConstants.O_NOFOLLOW or OsConstants.O_NONBLOCK, 0)
         } catch (_: Throwable) {
             return false
         }

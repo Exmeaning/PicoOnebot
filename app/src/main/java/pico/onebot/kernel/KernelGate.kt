@@ -295,35 +295,39 @@ object KernelGate {
         if (uin <= 0L) return
         val uid = readSelfUid()
 
-        val accountChanged: Boolean
-        val needRegisterListener: Boolean
-        val transitionedAfterLogin: Boolean
-        synchronized(this) {
+        val accountChanged = synchronized(this) {
             if (sessionEpoch != epochAtStart || loggingOutCount > 0 || sessionRef !== live) return
-            accountChanged = (selfUinCache > 0L && selfUinCache != uin) ||
+            (selfUinCache > 0L && selfUinCache != uin) ||
                 (selfUidCache.isNotEmpty() && uid.isNotEmpty() && selfUidCache != uid)
-            if (accountChanged) {
-                needRegisterListener = false
-                transitionedAfterLogin = false
-            } else {
-                selfUinCache = uin
-                if (uid.isNotEmpty()) selfUidCache = uid
-                var changed = false
-                if (state == State.SESSION_READY) {
-                    changed = transitionLocked(State.LOGGED_IN) || changed
-                }
-                needRegisterListener = (listenerId == 0L)
-                if (!needRegisterListener && state == State.LOGGED_IN) {
-                    changed = transitionLocked(State.ONLINE) || changed
-                }
-                transitionedAfterLogin = changed
-            }
         }
         if (accountChanged) {
             onSessionLost("account_changed")
             return
         }
+        // 在进入 State.LOGGED_IN (ready=true) 之前先完成账号消息库切换，防止并发 send_msg 写入被 clearMemoryLocked 抹除
         pico.onebot.msg.MsgIdStore.switchAccount(uin, epochAtStart)
+
+        val needRegisterListener: Boolean
+        val transitionedAfterLogin: Boolean
+        synchronized(this) {
+            if (sessionEpoch != epochAtStart || loggingOutCount > 0 || sessionRef !== live) return
+            if ((selfUinCache > 0L && selfUinCache != uin) ||
+                (selfUidCache.isNotEmpty() && uid.isNotEmpty() && selfUidCache != uid)
+            ) {
+                return
+            }
+            selfUinCache = uin
+            if (uid.isNotEmpty()) selfUidCache = uid
+            var changed = false
+            if (state == State.SESSION_READY) {
+                changed = transitionLocked(State.LOGGED_IN) || changed
+            }
+            needRegisterListener = (listenerId == 0L)
+            if (!needRegisterListener && state == State.LOGGED_IN) {
+                changed = transitionLocked(State.ONLINE) || changed
+            }
+            transitionedAfterLogin = changed
+        }
         if (transitionedAfterLogin) drainStateTransitions()
 
         if (needRegisterListener) {

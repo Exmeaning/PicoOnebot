@@ -948,36 +948,70 @@ object WebApi {
         if (!dir.exists()) return error(404, "目录不存在")
         if (!dir.isDirectory) return error(400, "目标不是目录")
 
-        val entries = JSONArray()
-        val children = dir.listFiles()?.sortedWith(
-            compareBy<File>({ !it.isDirectory }, { it.name.lowercase(Locale.ROOT) })
-        ) ?: emptyList()
+        val activeFile = Config.activeConfigFile?.takeIf { !isBlockedManagedPath(it) }
+        val virtualConfigObj = if (activeFile != null && Config.corruptRecoveryMode && !activeFile.exists()) {
+            relativePath(activeFile)?.let { relative ->
+                val virtualSize = recoveryVirtualConfigContent().toByteArray(Charsets.UTF_8).size.toLong()
+                JSONObject()
+                    .put("name", activeFile.name)
+                    .put("path", relative)
+                    .put("type", "file")
+                    .put("size", virtualSize)
+                    .put("modifiedAt", 0L)
+                    .put("editable", true)
+            }
+        } else {
+            null
+        }
+        val activeConfig = when {
+            activeFile != null && activeFile.isFile -> relativePath(activeFile)?.let { relative ->
+                JSONObject()
+                    .put("name", activeFile.name)
+                    .put("path", relative)
+                    .put("type", "file")
+                    .put("size", activeFile.length())
+                    .put("modifiedAt", activeFile.lastModified())
+                    .put("editable", isEditableText(activeFile))
+            }
+            virtualConfigObj != null -> virtualConfigObj
+            else -> null
+        }
+
+        val entriesList = ArrayList<Pair<Boolean, Pair<String, JSONObject>>>()
+        val children = dir.listFiles() ?: emptyArray()
         for (child in children) {
             if (isBlockedManagedPath(child)) continue
             val relative = relativePath(child) ?: continue
-            entries.put(
-                JSONObject()
+            val isDir = child.isDirectory
+            entriesList.add(
+                (!isDir) to (child.name.lowercase(Locale.ROOT) to JSONObject()
                     .put("name", child.name)
                     .put("path", relative)
-                    .put("type", if (child.isDirectory) "directory" else "file")
+                    .put("type", if (isDir) "directory" else "file")
                     .put("size", if (child.isFile) child.length() else 0)
                     .put("modifiedAt", child.lastModified())
-                    .put("editable", child.isFile && isEditableText(child))
+                    .put("editable", child.isFile && isEditableText(child)))
             )
+        }
+        if (virtualConfigObj != null && activeFile != null) {
+            val sameDir = try {
+                activeFile.parentFile?.canonicalFile == dir.canonicalFile
+            } catch (_: Throwable) {
+                false
+            }
+            if (sameDir && entriesList.none { it.second.second.optString("path") == virtualConfigObj.optString("path") }) {
+                entriesList.add(
+                    true to (activeFile.name.lowercase(Locale.ROOT) to JSONObject(virtualConfigObj.toString()))
+                )
+            }
+        }
+        entriesList.sortWith(compareBy({ it.first }, { it.second.first }))
+        val entries = JSONArray()
+        for (item in entriesList) {
+            entries.put(item.second.second)
         }
         val current = relativePath(dir) ?: ""
         val parent = if (current.isEmpty()) JSONObject.NULL else current.substringBeforeLast('/', "")
-        val activeConfig = Config.activeConfigFile?.takeIf { it.isFile && !isBlockedManagedPath(it) }?.let { config ->
-            relativePath(config)?.let { relative ->
-                JSONObject()
-                    .put("name", config.name)
-                    .put("path", relative)
-                    .put("type", "file")
-                    .put("size", config.length())
-                    .put("modifiedAt", config.lastModified())
-                    .put("editable", isEditableText(config))
-            }
-        }
         return Response(
             200,
             JSONObject()
@@ -993,7 +1027,21 @@ object WebApi {
         val target = resolveManagedPath(query["path"] ?: "")
             ?: return error(400, "文件路径无效")
         if (isBlockedManagedPath(target)) return error(403, "不允许通过文件管理器读取该文件")
-        if (!target.isFile) return error(404, "文件不存在")
+        if (!target.isFile) {
+            if (isActiveConfigFile(target) && Config.corruptRecoveryMode && !target.exists()) {
+                val content = recoveryVirtualConfigContent()
+                return Response(
+                    200,
+                    JSONObject()
+                        .put("path", relativePath(target))
+                        .put("name", target.name)
+                        .put("content", content)
+                        .put("size", content.toByteArray(Charsets.UTF_8).size)
+                        .put("modifiedAt", 0L)
+                )
+            }
+            return error(404, "文件不存在")
+        }
         if (!isEditableText(target)) {
             return error(415, "仅支持编辑不超过 1 MiB 的 UTF-8 文本文件")
         }
@@ -1031,6 +1079,7 @@ object WebApi {
         var runtime = JSONObject().put("restartRequired", false).put("warnings", JSONArray())
             .put("applied", JSONObject().put("reloaded", false).put("listeners", 0)
                 .put("reverse", 0).put("reporters", 0).put("appliedAt", 0L))
+        var recoveryCleared = false
         val savedSize: Long
         val savedModifiedAt: Long
         val savedRelPath: String
@@ -1080,6 +1129,7 @@ object WebApi {
                     }
                     runtime = applyRuntimeConfig(previous)
                     if (wasCorruptRecovery) {
+                        recoveryCleared = true
                         PicoLog.i("corrupt config recovery mode cleared after restoring config.json; recovery sessions revoked")
                     }
                 } else {
@@ -1098,16 +1148,30 @@ object WebApi {
         for (c in streamsToClose) c.close()
 
         PicoLog.i("file updated via webui: $savedRelPath")
-        return Response(
-            200,
-            JSONObject()
-                .put("ok", true)
-                .put("size", savedSize)
-                .put("modifiedAt", savedModifiedAt)
-                .put("restartRequired", runtime.optBoolean("restartRequired"))
-                .put("warnings", runtime.getJSONArray("warnings"))
-                .put("applied", runtime.getJSONObject("applied"))
-        )
+        val responseJson = JSONObject()
+            .put("ok", true)
+            .put("size", savedSize)
+            .put("modifiedAt", savedModifiedAt)
+            .put("restartRequired", runtime.optBoolean("restartRequired"))
+            .put("warnings", runtime.getJSONArray("warnings"))
+            .put("applied", runtime.getJSONObject("applied"))
+        if (recoveryCleared) {
+            responseJson
+                .put("reloginRequired", true)
+                .put("recoveryCleared", true)
+        }
+        return Response(200, responseJson)
+    }
+
+    private fun recoveryVirtualConfigContent(): String {
+        val raw = Config.corruptRecoveryRawSource()
+        if (!raw.isNullOrBlank() &&
+            raw.indexOf('\u0000') < 0 &&
+            raw.toByteArray(Charsets.UTF_8).size <= MAX_EDIT_BYTES
+        ) {
+            return redactConfigAuthFields(raw)
+        }
+        return Config.redactedRaw().toString(2) + "\n"
     }
 
     private fun isActiveConfigFile(target: File): Boolean = try {
@@ -1129,7 +1193,7 @@ object WebApi {
             obj.toString(2)
         } catch (_: Throwable) {
             rawContent.replace(
-                Regex("\"(passwordSalt|passwordHash|token)\"\\s*:\\s*\"[^\"]*\""),
+                Regex("\"(passwordSalt|passwordHash|token)\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\""),
                 "\"$1\": \"***\""
             )
         }

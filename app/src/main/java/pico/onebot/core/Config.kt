@@ -3,8 +3,10 @@ package pico.onebot.core
 import android.content.Context
 import android.system.Os
 import android.util.Base64
+import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
+import org.json.JSONTokener
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -65,10 +67,20 @@ object Config {
     @Volatile
     private var corruptRecoveredWebuiCreds: Pair<String, String>? = null
 
+    @Volatile
+    private var corruptSourceRawText: String? = null
+
+    private val BASE64_STD_REGEX = Regex("^[A-Za-z0-9+/=]+$")
+    private val CORRUPT_SALT_REGEX = Regex("\"passwordSalt\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"")
+    private val CORRUPT_HASH_REGEX = Regex("\"passwordHash\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"")
+
     lateinit var dataDir: File
         private set
 
     private var file: File? = null
+
+    /** 损坏恢复模式下返回待修复的原始配置文本(有界 UTF-8),供文件管理器在 dataDir/config.json 尚未落盘时预填充。 */
+    fun corruptRecoveryRawSource(): String? = if (corruptRecoveryMode) corruptSourceRawText else null
 
     @Synchronized
     fun load(ctx: Context) {
@@ -97,6 +109,7 @@ object Config {
             corruptRecoveryToken = null
             corruptFallbackSecrets = emptyMap()
             corruptRecoveredWebuiCreds = null
+            corruptSourceRawText = null
             root = fresh
             PicoLog.i("config v2 initialized at " + internal.absolutePath)
             return
@@ -139,6 +152,7 @@ object Config {
         corruptRecoveryToken = null
         corruptFallbackSecrets = emptyMap()
         corruptRecoveredWebuiCreds = null
+        corruptSourceRawText = null
         root = next
         if (importedFromExternal) {
             PicoLog.i("config v2 migrated one-time from /sdcard to " + internal.absolutePath)
@@ -164,40 +178,164 @@ object Config {
         )
         corruptFallbackSecrets = if (rawText != null) extractCorruptConnectionSecrets(rawText) else emptyMap()
         corruptRecoveredWebuiCreds = if (rawText != null) extractCorruptWebuiCreds(rawText) else null
+        corruptSourceRawText = rawText?.takeIf {
+            it.isNotBlank() && it.indexOf('\u0000') < 0 && it.toByteArray(Charsets.UTF_8).size <= 1024 * 1024
+        }
         corruptRecoveryToken = recoveryToken
         corruptRecoveryMode = true
         root = fallback
+        // 直接写本地 logcat，绕过 PicoLog.mask() 且绝不进入 PicoLog.ring / /api/logs
+        Log.w(
+            PicoLog.TAG,
+            "corrupt config recovery mode: one-time local recovery token=$recoveryToken " +
+                "(log in at http://127.0.0.1:${webuiPort} and restore valid config.json via File Manager)"
+        )
         PicoLog.w(
             "corrupt config recovery mode enabled (config.json NOT overwritten): " +
                 "WebUI bound strictly to 127.0.0.1:${webuiPort}; " +
-                "one-time local recovery token=$recoveryToken; " +
-                "restore valid config.json via File Manager to exit recovery mode"
+                "check adb logcat (${PicoLog.TAG}) for the one-time local recovery credential " +
+                "and restore valid config.json via File Manager to exit recovery mode"
         )
     }
 
-    /** 尽量从损坏的 config.json 原始文本中提取连接 id -> (token, secret),供修复保存时还原 \"***\" 掩码。 */
+    private fun unescapeJsonString(raw: String): String? = try {
+        JSONTokener("\"$raw\"").nextValue() as? String
+    } catch (_: Throwable) {
+        null
+    }
+
+    /** 返回从 [openQuoteIdx]('\"') 开始的 JSON 字符串闭合引号下标;未闭合或遇裸换行返回 -1。 */
+    private fun findJsonStringEnd(s: String, openQuoteIdx: Int): Int {
+        var i = openQuoteIdx + 1
+        var escaped = false
+        while (i < s.length) {
+            val c = s[i]
+            if (c == '\n' || c == '\r') return -1
+            if (escaped) {
+                escaped = false
+            } else if (c == '\\') {
+                escaped = true
+            } else if (c == '"') {
+                return i
+            }
+            i++
+        }
+        return -1
+    }
+
+    private fun skipToLineEnd(s: String, from: Int, endExclusive: Int): Int {
+        var i = from
+        while (i < endExclusive && s[i] != '\n' && s[i] != '\r') i++
+        return i
+    }
+
+    /** 提取单个 `{ ... }` 块内顶层(depth == 0)的 `"id"` / `"token"` / `"secret"` 字符串字段(反转义后)。 */
+    private fun extractObjectSecretFields(raw: String, start: Int, endExclusive: Int): Map<String, String> {
+        val fields = HashMap<String, String>(4)
+        var idx = start + 1
+        var depth = 0
+        while (idx < endExclusive) {
+            val c = raw[idx]
+            if (c == '"') {
+                val close = findJsonStringEnd(raw, idx)
+                if (close < 0 || close >= endExclusive) {
+                    idx = skipToLineEnd(raw, idx + 1, endExclusive)
+                    continue
+                }
+                if (depth == 0) {
+                    var look = close + 1
+                    while (look < endExclusive && raw[look].isWhitespace()) look++
+                    if (look < endExclusive && raw[look] == ':') {
+                        val key = unescapeJsonString(raw.substring(idx + 1, close))
+                        look++
+                        while (look < endExclusive && raw[look].isWhitespace()) look++
+                        if (look < endExclusive && raw[look] == '"') {
+                            val valClose = findJsonStringEnd(raw, look)
+                            if (valClose in (look + 1) until endExclusive) {
+                                if (key == "id" || key == "token" || key == "secret") {
+                                    val decoded = unescapeJsonString(raw.substring(look + 1, valClose))
+                                    if (decoded != null) {
+                                        fields[key] = decoded
+                                    }
+                                }
+                                idx = valClose + 1
+                                continue
+                            }
+                            idx = skipToLineEnd(raw, look + 1, endExclusive)
+                            continue
+                        }
+                        idx = look
+                        continue
+                    }
+                }
+                idx = close + 1
+                continue
+            }
+            when (c) {
+                '{', '[' -> depth++
+                '}', ']' -> if (depth > 0) depth-- else break
+            }
+            idx++
+        }
+        return fields
+    }
+
+    private fun collectConnectionSecret(
+        raw: String,
+        start: Int,
+        endExclusive: Int,
+        out: MutableMap<String, Pair<String?, String?>>
+    ) {
+        val fields = extractObjectSecretFields(raw, start, endExclusive)
+        val id = fields["id"] ?: return
+        if (id.isEmpty()) return
+        val token = fields["token"]?.takeIf { it.isNotEmpty() && it != REDACTED_MASK }
+        val secret = fields["secret"]?.takeIf { it.isNotEmpty() && it != REDACTED_MASK }
+        if (token != null || secret != null) {
+            out[id] = token to secret
+        }
+    }
+
+    /** 尽量从损坏的 config.json 原始文本中提取连接 id -> (token, secret),供修复保存时还原 "***" 掩码。 */
     private fun extractCorruptConnectionSecrets(raw: String): Map<String, Pair<String?, String?>> {
         val out = HashMap<String, Pair<String?, String?>>()
-        val objPattern = Regex("\\{[^{}]*\"id\"\\s*:\\s*\"([^\"\\\\]+)\"[^{}]*\\}")
-        val tokenPattern = Regex("\"token\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"")
-        val secretPattern = Regex("\"secret\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"")
-        for (match in objPattern.findAll(raw)) {
-            val block = match.value
-            val id = match.groupValues[1]
-            if (id.isEmpty()) continue
-            val token = tokenPattern.find(block)?.groupValues?.get(1)?.takeIf { it.isNotEmpty() && it != REDACTED_MASK }
-            val secret = secretPattern.find(block)?.groupValues?.get(1)?.takeIf { it.isNotEmpty() && it != REDACTED_MASK }
-            if (token != null || secret != null) {
-                out[id] = token to secret
+        val braceStack = ArrayDeque<Int>()
+        var i = 0
+        while (i < raw.length) {
+            when (raw[i]) {
+                '"' -> {
+                    val close = findJsonStringEnd(raw, i)
+                    i = if (close >= 0) close + 1 else skipToLineEnd(raw, i + 1, raw.length)
+                }
+                '{' -> {
+                    braceStack.addLast(i)
+                    i++
+                }
+                '}' -> {
+                    if (braceStack.isNotEmpty()) {
+                        val start = braceStack.removeLast()
+                        collectConnectionSecret(raw, start, i + 1, out)
+                    }
+                    i++
+                }
+                else -> i++
             }
+        }
+        if (braceStack.isNotEmpty()) {
+            val start = braceStack.removeLast()
+            collectConnectionSecret(raw, start, raw.length, out)
         }
         return out
     }
 
     /** 若损坏配置文件里保留了合法的 PBKDF2 盐与哈希,修复保存时继续沿用而非降级回未初始化状态。 */
     private fun extractCorruptWebuiCreds(raw: String): Pair<String, String>? {
-        val salt = Regex("\"passwordSalt\"\\s*:\\s*\"([A-Za-z0-9+/=]{16,128})\"").find(raw)?.groupValues?.get(1) ?: return null
-        val hash = Regex("\"passwordHash\"\\s*:\\s*\"([A-Za-z0-9+/=]{32,128})\"").find(raw)?.groupValues?.get(1) ?: return null
+        val saltRaw = CORRUPT_SALT_REGEX.find(raw)?.groupValues?.get(1) ?: return null
+        val hashRaw = CORRUPT_HASH_REGEX.find(raw)?.groupValues?.get(1) ?: return null
+        val salt = unescapeJsonString(saltRaw) ?: return null
+        val hash = unescapeJsonString(hashRaw) ?: return null
+        if (salt.length !in 16..128 || hash.length !in 32..128) return null
+        if (!BASE64_STD_REGEX.matches(salt) || !BASE64_STD_REGEX.matches(hash)) return null
         return try {
             val saltBytes = Base64.decode(salt, Base64.NO_WRAP)
             val hashBytes = Base64.decode(hash, Base64.NO_WRAP)
@@ -663,6 +801,7 @@ object Config {
             corruptRecoveryToken = null
             corruptFallbackSecrets = emptyMap()
             corruptRecoveredWebuiCreds = null
+            corruptSourceRawText = null
         }
     }
 

@@ -17,10 +17,10 @@ object ContainerRestart {
         readTrustedMarker(CONTAINER_PATH, expectedContent = "pico-container-v1", maxAgeSec = null) &&
             readTrustedMarker(MARKER_PATH, expectedContent = "restart-qq-v1", maxAgeSec = 20L)
 
-    /** 使用 O_NOFOLLOW 打开后基于同一 fd 做 fstat + 有界读取,消除 lstat->open TOCTOU。 */
+    /** 使用 O_NOFOLLOW + O_NONBLOCK 打开后基于同一 fd 做 fstat + 有界读取,消除 lstat->open TOCTOU 与 FIFO 阻塞。 */
     private fun readTrustedMarker(path: String, expectedContent: String, maxAgeSec: Long?): Boolean {
         val fd = try {
-            Os.open(path, OsConstants.O_RDONLY or OsConstants.O_NOFOLLOW, 0)
+            Os.open(path, OsConstants.O_RDONLY or OsConstants.O_NOFOLLOW or OsConstants.O_NONBLOCK, 0)
         } catch (_: Throwable) {
             return false
         }

@@ -15,6 +15,7 @@ import java.io.OutputStream
 import java.net.HttpURLConnection
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.Proxy
 import java.net.Socket
 import java.net.SocketAddress
 import java.net.URI
@@ -524,7 +525,7 @@ object MediaFiles {
                 ?: throw ResolveError("无法格式化目标 IP 地址: " + cleanHost)
             val ipHost = if (rawIp.contains(':')) "[$rawIp]" else rawIp
             val pinnedUrl = URL(scheme, ipHost, parsed.port, parsed.file)
-            val conn = (pinnedUrl.openConnection() as HttpURLConnection).apply {
+            val conn = (pinnedUrl.openConnection(Proxy.NO_PROXY) as HttpURLConnection).apply {
                 connectTimeout = CONNECT_TIMEOUT_MS
                 readTimeout = READ_TIMEOUT_MS
                 instanceFollowRedirects = false
@@ -658,7 +659,7 @@ object MediaFiles {
         ): Socket = connectAndWrap(port, localAddress, localPort)
 
         private fun connectAndWrap(port: Int, localAddr: InetAddress? = null, localPort: Int = 0): Socket {
-            val raw = Socket()
+            val raw = Socket(Proxy.NO_PROXY)
             try {
                 if (localAddr != null) {
                     raw.bind(InetSocketAddress(localAddr, localPort))

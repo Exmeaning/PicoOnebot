@@ -169,15 +169,33 @@ object WsFrame {
 
     /**
      * 读一行(以 \r\n 或 \n 结束,拒绝行中裸 \r 并限制最大长度与可选单调截止时间);流结束返回 null。
+     * 若同时提供 [deadlineNanos] 与 [setSoTimeout],则在每次 `read()` 前按剩余截止时间动态收缩超时。
      */
+    @JvmOverloads
     @Throws(IOException::class)
-    fun readLine(ins: InputStream, maxLen: Int = MAX_LINE_BYTES, deadlineNanos: Long? = null): String? {
+    fun readLine(
+        ins: InputStream,
+        maxLen: Int = MAX_LINE_BYTES,
+        deadlineNanos: Long? = null,
+        setSoTimeout: ((Int) -> Unit)? = null
+    ): String? {
         val sb = StringBuilder()
         var count = 0
         var prevCr = false
+        var lastTimeoutMs = -1
         while (true) {
-            if (deadlineNanos != null && (System.nanoTime() - deadlineNanos) > 0L) {
-                throw SocketTimeoutException("line read deadline exceeded")
+            if (deadlineNanos != null) {
+                val remNanos = deadlineNanos - System.nanoTime()
+                if (remNanos <= 0L) {
+                    throw SocketTimeoutException("line read deadline exceeded")
+                }
+                if (setSoTimeout != null) {
+                    val remMs = ((remNanos + 999_999L) / 1_000_000L).coerceIn(1L, Int.MAX_VALUE.toLong()).toInt()
+                    if (remMs != lastTimeoutMs) {
+                        setSoTimeout(remMs)
+                        lastTimeoutMs = remMs
+                    }
+                }
             }
             val b = ins.read()
             if (b < 0) {
