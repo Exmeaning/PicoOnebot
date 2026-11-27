@@ -250,10 +250,12 @@ function parseJsonResponse<T>(data: unknown, validator: (value: unknown) => T | 
 function parseLoginResult(value: unknown): LoginResult | null {
   if (!isRecord(value) || typeof value.ok !== "boolean" || typeof value.token !== "string") return null;
   if (value.mustChangePassword !== undefined && typeof value.mustChangePassword !== "boolean") return null;
+  if (value.recoveryMode !== undefined && typeof value.recoveryMode !== "boolean") return null;
   return {
     ok: value.ok,
     token: value.token,
     mustChangePassword: value.mustChangePassword,
+    recoveryMode: value.recoveryMode,
   };
 }
 
@@ -286,6 +288,7 @@ function parseBotStatus(value: unknown): BotStatus | null {
     webuiUrl: optStrField(value, "webuiUrl"),
     lanIp: optStrField(value, "lanIp"),
     canRestartQq: optBoolField(value, "canRestartQq"),
+    recoveryMode: optBoolField(value, "recoveryMode"),
   };
 }
 
@@ -308,7 +311,7 @@ function parseServerConn(value: unknown, defaultPort: number, defaultWebsocket: 
     host: strField(value, "host", "0.0.0.0"),
     port: numField(value, "port", defaultPort),
     token: strField(value, "token"),
-    cors: boolField(value, "cors", true),
+    cors: boolField(value, "cors", false),
     websocket: boolField(value, "websocket", defaultWebsocket),
   };
 }
@@ -359,7 +362,7 @@ function parseWebuiConfig(value: unknown): WebuiConfig | null {
 function parseNetworkConfig(value: unknown): NetworkConfig | null {
   if (!isRecord(value)) return null;
   const wsServers: WsServer[] = parseArrayItems(value.wsServers, (x) => parseServerConn(x, 3001, true));
-  const httpServers: HttpServer[] = parseArrayItems(value.httpServers, (x) => parseServerConn(x, 3000, true));
+  const httpServers: HttpServer[] = parseArrayItems(value.httpServers, (x) => parseServerConn(x, 3000, false));
   const wsClients: WsClient[] = parseArrayItems(value.wsClients, parseWsClient);
   const httpClients: HttpClient[] = parseArrayItems(value.httpClients, parseHttpClient);
   return { wsServers, wsClients, httpServers, httpClients };
@@ -503,6 +506,8 @@ function parseSaveFileResult(value: unknown): SaveFileResult | null {
     restartRequired: boolField(value, "restartRequired"),
     warnings: parseStringArray(value.warnings),
     applied: parseAppliedResult(value.applied),
+    reloginRequired: optBoolField(value, "reloginRequired"),
+    recoveryCleared: optBoolField(value, "recoveryCleared"),
   };
 }
 

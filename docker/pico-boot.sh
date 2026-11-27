@@ -85,7 +85,7 @@ detect_webui_port() {
         ' "$_cfg" 2>/dev/null || true)"
     fi
     case "$_port" in
-        ''|*[!0-9]*) _port=6099 ;;
+        ''|*[!0-9]*|0*|??????*) _port=6099 ;;
     esac
     if [ "$_port" -lt 1 ] || [ "$_port" -gt 65535 ]; then
         _port=6099
@@ -97,7 +97,7 @@ webui_listening() {
     _wport="${1:-$(detect_webui_port)}"
     _whex="$(printf '%04X' "$_wport")"
     (cat /proc/net/tcp /proc/net/tcp6 2>/dev/null || true) \
-        | awk -v port_hex="$_whex" '$4 == "0A" && toupper($2) ~ (":" port_hex "$") { found = 1; exit 0 } END { exit(found ? 0 : 1) }'
+        | awk -v port_hex="$_whex" '$4 == "0A" && (toupper($2) ~ (":" port_hex "$") || toupper($2) == "0100007F:17D3" || toupper($2) == "0000000000000000FFFF00000100007F:17D3") { found = 1; exit 0 } END { exit(found ? 0 : 1) }'
 }
 
 log "=============================================================="

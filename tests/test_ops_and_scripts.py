@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import socket
 import stat
 import subprocess
@@ -198,12 +199,15 @@ class PicoQrTests(unittest.TestCase):
         env = os.environ.copy()
         env.pop("PICO_WEBUI_TOKEN", None)
         env.pop("PICO_API", None)
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
         if env_overrides:
             env.update(env_overrides)
         return subprocess.run(
             [sys.executable, str(PICOQR_PATH), *args],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=25,
             env=env,
         )
@@ -277,6 +281,8 @@ class PicoQrTests(unittest.TestCase):
             server.server_close()
 
 
+@unittest.skipIf(os.name == "nt", "Requires POSIX shell/awk")
+@unittest.skipUnless(shutil.which("bash"), "Requires bash in PATH")
 class PicoCtlTests(unittest.TestCase):
     """Regression tests for scripts/picoctl.sh HTTP probe & curl -K hardening (P0-1, P2-28)."""
 
@@ -294,7 +300,7 @@ class PicoCtlTests(unittest.TestCase):
             curl_path.chmod(curl_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
             env = os.environ.copy()
-            env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+            env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
             env["PICOCTL_SOURCE_ONLY"] = "1"
             env["PICO_IP"] = "127.0.0.1"
             env["PICO_WEBUI_PORT"] = "6099"
@@ -307,6 +313,7 @@ class PicoCtlTests(unittest.TestCase):
                 ["bash", "-c", cmd],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
                 timeout=15,
                 env=env,
             )
@@ -462,6 +469,8 @@ class ObCheckTests(unittest.TestCase):
             t.join(timeout=5)
 
 
+@unittest.skipIf(os.name == "nt", "Requires POSIX shell/awk")
+@unittest.skipUnless(shutil.which("awk"), "Requires awk in PATH")
 class ProcNetTcpAwkFilterTests(unittest.TestCase):
     STATIC_PORT_SCRIPTS = (
         REPO_ROOT / "docker" / "pico-doctor.sh",
@@ -481,6 +490,7 @@ class ProcNetTcpAwkFilterTests(unittest.TestCase):
             cmd,
             input=proc_net_content,
             text=True,
+            encoding="utf-8",
             capture_output=True,
             timeout=10,
         )
@@ -572,48 +582,175 @@ class ProcNetTcpAwkFilterTests(unittest.TestCase):
                 with self.subTest(script=script_path.name, case=case_name):
                     self.assertEqual(self._run_awk(awk_program, content, port_hex="17D3"), expected_rc)
 
-            # Custom configured port (8080 = 0x1F90) must match only 1F90, not 17D3
+            # Custom configured port (8080 = 0x1F90) matches 1F90 and recovery-mode loopback 127.0.0.1:6099,
+            # while still rejecting wildcard 0.0.0.0:6099 and non-LISTEN states on 127.0.0.1:6099.
             custom_match_tbl = header + "   0: 00000000:1f90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 200\n"
             custom_miss_tbl = header + "   0: 00000000:17D3 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 201\n"
+            recovery_v4_tbl = header + "   0: 0100007F:17D3 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 202\n"
+            recovery_v6_tbl = header + "   0: 0000000000000000FFFF00000100007F:17d3 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 203\n"
+            recovery_est_tbl = header + "   0: 0100007F:17D3 0100007F:C350 01 00000000:00000000 00:00000000 00000000 1000 0 204\n"
             with self.subTest(script=script_path.name, case="custom_port_8080_match"):
                 self.assertEqual(self._run_awk(awk_program, custom_match_tbl, port_hex="1F90"), 0)
-            with self.subTest(script=script_path.name, case="custom_port_8080_reject_6099"):
+            with self.subTest(script=script_path.name, case="custom_port_8080_reject_wildcard_6099"):
                 self.assertEqual(self._run_awk(awk_program, custom_miss_tbl, port_hex="1F90"), 1)
+            with self.subTest(script=script_path.name, case="custom_port_8080_accept_recovery_loopback_v4_6099"):
+                self.assertEqual(self._run_awk(awk_program, recovery_v4_tbl, port_hex="1F90"), 0)
+            with self.subTest(script=script_path.name, case="custom_port_8080_accept_recovery_loopback_v6_6099"):
+                self.assertEqual(self._run_awk(awk_program, recovery_v6_tbl, port_hex="1F90"), 0)
+            with self.subTest(script=script_path.name, case="custom_port_8080_reject_recovery_loopback_non_listen"):
+                self.assertEqual(self._run_awk(awk_program, recovery_est_tbl, port_hex="1F90"), 1)
 
+    @unittest.skipUnless(shutil.which("sh"), "Requires sh in PATH")
     def test_detect_webui_port_parses_config_json_and_falls_back_to_6099(self) -> None:
-        # Extract detect_webui_port() from pico-health.sh and execute under sh
-        health_text = (REPO_ROOT / "docker" / "pico-health.sh").read_text(encoding="utf-8")
-        m = re.search(r"detect_webui_port\(\)\s*\{.*?\n\}", health_text, re.S)
-        self.assertIsNotNone(m)
-        assert m is not None
-        fn_def = m.group(0)
+        samples = [
+            ("pretty_custom_port", json.dumps({"version": 2, "webui": {"host": "0.0.0.0", "port": 8080}, "network": {"wsServers": [{"port": 3001}]}}, indent=2), "8080"),
+            ("minified_custom_port", json.dumps({"webui": {"cors_allowed_origins": ["http://a.test"], "port": 7001}, "network": {"wsServers": [{"port": 3001}]}}), "7001"),
+            ("missing_webui_port_does_not_grab_network_port", json.dumps({"webui": {"host": "0.0.0.0"}, "network": {"wsServers": [{"port": 3001}]}}), "6099"),
+            ("invalid_port_out_of_range", json.dumps({"webui": {"port": 99999}}), "6099"),
+            ("invalid_port_6digit_overflow", '{"webui":{"port":100000}}', "6099"),
+            ("invalid_port_huge_overflow", '{"webui":{"port":999999999999999999999}}', "6099"),
+            ("invalid_port_leading_zero_octal", '{"webui":{"port":0100}}', "6099"),
+            ("invalid_port_leading_zero_08080", '{"webui":{"port":08080}}', "6099"),
+            ("invalid_port_zero", '{"webui":{"port":0}}', "6099"),
+            ("corrupt_json", "{not-json", "6099"),
+        ]
 
-        with tempfile.TemporaryDirectory(prefix="pico-port-test-") as td:
-            cfg = Path(td) / "config.json"
-            samples = [
-                ("pretty_custom_port", json.dumps({"version": 2, "webui": {"host": "0.0.0.0", "port": 8080}, "network": {"wsServers": [{"port": 3001}]}}, indent=2), "8080"),
-                ("minified_custom_port", json.dumps({"webui": {"cors_allowed_origins": ["http://a.test"], "port": 7001}, "network": {"wsServers": [{"port": 3001}]}}), "7001"),
-                ("missing_webui_port_does_not_grab_network_port", json.dumps({"webui": {"host": "0.0.0.0"}, "network": {"wsServers": [{"port": 3001}]}}), "6099"),
-                ("invalid_port_out_of_range", json.dumps({"webui": {"port": 99999}}), "6099"),
-                ("corrupt_json", "{not-json", "6099"),
-            ]
-            for label, content, expected in samples:
-                with self.subTest(case=label):
-                    cfg.write_text(content, encoding="utf-8")
-                    env = os.environ.copy()
-                    env["PICO_CONFIG_FILE"] = str(cfg)
-                    proc = subprocess.run(
-                        ["sh", "-c", f"{fn_def}\ndetect_webui_port"],
-                        capture_output=True,
-                        text=True,
-                        timeout=10,
-                        env=env,
-                    )
-                    self.assertEqual(proc.returncode, 0)
-                    self.assertEqual(proc.stdout.strip(), expected)
+        for script_path in self.DYNAMIC_PORT_SCRIPTS:
+            script_text = script_path.read_text(encoding="utf-8")
+            m = re.search(r"detect_webui_port\(\)\s*\{.*?\n\}", script_text, re.S)
+            self.assertIsNotNone(m, f"Expected detect_webui_port() in {script_path}")
+            assert m is not None
+            fn_def = m.group(0)
+
+            with tempfile.TemporaryDirectory(prefix="pico-port-test-") as td:
+                cfg = Path(td) / "config.json"
+                for label, content, expected in samples:
+                    with self.subTest(script=script_path.name, case=label):
+                        cfg.write_text(content, encoding="utf-8")
+                        env = os.environ.copy()
+                        env["PICO_CONFIG_FILE"] = str(cfg)
+                        proc = subprocess.run(
+                            ["sh", "-c", f"{fn_def}\ndetect_webui_port"],
+                            capture_output=True,
+                            text=True,
+                            encoding="utf-8",
+                            timeout=10,
+                            env=env,
+                        )
+                        self.assertEqual(proc.returncode, 0, msg=f"stderr={proc.stderr!r}")
+                        self.assertEqual(proc.stdout.strip(), expected)
+
+
+@unittest.skipIf(os.name == "nt", "Requires POSIX shell/awk")
+@unittest.skipUnless(shutil.which("sh"), "Requires sh in PATH")
+class PicoRestartTests(unittest.TestCase):
+    """Regression tests for docker/pico-restart.sh timestamp re-sampling & mv -T safety (R3-P2-11, R3-P2-14)."""
+
+    def test_restart_tick_resamples_now_after_reading_request_across_second_boundary(self) -> None:
+        restart_script = REPO_ROOT / "docker" / "pico-restart.sh"
+        with tempfile.TemporaryDirectory(prefix="pico-restart-clock-") as td:
+            td_path = Path(td)
+            ready = td_path / "ready"
+            req = td_path / "restart-qq.request"
+            log_file = td_path / "actions.log"
+            date_flag = td_path / "date.called"
+            script = (
+                f'. "{restart_script}"\n'
+                f'restart_dir="{td_path}"\n'
+                f'restart_ready="{ready}"\n'
+                f'restart_request="{req}"\n'
+                'restart_last=0\n'
+                'date() {\n'
+                f'  if [ ! -f "{date_flag}" ]; then\n'
+                f'    : > "{date_flag}"\n'
+                '    printf "1700000100\\n"\n'
+                '  else\n'
+                '    printf "1700000101\\n"\n'
+                '  fi\n'
+                '}\n'
+                f'log() {{ printf "%s\\n" "$*" >> "{log_file}"; }}\n'
+                'sleep() { :; }\n'
+                f'am() {{ printf "AM:%s\\n" "$*" >> "{log_file}"; return 0; }}\n'
+                'restart_write_ready() {\n'
+                '  # Simulate ContainerRestart writing T+1 right as the clock crosses a second boundary.\n'
+                '  printf "1700000101" > "$restart_request"\n'
+                '  return 0\n'
+                '}\n'
+                'restart_tick\n'
+            )
+            proc = subprocess.run(
+                ["sh", "-c", script],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=10,
+            )
+            self.assertEqual(proc.returncode, 0, msg=f"stderr={proc.stderr!r}")
+            actions = log_file.read_text(encoding="utf-8") if log_file.exists() else ""
+            self.assertIn("AM:force-stop com.tencent.qqlite", actions, f"Expected restart to execute, got:\n{actions}")
+            self.assertNotIn("忽略过期", actions)
+
+    def test_restart_write_ready_with_mv_T_never_falls_back_when_target_is_directory(self) -> None:
+        restart_script = REPO_ROOT / "docker" / "pico-restart.sh"
+        with tempfile.TemporaryDirectory(prefix="pico-restart-mvT-") as td:
+            td_path = Path(td)
+            bin_dir = td_path / "bin"
+            bin_dir.mkdir()
+            mv_log = td_path / "mv.log"
+            ready = td_path / "pico-qq-restart.ready"
+            # Mock mv that supports -T (refuses target dir), logs every invocation,
+            # and simulates a TOCTOU directory swap on the real target path right before mv -T -f runs.
+            mock_mv = bin_dir / "mv"
+            mock_mv.write_text(
+                "#!/bin/sh\n"
+                f'printf "%s\\n" "$*" >> "{mv_log}"\n'
+                'has_T=0\n'
+                'while [ $# -gt 0 ]; do\n'
+                '  case "$1" in\n'
+                '    -T) has_T=1; shift ;;\n'
+                '    -f) shift ;;\n'
+                '    *) break ;;\n'
+                '  esac\n'
+                'done\n'
+                'src="$1"; dst="$2"\n'
+                f'if [ "$dst" = "{ready}" ] && [ ! -d "$dst" ]; then mkdir -p "$dst"; fi\n'
+                'if [ "$has_T" = "1" ] && [ -d "$dst" ]; then exit 1; fi\n'
+                'exec /bin/mv -f "$src" "$dst"\n',
+                encoding="utf-8",
+            )
+            mock_mv.chmod(mock_mv.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+            script = (
+                f'PATH="{bin_dir}{os.pathsep}$PATH"\n'
+                f'. "{restart_script}"\n'
+                f'restart_dir="{td_path}"\n'
+                f'restart_ready="{ready}"\n'
+                'log() { :; }\n'
+                'restart_probe_mv\n'
+                'printf "has_T=%s\\n" "$restart_mv_has_T"\n'
+                'if restart_write_ready; then echo UNEXPECTED_OK; else echo REJECTED_OK; fi\n'
+            )
+            proc = subprocess.run(
+                ["sh", "-c", script],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=10,
+            )
+            self.assertEqual(proc.returncode, 0, msg=f"stderr={proc.stderr!r}")
+            self.assertIn("has_T=1", proc.stdout)
+            self.assertIn("REJECTED_OK", proc.stdout)
+            self.assertTrue(ready.is_dir())
+            self.assertFalse((ready / "pico-qq-restart.ready.tmp").exists())
+            self.assertFalse((td_path / "pico-qq-restart.ready.tmp").exists())
+            # Ensure mv -T -f was attempted on the real target AND no fallback plain `mv -f` (without -T) was ever called.
+            mv_calls = mv_log.read_text(encoding="utf-8").splitlines()
+            self.assertTrue(any(str(ready) in line for line in mv_calls), f"Expected mv call targeting {ready}: {mv_calls}")
+            self.assertTrue(all("-T" in line for line in mv_calls), f"Unexpected fallback mv without -T: {mv_calls}")
 
 
 class ShellAndYamlValidationTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "Requires POSIX shell/awk")
     def test_all_shell_scripts_pass_syntax_check(self) -> None:
         scripts = sorted(
             [
@@ -626,11 +763,14 @@ class ShellAndYamlValidationTests(unittest.TestCase):
         for script in scripts:
             first_line = script.read_text(encoding="utf-8").splitlines()[0]
             shell = "bash" if "bash" in first_line else "sh"
+            if not shutil.which(shell):
+                self.skipTest(f"Requires {shell} in PATH")
             with self.subTest(script=script.relative_to(REPO_ROOT).as_posix(), shell=shell):
                 proc = subprocess.run(
                     [shell, "-n", str(script)],
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
                     timeout=10,
                 )
                 self.assertEqual(
@@ -712,17 +852,24 @@ class ShellAndYamlValidationTests(unittest.TestCase):
         k8s_kinds = {doc.get("kind") for doc in k8s_docs}
         self.assertIn("NetworkPolicy", k8s_kinds, "pico-k8s.yaml must enable NetworkPolicy by default")
         k8s_deploy = next(doc for doc in k8s_docs if doc.get("kind") == "Deployment")
+        k8s_container = k8s_deploy["spec"]["template"]["spec"]["containers"][0]
         k8s_env = {
             e["name"]: e["value"]
-            for e in k8s_deploy["spec"]["template"]["spec"]["containers"][0].get("env", [])
+            for e in k8s_container.get("env", [])
         }
         self.assertEqual(k8s_env.get("PICO_LOG_KMSG"), "0")
         self.assertEqual(k8s_env.get("PICO_ENABLE_ADB"), "0")
+        for probe_name in ("startupProbe", "readinessProbe", "livenessProbe"):
+            probe = k8s_container.get(probe_name) or {}
+            self.assertNotIn("tcpSocket", probe, f"{probe_name} must not hardcode tcpSocket port 6099")
+            cmd = (probe.get("exec") or {}).get("command") or []
+            self.assertIn("/system/bin/pico-health.sh", cmd, f"{probe_name} must invoke /system/bin/pico-health.sh")
 
-        # Verify compose.yml defaults PICO_LOG_KMSG to 0
+        # Verify compose.yml defaults PICO_LOG_KMSG to 0 and passes through PICO_ENABLE_ADB
         compose_doc = parsed_by_rel["docker/compose.yml"][0]
         compose_env = compose_doc["services"]["pico-onebot"]["environment"]
         self.assertEqual(compose_env.get("PICO_LOG_KMSG"), "${PICO_LOG_KMSG:-0}")
+        self.assertEqual(compose_env.get("PICO_ENABLE_ADB"), "${PICO_ENABLE_ADB:-1}")
 
 
 if __name__ == "__main__":

@@ -58,11 +58,11 @@ function blankEntry(kind: Kind): EditingConn {
   const base = { id: uid(), name: "", enabled: true };
   switch (kind) {
     case "wsServers":
-      return { kind, item: { ...base, name: "新的正向 WS", host: "", port: 3001, token: "", cors: true, websocket: true } };
+      return { kind, item: { ...base, name: "新的正向 WS", host: "", port: 3001, token: "", cors: false, websocket: true } };
     case "wsClients":
       return { kind, item: { ...base, name: "新的反向 WS", url: "", token: "", reconnectInterval: 5000 } };
     case "httpServers":
-      return { kind, item: { ...base, name: "新的 HTTP 服务", host: "", port: 3000, token: "", cors: true, websocket: false } };
+      return { kind, item: { ...base, name: "新的 HTTP 服务", host: "", port: 3000, token: "", cors: false, websocket: false } };
     case "httpClients":
       return { kind, item: { ...base, name: "新的 HTTP 上报", url: "", token: "", secret: "" } };
   }

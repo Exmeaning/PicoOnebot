@@ -106,6 +106,17 @@ export function Settings({
   const [base, setBase] = useState(() => getStoredBaseUrl());
   const [switchingBase, setSwitchingBase] = useState(false);
   const loadAbort = useRef<AbortController | null>(null);
+  const probeAbortRef = useRef<AbortController | null>(null);
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      probeAbortRef.current?.abort();
+      probeAbortRef.current = null;
+    };
+  }, []);
 
   useEffect(() => {
     setHexDraft(theme.color);
@@ -192,6 +203,7 @@ export function Settings({
 
   const handleSaveBaseUrl = async (event?: FormEvent) => {
     event?.preventDefault();
+    if (switchingBase) return;
     const parsed = normalizeBaseUrl(base);
     if (!parsed.ok) {
       toast.push("error", parsed.error);
@@ -205,16 +217,26 @@ export function Settings({
       toast.push("info", parsed.url ? "后端地址未变化" : "已恢复默认同源地址");
       return;
     }
+    probeAbortRef.current?.abort();
+    const controller = new AbortController();
+    probeAbortRef.current = controller;
+    let timedOut = false;
     setSwitchingBase(true);
     try {
       // 先探测目标后端连通性与 CORS 预检，避免切到不可达或未放行跨域的地址后被迫退出并卡在登录页。
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 6000);
+      const timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, 6000);
       let probe;
       try {
         probe = await api.probeBaseUrl(parsed.url, controller.signal);
       } finally {
         clearTimeout(timer);
+      }
+      // 切页、卸载或退出登录时中止探测，防止旧回调延迟弹出 toast / confirm 或误触发登出。
+      if (!mountedRef.current || probeAbortRef.current !== controller || (controller.signal.aborted && !timedOut)) {
+        return;
       }
       if (!probe.ok) {
         toast.push("error", probe.message);
@@ -223,12 +245,23 @@ export function Settings({
       if (!confirm(`已确认目标后端 ${nextEffective} 可达。切换后端地址将退出当前会话并需要重新登录，以避免将当前凭据发送到新主机。确定切换吗？`)) {
         return;
       }
+      if (!mountedRef.current || probeAbortRef.current !== controller) {
+        return;
+      }
       // Log out on the old host BEFORE switching baseUrl so the old token is never sent to the new host.
       await api.logout();
+      if (!mountedRef.current || probeAbortRef.current !== controller) {
+        return;
+      }
       setBaseUrl(parsed.url);
       onRequireRelogin("后端地址已更新，请重新登录");
     } finally {
-      setSwitchingBase(false);
+      if (probeAbortRef.current === controller) {
+        probeAbortRef.current = null;
+      }
+      if (mountedRef.current) {
+        setSwitchingBase(false);
+      }
     }
   };
 

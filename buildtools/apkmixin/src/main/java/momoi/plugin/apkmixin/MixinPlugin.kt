@@ -8,9 +8,12 @@ import momoi.plugin.apkmixin.utils.lifecycle
 import org.gradle.api.DefaultTask
 import org.gradle.api.Plugin
 import org.gradle.api.Project
+import org.gradle.api.Task
+import org.gradle.api.file.Directory
 import org.gradle.api.file.DirectoryProperty
 import org.gradle.api.file.FileCollection
 import org.gradle.api.file.RegularFileProperty
+import org.gradle.api.provider.Provider
 import org.gradle.api.tasks.Input
 import org.gradle.api.tasks.InputDirectory
 import org.gradle.api.tasks.InputFile
@@ -42,7 +45,8 @@ class MixinPlugin : Plugin<Project> {
 
     private fun createMixinBaseTask(project: Project) {
         project.tasks.register("MixinApk", MixinApkTask::class.java) { task ->
-            task.mixinAppDexDir.set(project.layout.buildDirectory.dir("intermediates/dex/release/mergeDexRelease"))
+            task.dependsOn(project.provider { resolveDexTaskName(project, DEFAULT_VARIANT_NAME) })
+            task.mixinAppDexDir.set(resolveDexOutputDir(project, DEFAULT_VARIANT_NAME))
             task.targetAppFile.set(
                 project.layout.projectDirectory.file(
                     project.provider {
@@ -165,7 +169,9 @@ class MixinPlugin : Plugin<Project> {
             "--out", outputApk.absolutePath,
             inputApk.absolutePath
         ).redirectErrorStream(true).start()
-        val output = process.inputStream.bufferedReader().readText()
+        // 立即关闭子进程 stdin，防止交互式口令提示导致构建无限挂起
+        process.outputStream.close()
+        val output = process.inputStream.bufferedReader().use { it.readText() }
         val exitCode = process.waitFor()
         if (exitCode != 0) {
             outputApk.delete()
@@ -192,7 +198,8 @@ class MixinPlugin : Plugin<Project> {
             unsignedApkFile.absolutePath,
             alignedFile.absolutePath
         ).redirectErrorStream(true).start()
-        val output = process.inputStream.bufferedReader().readText()
+        process.outputStream.close()
+        val output = process.inputStream.bufferedReader().use { it.readText() }
         val exitCode = process.waitFor()
         if (exitCode != 0) {
             alignedFile.delete()
@@ -283,7 +290,64 @@ class MixinPlugin : Plugin<Project> {
     }
 
     internal companion object {
+        private const val DEFAULT_VARIANT_NAME = "Release"
         private val PRE_RELEASE_TOKEN_REGEX = Regex("\\d+|\\D+")
+
+        internal fun resolveDexTaskName(project: Project, variantName: String = DEFAULT_VARIANT_NAME): String {
+            val r8TaskName = "minify${variantName}WithR8"
+            val r8Task = project.tasks.findByName(r8TaskName)
+            if (r8Task != null && r8Task.enabled) {
+                return r8TaskName
+            }
+            return "mergeDex${variantName}"
+        }
+
+        internal fun resolveDexOutputDir(project: Project, variantName: String = DEFAULT_VARIANT_NAME): Provider<Directory> {
+            val variantLower = variantName.replaceFirstChar { it.lowercase() }
+            return project.provider { resolveDexTaskName(project, variantName) }.flatMap { taskName ->
+                val dexTask = project.tasks.findByName(taskName)
+                val taskDirProp = dexTask?.let { extractDexDirectoryProperty(it) }
+                if (taskDirProp != null && taskDirProp.isPresent) {
+                    taskDirProp
+                } else {
+                    project.layout.buildDirectory.dir("intermediates/dex/$variantLower/$taskName")
+                }
+            }
+        }
+
+        private fun extractDexDirectoryProperty(task: Task): DirectoryProperty? {
+            for (getter in listOf("getOutputDex", "getOutputDir")) {
+                val prop = runCatching { task.javaClass.getMethod(getter).invoke(task) as? DirectoryProperty }.getOrNull()
+                if (prop != null) return prop
+            }
+            return null
+        }
+
+        private fun isAsciiDigits(value: String): Boolean =
+            value.isNotEmpty() && value.all { it in '0'..'9' }
+
+        private fun compareUnsignedDigits(a: String, b: String): Int {
+            val aTrim = a.trimStart('0')
+            val bTrim = b.trimStart('0')
+            val lenCmp = aTrim.length.compareTo(bTrim.length)
+            if (lenCmp != 0) return lenCmp
+            return aTrim.compareTo(bTrim)
+        }
+
+        /**
+         * 严格弱序分段比较：纯数字段严格高于非数字段，消除混合字符串与数字比较引发的循环传递性违例
+         * （如 `"9" < "35" < "5_custom" < "9"`），同时确保 `android-4.4W < 35.0.0 < 36.0.0`。
+         */
+        private fun compareSegment(a: String, b: String): Int {
+            val aIsNum = isAsciiDigits(a)
+            val bIsNum = isAsciiDigits(b)
+            return when {
+                aIsNum && bIsNum -> compareUnsignedDigits(a, b)
+                aIsNum -> 1
+                bIsNum -> -1
+                else -> a.compareTo(b)
+            }
+        }
 
         internal fun compareBuildToolsVersion(a: String, b: String): Int {
             val aDash = a.indexOf('-')
@@ -294,13 +358,7 @@ class MixinPlugin : Plugin<Project> {
             for (i in 0 until maxLen) {
                 val aPart = aCore.getOrNull(i) ?: "0"
                 val bPart = bCore.getOrNull(i) ?: "0"
-                val aNum = aPart.toLongOrNull()
-                val bNum = bPart.toLongOrNull()
-                val cmp = if (aNum != null && bNum != null) {
-                    aNum.compareTo(bNum)
-                } else {
-                    aPart.compareTo(bPart)
-                }
+                val cmp = compareSegment(aPart, bPart)
                 if (cmp != 0) return cmp
             }
             val aPre = if (aDash >= 0) a.substring(aDash + 1) else null
@@ -319,11 +377,7 @@ class MixinPlugin : Plugin<Project> {
             val bTokens = PRE_RELEASE_TOKEN_REGEX.findAll(b).map { it.value }.toList()
             val minLen = minOf(aTokens.size, bTokens.size)
             for (i in 0 until minLen) {
-                val at = aTokens[i]
-                val bt = bTokens[i]
-                val an = at.toLongOrNull()
-                val bn = bt.toLongOrNull()
-                val cmp = if (an != null && bn != null) an.compareTo(bn) else at.compareTo(bt)
+                val cmp = compareSegment(aTokens[i], bTokens[i])
                 if (cmp != 0) return cmp
             }
             return aTokens.size.compareTo(bTokens.size)
@@ -365,10 +419,6 @@ abstract class MixinApkTask : DefaultTask() {
 
     @get:OutputFile
     abstract val outputMixinFile: RegularFileProperty
-
-    init {
-        dependsOn("mergeDexRelease")
-    }
 
     @TaskAction
     fun execute() {

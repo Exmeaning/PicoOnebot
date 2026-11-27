@@ -26,6 +26,8 @@ services:
       PICO_LOG_KMSG: "${PICO_LOG_KMSG:-0}"
       # Binder 校验失败时是否直接退出容器 (1: 退出, 0: 仅告警并继续)
       PICO_BINDER_STRICT: "${PICO_BINDER_STRICT:-0}"
+      # 是否启用容器内 Redroid adbd (1: 默认启用且仅映射 127.0.0.1:5555, 0: 彻底禁用)
+      PICO_ENABLE_ADB: "${PICO_ENABLE_ADB:-1}"
 
     # ── Binder 设备配置 ───────────────────────────────────────────────────────
     # 默认使用 binderfs 模式（无需映射宿主机 binder 设备）。

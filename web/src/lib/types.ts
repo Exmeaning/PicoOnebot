@@ -41,6 +41,7 @@ export interface BotStatus {
   webuiUrl?: string;
   lanIp?: string;
   canRestartQq?: boolean;
+  recoveryMode?: boolean;
 }
 
 export interface WsServer {
@@ -155,6 +156,7 @@ export interface LoginResult {
   ok: boolean;
   token: string;
   mustChangePassword?: boolean;
+  recoveryMode?: boolean;
 }
 
 export interface FileEntry {
@@ -206,6 +208,8 @@ export interface SaveFileResult {
   restartRequired: boolean;
   warnings?: string[];
   applied?: AppliedResult;
+  reloginRequired?: boolean;
+  recoveryCleared?: boolean;
 }
 
 export interface ConnectionInfo {

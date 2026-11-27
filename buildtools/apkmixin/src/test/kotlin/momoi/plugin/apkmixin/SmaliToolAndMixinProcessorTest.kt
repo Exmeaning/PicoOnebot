@@ -527,6 +527,129 @@ class SmaliToolAndMixinProcessorTest {
     }
 
     @Test
+    fun privateTargetRewritesShortFormInvokeDirectAndRangeFromRealDex() {
+        val tempDir = Files.createTempDirectory("mixin-private-short-direct-test").toFile()
+        try {
+            val processor = newProcessor(tempDir)
+
+            val targetDef = """
+                .class public Lcom/example/Host;
+                .super Ljava/lang/Object;
+
+                .method private secret(I)I
+                    .registers 2
+
+                    return p1
+                .end method
+            """.trimIndent().toClassDefOrThrow(21, "Lcom/example/Host;")
+
+            // Real compiled DEX invokes private methods on the mixin class via invoke-direct(/range),
+            // which BaksmaliWriter(writer, this.type) disassembles in short form (secret(I)I).
+            val privateDirectMixinDef = """
+                .class public Lcom/example/HostPrivateDirectMixin;
+                .super Lcom/example/Host;
+
+                .annotation runtime Lmomoi/anno/mixin/Mixin;
+                .end annotation
+
+                .method private helperPrivate(I)I
+                    .registers 2
+
+                    return p1
+                .end method
+
+                .method private secret(I)I
+                    .registers 6
+
+                    const-string v0, "invoke-direct {p0, p1}, secret(I)I"
+
+                    invoke-direct {p0, p1}, Lcom/example/HostPrivateDirectMixin;->secret(I)I
+                    move-result v1
+
+                    invoke-direct/range {p0 .. p1}, Lcom/example/HostPrivateDirectMixin;->secret(I)I
+                    move-result v2
+
+                    invoke-direct {p0, p1}, Lcom/example/HostPrivateDirectMixin;->helperPrivate(I)I
+                    move-result v3
+
+                    add-int/2addr v1, v2
+                    add-int/2addr v1, v3
+
+                    return v1
+                .end method
+            """.trimIndent().toClassDefOrThrow(21, "Lcom/example/HostPrivateDirectMixin;")
+
+            // Confirm Baksmali indeed produces the short-form invoke-direct(/range) that caused R3-P1-3.
+            val disassembledMixin = privateDirectMixinDef.toSmali(21)
+            assertTrue(
+                disassembledMixin.contains("invoke-direct {p0, p1}, secret(I)I"),
+                "Expected Baksmali short-form invoke-direct in test fixture:\n$disassembledMixin"
+            )
+            assertTrue(
+                disassembledMixin.contains("invoke-direct/range {p0 .. p1}, secret(I)I"),
+                "Expected Baksmali short-form invoke-direct/range in test fixture:\n$disassembledMixin"
+            )
+
+            val srcDex = MutableDexFile().apply { classes.add(privateDirectMixinDef) }
+            val trgDex = MutableDexFile().apply { classes.add(targetDef) }
+
+            @Suppress("UNCHECKED_CAST")
+            val mixinClasses = invokePrivate(
+                processor,
+                "findMixinClasses",
+                arrayOf(DexFile::class.java, DexFile::class.java),
+                srcDex,
+                trgDex
+            ) as Map<ClassDef, ClassDef>
+            assertEquals(1, mixinClasses.size)
+
+            @Suppress("UNCHECKED_CAST")
+            val resultPair = invokePrivate(
+                processor,
+                "processClasses",
+                arrayOf(DexFile::class.java, DexFile::class.java, Map::class.java, Int::class.javaPrimitiveType!!),
+                srcDex,
+                trgDex,
+                mixinClasses,
+                21
+            ) as Pair<MutableDexFile, Map<String, ClassDef>>
+
+            val modified = assertNotNull(resultPair.second["Lcom/example/Host;"])
+            val outSmali = Smali(modified.toSmali(21))
+
+            val secretOrig = assertNotNull(outSmali.methods.find { it.name == "secret_0" })
+            assertTrue(secretOrig.isPrivate)
+            val secretNew = assertNotNull(outSmali.methods.find { it.name == "secret" })
+            assertTrue(
+                secretNew.body.contains("invoke-direct {p0, p1}, secret_0(I)I"),
+                "Short-form invoke-direct on private target must rewrite to secret_0:\n${secretNew.body}"
+            )
+            assertTrue(
+                secretNew.body.contains("invoke-direct/range {p0 .. p1}, secret_0(I)I"),
+                "Short-form invoke-direct/range on private target must rewrite to secret_0:\n${secretNew.body}"
+            )
+            assertFalse(
+                secretNew.body.lines().any { it.trimStart().startsWith("invoke-direct") && it.contains(", secret(I)I") },
+                "Must NOT leave recursive invoke-direct to secret(I)I:\n${secretNew.body}"
+            )
+            assertTrue(
+                secretNew.body.contains("invoke-direct {p0, p1}, helperPrivate(I)I"),
+                "Unrelated private invoke-direct must NOT be rewritten:\n${secretNew.body}"
+            )
+            assertTrue(
+                secretNew.body.contains("const-string v0, \"invoke-direct {p0, p1}, secret(I)I\""),
+                "String literal must NOT be rewritten:\n${secretNew.body}"
+            )
+            assertFalse(
+                secretNew.body.contains("invoke-virtual"),
+                "Must NEVER emit illegal invoke-virtual for private target:\n${secretNew.body}"
+            )
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
     fun writeDexOutputStripsStaleRootDexAndUsesResolvedApiLevel() {
         val tempDir = Files.createTempDirectory("mixin-write-dex-test").toFile()
         try {

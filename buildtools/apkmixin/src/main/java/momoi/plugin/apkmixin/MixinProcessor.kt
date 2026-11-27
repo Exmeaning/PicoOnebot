@@ -233,7 +233,8 @@ class MixinProcessor(
 
         // 精准重写当前被覆盖方法的委托调用，避免全局字符串替换误伤无关调用或字符串字面量：
         // - 静态方法（如 @StaticHook）：将指向 rawCall / 隐式 rawShortCall 的 invoke-static(/range) 重定向至重命名原实现，防止无限递归；
-        // - 实例方法：将指向 rawCall 的 invoke-super(/range) 重定向至重命名原实现；当目标原方法为 private 时使用合法的 invoke-direct(/range)。
+        // - private 实例方法：真实 DEX 反汇编会输出短形式 invoke-direct(/range) rawShortCall，同时兼容完整形式 invoke-direct/invoke-super rawCall，统一重定向为合法的 invoke-direct(/range)；
+        // - 非 private 实例方法：将指向 rawCall 的 invoke-super(/range) 重定向至重命名原实现。
         if (isStatic) {
             val staticCallRegex = Regex(
                 """^([ \t]*)invoke-(?:static|super)(/range)?([ \t]+\{[^}]*\},[ \t]*)(?:${Regex.escape(rawCall)}|${Regex.escape(rawShortCall)})([ \t]*(?:#.*)?)$""",
@@ -246,11 +247,23 @@ class MixinProcessor(
                 val trailing = match.groupValues[4]
                 "${indent}invoke-static${rangeSuffix}${registers}${renamedCall}${trailing}"
             }
+        } else if (trgMethod.isPrivate) {
+            val escapedFull = Regex.escape(rawCall)
+            val escapedShort = Regex.escape(rawShortCall)
+            val privateCallRegex = Regex(
+                """^([ \t]*)(?:invoke-super(/range)?([ \t]+\{[^}]*\},[ \t]*)$escapedFull|invoke-direct(/range)?([ \t]+\{[^}]*\},[ \t]*)(?:$escapedFull|$escapedShort))([ \t]*(?:#.*)?)$""",
+                RegexOption.MULTILINE
+            )
+            srcMethod.body = privateCallRegex.replace(srcMethod.body) { match ->
+                val indent = match.groupValues[1]
+                val rangeSuffix = match.groupValues[2].ifEmpty { match.groupValues[4] }
+                val registers = match.groupValues[3].ifEmpty { match.groupValues[5] }
+                val trailing = match.groupValues[6]
+                "${indent}invoke-direct${rangeSuffix}${registers}${renamedCall}${trailing}"
+            }
         } else {
-            val targetInvoke = if (trgMethod.isPrivate) "invoke-direct" else "invoke-virtual"
-            val sourceInvokePattern = if (trgMethod.isPrivate) "invoke-(?:super|direct)" else "invoke-super"
             val instanceCallRegex = Regex(
-                """^([ \t]*)${sourceInvokePattern}(/range)?([ \t]+\{[^}]*\},[ \t]*)${Regex.escape(rawCall)}([ \t]*(?:#.*)?)$""",
+                """^([ \t]*)invoke-super(/range)?([ \t]+\{[^}]*\},[ \t]*)${Regex.escape(rawCall)}([ \t]*(?:#.*)?)$""",
                 RegexOption.MULTILINE
             )
             srcMethod.body = instanceCallRegex.replace(srcMethod.body) { match ->
@@ -258,7 +271,7 @@ class MixinProcessor(
                 val rangeSuffix = match.groupValues[2]
                 val registers = match.groupValues[3]
                 val trailing = match.groupValues[4]
-                "${indent}${targetInvoke}${rangeSuffix}${registers}${renamedCall}${trailing}"
+                "${indent}invoke-virtual${rangeSuffix}${registers}${renamedCall}${trailing}"
             }
         }
     }

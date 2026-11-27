@@ -16,7 +16,7 @@ import {
   Search,
 } from "lucide-react";
 import { Badge, Button, Card, CardHeader, Empty, Input, PageHeader, useToast } from "../components/ui";
-import { ApiError, api, getErrorMessage, isAbortError } from "../lib/api";
+import { ApiError, api, getErrorMessage, isAbortError, setToken } from "../lib/api";
 import { copyText } from "../lib/clipboard";
 import { fmtApplied, fmtDateTime } from "../lib/format";
 import type { FileDocument, FileEntry, FileListing } from "../lib/types";
@@ -34,7 +34,15 @@ function fileIcon(entry: FileEntry) {
   return <FileText className="h-4 w-4" />;
 }
 
-export function FileManager({ onDirtyChange }: { onDirtyChange?: (dirty: boolean) => void }) {
+export function FileManager({
+  onDirtyChange,
+  onRequireRelogin,
+  recoveryMode = false,
+}: {
+  onDirtyChange?: (dirty: boolean) => void;
+  onRequireRelogin?: (message: string) => void;
+  recoveryMode?: boolean;
+}) {
   const toast = useToast();
   const mountedRef = useRef(true);
   const requestId = useRef(0);
@@ -42,6 +50,7 @@ export function FileManager({ onDirtyChange }: { onDirtyChange?: (dirty: boolean
   const dirAbortRef = useRef<AbortController | null>(null);
   const fileAbortRef = useRef<AbortController | null>(null);
   const savingRef = useRef(false);
+  const recoveryAutoOpenedRef = useRef(false);
 
   const [listing, setListing] = useState<FileListing | null>(null);
   const [directoryError, setDirectoryError] = useState<string | null>(null);
@@ -66,6 +75,8 @@ export function FileManager({ onDirtyChange }: { onDirtyChange?: (dirty: boolean
   }, []);
 
   const dirty = document !== null && content !== savedContent;
+  const isActiveConfigDoc = Boolean(document && listing?.activeConfig && document.path === listing.activeConfig.path);
+  const canSave = Boolean(document) && (dirty || (recoveryMode && isActiveConfigDoc));
 
   const loadDirectory = useCallback(
     async (path: string) => {
@@ -173,6 +184,18 @@ export function FileManager({ onDirtyChange }: { onDirtyChange?: (dirty: boolean
     [toast]
   );
 
+  useEffect(() => {
+    if (!recoveryMode) {
+      recoveryAutoOpenedRef.current = false;
+      return;
+    }
+    const active = listing?.activeConfig;
+    if (active && active.editable && !recoveryAutoOpenedRef.current && !selected && !loadingFile) {
+      recoveryAutoOpenedRef.current = true;
+      void loadFile(active);
+    }
+  }, [recoveryMode, listing, selected, loadingFile, loadFile]);
+
   const openEntry = async (entry: FileEntry) => {
     if (entry.type === "directory") {
       await openDirectory(entry.path);
@@ -202,7 +225,7 @@ export function FileManager({ onDirtyChange }: { onDirtyChange?: (dirty: boolean
   };
 
   const save = useCallback(async () => {
-    if (!document || !dirty || savingRef.current) return;
+    if (!document || !canSave || savingRef.current) return;
     const saveReqId = requestId.current;
     const targetDoc = document;
     const savedSnapshot = content;
@@ -223,6 +246,21 @@ export function FileManager({ onDirtyChange }: { onDirtyChange?: (dirty: boolean
           ? { ...current, size: result.size, modifiedAt: result.modifiedAt }
           : current
       );
+      // 恢复模式下修复并保存 config.json 后，后端会立即吊销恢复会话：直接提示成功并干净退回登录页，
+      // 避免继续用失效令牌调用 loadDirectory() 触发误导性的 401 红错。
+      if (result.reloginRequired || result.recoveryCleared) {
+        onDirtyChange?.(false);
+        const reloginMsg = result.restartRequired
+          ? "配置已修复（部分设置需重启 QQ 生效），请重新登录"
+          : "配置已修复，请重新登录";
+        if (onRequireRelogin) {
+          onRequireRelogin(reloginMsg);
+        } else {
+          setToken("");
+          toast.push("success", reloginMsg);
+        }
+        return;
+      }
       // 只有改到正在生效的配置文件才谈得上"应用"；别的文件就是写盘,别替它宣布生效。
       if (activeConfigPath === targetDoc.path) {
         const applied = fmtApplied(result);
@@ -243,7 +281,7 @@ export function FileManager({ onDirtyChange }: { onDirtyChange?: (dirty: boolean
       savingRef.current = false;
       if (mountedRef.current) setSaving(false);
     }
-  }, [content, dirty, document, listing, loadDirectory, toast]);
+  }, [canSave, content, document, listing, loadDirectory, onDirtyChange, onRequireRelogin, toast]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -347,7 +385,7 @@ export function FileManager({ onDirtyChange }: { onDirtyChange?: (dirty: boolean
                           <span className="block truncate text-xs font-extrabold">当前生效配置</span>
                           <span className="mt-0.5 block truncate font-mono text-[10px] text-pico-muted">{activeConfig.path}</span>
                         </span>
-                        <Badge tone="amber" className="shrink-0">开发者</Badge>
+                        <Badge tone="amber" className="shrink-0">{recoveryMode ? "待修复" : "开发者"}</Badge>
                       </button>
                     );
                   })() : null}
@@ -390,12 +428,24 @@ export function FileManager({ onDirtyChange }: { onDirtyChange?: (dirty: boolean
         <Card className="min-w-0 lg:h-[calc(100vh-12rem)] lg:min-h-[580px]">
           <CardHeader
             title={selected?.name ?? "编辑器"}
-            desc={document ? `${formatSize(document.size)} · ${fmtDateTime(document.modifiedAt)}` : selected ? `${formatSize(selected.size)} · ${fmtDateTime(selected.modifiedAt)}` : "未选择文件"}
+            desc={
+              document
+                ? `${formatSize(document.size)} · ${document.modifiedAt > 0 ? fmtDateTime(document.modifiedAt) : "尚未写入磁盘"}`
+                : selected
+                  ? `${formatSize(selected.size)} · ${selected.modifiedAt > 0 ? fmtDateTime(selected.modifiedAt) : "尚未写入磁盘"}`
+                  : "未选择文件"
+            }
             icon={<FileText className="h-4 w-4" />}
             action={
               document ? (
                 <div className="flex shrink-0 items-center gap-1 sm:gap-2">
-                  {dirty ? <Badge tone="amber">未保存</Badge> : <Badge tone="green">已保存</Badge>}
+                  {dirty ? (
+                    <Badge tone="amber">未保存</Badge>
+                  ) : recoveryMode && isActiveConfigDoc ? (
+                    <Badge tone="amber">待修复</Badge>
+                  ) : (
+                    <Badge tone="green">已保存</Badge>
+                  )}
                   <Button
                     variant="ghost"
                     size="icon"
@@ -423,7 +473,7 @@ export function FileManager({ onDirtyChange }: { onDirtyChange?: (dirty: boolean
                   <Button variant="ghost" size="icon" onClick={() => setContent(savedContent)} disabled={!dirty} title="撤销修改" aria-label="撤销修改">
                     <RotateCcw className="h-4 w-4" />
                   </Button>
-                  <Button onClick={() => void save()} loading={saving} disabled={!dirty || saving}>
+                  <Button onClick={() => void save()} loading={saving} disabled={!canSave || saving}>
                     <Save className="h-4 w-4" /> 保存
                   </Button>
                 </div>

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { AlertTriangle, FolderCog } from "lucide-react";
 import { ThemeProvider } from "./store/theme";
-import { ToastProvider, useToast } from "./components/ui";
+import { Button, ToastProvider, useToast } from "./components/ui";
 import { Shell, NAV, type PageKey } from "./components/Shell";
 import { Login } from "./pages/Login";
 import { Dashboard } from "./pages/Dashboard";
@@ -225,7 +226,11 @@ function Root() {
         const s = await api.status(controller.signal);
         if (!alive || controller.signal.aborted) return;
         setStatus(s);
-        if (s.online) {
+        if (s.recoveryMode) {
+          // 损坏配置恢复模式下抑制自动跳转扫码页，优先让用户在文件管理修复 config.json
+          qrRedirected.current = false;
+          qrDeferredNotified.current = false;
+        } else if (s.online) {
           qrRedirected.current = false;
           qrDeferredNotified.current = false;
           if (pageRef.current === "qr") navigate("dashboard", { force: true });
@@ -378,11 +383,40 @@ function Root() {
 
   return (
     <Shell page={page} onNavigate={navigateInteractive} onLogout={() => void logout()} status={status}>
+      {status?.recoveryMode ? (
+        <div
+          role="alert"
+          className="mb-6 flex flex-wrap items-center justify-between gap-3 rounded-3xl border-2 border-amber-300 bg-amber-50/95 px-5 py-4 text-amber-950 shadow-cute"
+        >
+          <div className="flex min-w-0 items-start gap-3">
+            <span className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-2xl bg-amber-100 text-amber-700">
+              <AlertTriangle className="h-5 w-5" />
+            </span>
+            <div className="min-w-0">
+              <p className="text-sm font-extrabold">当前处于损坏配置恢复模式</p>
+              <p className="mt-0.5 text-xs leading-relaxed text-amber-900/90">
+                检测到 <code className="rounded bg-amber-100/80 px-1 py-0.5 font-mono">config.json</code> 损坏，后端已仅监听本机回环并禁用普通配置写入。请前往「文件管理」打开「当前生效配置」（<code className="rounded bg-amber-100/80 px-1 py-0.5 font-mono">config.json</code>）修复并保存；保存成功后恢复会话将自动注销，请重新登录。
+              </p>
+            </div>
+          </div>
+          {page !== "files" ? (
+            <Button type="button" size="sm" variant="soft" onClick={() => navigateInteractive("files")} className="shrink-0">
+              <FolderCog className="h-4 w-4" /> 前往修复 config.json
+            </Button>
+          ) : null}
+        </div>
+      ) : null}
       {page === "dashboard" && <Dashboard status={status} onNavigate={navigateInteractive} />}
       {page === "qr" && <QrLogin onNavigate={navigateInteractive} />}
       {page === "network" && <Network onDirtyChange={onNetworkDirtyChange} />}
       {page === "logs" && <Logs />}
-      {page === "files" && <FileManager onDirtyChange={onFilesDirtyChange} />}
+      {page === "files" && (
+        <FileManager
+          onDirtyChange={onFilesDirtyChange}
+          onRequireRelogin={requireRelogin}
+          recoveryMode={Boolean(status?.recoveryMode)}
+        />
+      )}
       {page === "settings" && <Settings onRequireRelogin={requireRelogin} onDirtyChange={onSettingsDirtyChange} />}
       {page === "about" && <About status={status} />}
     </Shell>

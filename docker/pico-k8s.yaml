@@ -57,16 +57,22 @@ spec:
             memory: "4Gi"
         # 首次启动需完成 Android 系统与应用初始化（最长等待约 8 分钟）
         startupProbe:
-          tcpSocket:
-            port: 6099
+          exec:
+            command:
+            - /system/bin/pico-bb/busybox
+            - sh
+            - /system/bin/pico-health.sh
           periodSeconds: 10
-          timeoutSeconds: 5
+          timeoutSeconds: 10
           failureThreshold: 48
         readinessProbe:
-          tcpSocket:
-            port: 6099
+          exec:
+            command:
+            - /system/bin/pico-bb/busybox
+            - sh
+            - /system/bin/pico-health.sh
           periodSeconds: 20
-          timeoutSeconds: 5
+          timeoutSeconds: 10
           failureThreshold: 3
         livenessProbe:
           exec:

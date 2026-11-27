@@ -7,10 +7,44 @@ restart_dir=/data/local/tmp
 restart_ready=/data/local/tmp/pico-qq-restart.ready
 restart_request=/data/user/0/com.tencent.qqlite/files/pico-onebot/restart-qq.request
 restart_last=0
+restart_mv="mv"
+restart_mv_has_T=0
+restart_mv_probed=0
+
+restart_probe_mv() {
+    if [ -x /system/bin/pico-bb/mv ]; then
+        restart_mv="/system/bin/pico-bb/mv"
+    else
+        restart_mv="mv"
+    fi
+    restart_mv_has_T=0
+    restart_mv_probed=1
+    _probe_base=""
+    for _cand in /data/pico "${TMPDIR:-/tmp}" "$restart_dir"; do
+        if [ -d "$_cand" ] && [ ! -L "$_cand" ] && [ -w "$_cand" ]; then
+            _probe_base="$_cand"
+            break
+        fi
+    done
+    [ -n "$_probe_base" ] || return 0
+    _probe_dir="${_probe_base}/.pico-mv-probe.$$"
+    if (umask 077 && mkdir "$_probe_dir" && mkdir "$_probe_dir/d") 2>/dev/null; then
+        if (set -C; : > "$_probe_dir/a") 2>/dev/null \
+            && "$restart_mv" -T -f "$_probe_dir/a" "$_probe_dir/b" >/dev/null 2>&1 \
+            && [ -f "$_probe_dir/b" ] && [ ! -e "$_probe_dir/a" ] \
+            && ! "$restart_mv" -T -f "$_probe_dir/b" "$_probe_dir/d" >/dev/null 2>&1 \
+            && [ -f "$_probe_dir/b" ] && [ ! -e "$_probe_dir/d/b" ]; then
+            restart_mv_has_T=1
+        fi
+        rm -f "$_probe_dir/a" "$_probe_dir/b" "$_probe_dir/d/b" 2>/dev/null || true
+        rmdir "$_probe_dir/d" "$_probe_dir" 2>/dev/null || true
+    fi
+}
 
 restart_init() {
     [ -f /system/etc/pico-container ] && [ ! -L /system/etc/pico-container ] || return 1
     [ "$(cat /system/etc/pico-container 2>/dev/null)" = "pico-container-v1" ] || return 1
+    restart_probe_mv
     for _p in "$restart_ready" "${restart_ready}.tmp" "$restart_request"; do
         if [ -L "$_p" ] || [ -f "$_p" ]; then
             rm -f "$_p" 2>/dev/null || true
@@ -59,9 +93,16 @@ restart_write_ready() {
         rm -f "$_tmp" 2>/dev/null || true
         return 1
     fi
-    # 优先使用 mv -T -f 拒绝目标为目录的替换竞态；若精简 toybox 不支持 -T，先再次确认非目录/符号链接后回退
-    if ! mv -T -f "$_tmp" "$restart_ready" 2>/dev/null; then
-        if [ -L "$restart_ready" ] || [ -d "$restart_ready" ] || ! mv -f "$_tmp" "$restart_ready" 2>/dev/null; then
+    [ "$restart_mv_probed" = "1" ] || restart_probe_mv
+    if [ "$restart_mv_has_T" = "1" ]; then
+        # 已在初始化时确认 mv 支持 -T：失败（例如目标已被替换为目录）时绝不回退到普通 mv -f
+        if ! "$restart_mv" -T -f "$_tmp" "$restart_ready" 2>/dev/null; then
+            log "WARN: 无法原子替换 $restart_ready（可能被替换为目录）"
+            rm -f "$_tmp" 2>/dev/null || true
+            return 1
+        fi
+    else
+        if [ -L "$restart_ready" ] || [ -d "$restart_ready" ] || ! "$restart_mv" -f "$_tmp" "$restart_ready" 2>/dev/null; then
             rm -f "$_tmp" 2>/dev/null || true
             return 1
         fi
@@ -95,6 +136,8 @@ restart_tick() {
     [ -f "$restart_request" ] || return 0
     requested_at="$(head -c 32 "$restart_request" 2>/dev/null)"
     rm -f "$restart_request" 2>/dev/null || true
+    # 读取请求后再采样当前秒数，避免 restart_write_ready 跨越整秒边界导致 restart_age = -1 误丢弃合法请求
+    restart_now="$(date +%s)"
     case "$requested_at" in
         ''|*[!0-9]*) log "忽略无效的 QQ 重启请求"; return 0 ;;
     esac

@@ -23,7 +23,7 @@ detect_webui_port() {
         ' "$_cfg" 2>/dev/null || true)"
     fi
     case "$_port" in
-        ''|*[!0-9]*) _port=6099 ;;
+        ''|*[!0-9]*|0*|??????*) _port=6099 ;;
     esac
     if [ "$_port" -lt 1 ] || [ "$_port" -gt 65535 ]; then
         _port=6099
@@ -33,7 +33,9 @@ detect_webui_port() {
 
 webui_port="$(detect_webui_port)"
 webui_port_hex="$(printf '%04X' "$webui_port")"
+# 同时允许损坏配置恢复模式绑定的本地回环 127.0.0.1:6099 (0100007F:17D3 及双栈 ::ffff:127.0.0.1:6099) 作为健康回退，
+# 防止自定义端口配置损坏进入恢复模式时触发容器重启循环。
 (cat /proc/net/tcp /proc/net/tcp6 2>/dev/null || true) \
-    | awk -v port_hex="$webui_port_hex" '$4 == "0A" && toupper($2) ~ (":" port_hex "$") { found = 1; exit 0 } END { exit(found ? 0 : 1) }' \
+    | awk -v port_hex="$webui_port_hex" '$4 == "0A" && (toupper($2) ~ (":" port_hex "$") || toupper($2) == "0100007F:17D3" || toupper($2) == "0000000000000000FFFF00000100007F:17D3") { found = 1; exit 0 } END { exit(found ? 0 : 1) }' \
     || exit 1
 exit 0
