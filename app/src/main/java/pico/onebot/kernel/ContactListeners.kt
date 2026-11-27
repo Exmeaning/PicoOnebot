@@ -57,7 +57,7 @@ object ContactListeners {
                 try {
                     val iface = IKernelGroupListener::class.java
                     val p = Proxy.newProxyInstance(
-                        iface.classLoader, arrayOf(iface), Handler(::dispatchGroup)
+                        iface.classLoader, arrayOf(iface), Handler(expectedEpoch, ::dispatchGroup)
                     ) as IKernelGroupListener
                     val id = svc.addKernelGroupListener(p)
                     if (id != 0L) {
@@ -98,7 +98,7 @@ object ContactListeners {
                 try {
                     val iface = IKernelBuddyListener::class.java
                     val p = Proxy.newProxyInstance(
-                        iface.classLoader, arrayOf(iface), Handler(::dispatchBuddy)
+                        iface.classLoader, arrayOf(iface), Handler(expectedEpoch, ::dispatchBuddy)
                     ) as IKernelBuddyListener
                     val id = svc.addKernelBuddyListener(p)
                     if (id != 0L) {
@@ -158,28 +158,28 @@ object ContactListeners {
         }
     }
 
-    private fun dispatchGroup(name: String, args: Array<out Any?>?) {
+    private fun dispatchGroup(expectedEpoch: Long, name: String, args: Array<out Any?>?) {
         when (name) {
             "onGroupListUpdate" ->
-                ContactStore.onGroupListUpdate(args?.getOrNull(0), args?.getOrNull(1) as? ArrayList<*>)
+                ContactStore.onGroupListUpdate(args?.getOrNull(0), args?.getOrNull(1) as? ArrayList<*>, expectedEpoch)
 
             "onGroupDetailInfoChange" ->
-                ContactStore.onGroupDetailInfo(args?.getOrNull(0))
+                ContactStore.onGroupDetailInfo(args?.getOrNull(0), expectedEpoch)
 
             // onMemberInfoChange(groupCode, DataSource, HashMap<uid, MemberInfo>)
             "onMemberInfoChange" ->
-                ContactStore.onMemberInfoChange(args?.getOrNull(2))
+                ContactStore.onMemberInfoChange(args?.getOrNull(2), expectedEpoch)
         }
     }
 
-    private fun dispatchBuddy(name: String, args: Array<out Any?>?) {
+    private fun dispatchBuddy(expectedEpoch: Long, name: String, args: Array<out Any?>?) {
         when (name) {
             "onBuddyListChange" ->
-                ContactStore.onBuddyListChange(args?.getOrNull(0) as? ArrayList<*>)
+                ContactStore.onBuddyListChange(args?.getOrNull(0) as? ArrayList<*>, expectedEpoch)
 
             // onNickUpdated(uid, nick) / onBuddyRemarkUpdated(uid, remark)
             "onNickUpdated", "onBuddyRemarkUpdated" ->
-                NickStore.feed(args?.getOrNull(0) as? String, args?.getOrNull(1) as? String)
+                NickStore.feed(args?.getOrNull(0) as? String, args?.getOrNull(1) as? String, expectedEpoch)
         }
     }
 
@@ -189,7 +189,10 @@ object ContactListeners {
         return out
     }
 
-    private class Handler(private val sink: (String, Array<out Any?>?) -> Unit) : InvocationHandler {
+    private class Handler(
+        private val expectedEpoch: Long,
+        private val sink: (Long, String, Array<out Any?>?) -> Unit
+    ) : InvocationHandler {
 
         override fun invoke(proxy: Any, method: Method, args: Array<out Any?>?): Any? {
             val name = method.name
@@ -198,9 +201,12 @@ object ContactListeners {
                 "hashCode" -> return System.identityHashCode(proxy)
                 "equals" -> return proxy === args?.getOrNull(0)
             }
+            if (!KernelGate.isEpochCurrent(expectedEpoch)) {
+                return defaultValue(method.returnType)
+            }
             callCounts.getOrPut(name) { AtomicLong() }.incrementAndGet()
             try {
-                sink(name, args)
+                sink(expectedEpoch, name, args)
             } catch (t: Throwable) {
                 PicoLog.w("contact listener $name failed: " + t.javaClass.simpleName + " " + t.message)
             }

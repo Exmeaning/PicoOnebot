@@ -114,7 +114,7 @@ object MediaBuilder {
             )
         }
         val md5 = MediaFiles.md5File(src)
-        val name = kernelName(src, md5)
+        val name = kernelName(src, md5, ext.removePrefix("."))
         val path = kernelPath(E_PTT, 0, md5, name, DL_ORIGIN, 0)
             ?: throw BuildError("内核没有返回语音缓存路径")
         if (!MediaFiles.copyTo(src, path)) throw BuildError("拷贝到内核缓存失败: " + path)
@@ -207,7 +207,10 @@ object MediaBuilder {
                 }
             }
         } finally {
-            generatedThumb?.delete()
+            generatedThumb?.let {
+                MediaFiles.unpinOutboxFile(it)
+                it.delete()
+            }
         }
 
         val e = MsgElement()
@@ -228,17 +231,22 @@ object MediaBuilder {
                 var out: File? = null
                 try {
                     val tmp = File.createTempFile("thumb-", ".jpg", MediaFiles.outboxDir)
+                    MediaFiles.pinOutboxFile(tmp)
                     out = tmp
                     val ok = FileOutputStream(tmp).use {
                         bmp.compress(Bitmap.CompressFormat.JPEG, 80, it)
                     }
                     if (!ok) {
+                        MediaFiles.unpinOutboxFile(tmp)
                         tmp.delete()
                         out = null
                     }
                     out
                 } catch (t: Throwable) {
-                    out?.delete()
+                    out?.let {
+                        MediaFiles.unpinOutboxFile(it)
+                        it.delete()
+                    }
                     throw t
                 } finally {
                     bmp.recycle()
@@ -278,6 +286,7 @@ object MediaBuilder {
     // ---------------- 公共 ----------------
 
     private val SAFE_EXT_BODY = Regex("^[a-z0-9]{1,5}$")
+    private val GENERIC_EXT_BODIES = setOf("tmp", "dat", "bin", "part", "bak", "cache", "file", "raw")
 
     private fun sanitizeFileName(raw: String, fallback: String): String {
         val cleaned = cleanBaseName(raw)
@@ -297,10 +306,22 @@ object MediaBuilder {
         return base
     }
 
-    private fun kernelName(src: File, md5: String): String {
+    private fun kernelName(src: File, md5: String, preferredExt: String = ""): String {
+        val pref = preferredExt.lowercase(Locale.ROOT)
+        if (SAFE_EXT_BODY.matches(pref) && pref !in GENERIC_EXT_BODIES) {
+            return "$md5.$pref"
+        }
         val rawExt = src.name.substringAfterLast('.', "").lowercase(Locale.ROOT)
-        val ext = if (SAFE_EXT_BODY.matches(rawExt)) rawExt
-        else MediaFiles.sniffExt(MediaFiles.head(src)).removePrefix(".")
+        val validRaw = SAFE_EXT_BODY.matches(rawExt) && rawExt !in GENERIC_EXT_BODIES
+        val sniffed = MediaFiles.sniffExt(MediaFiles.head(src)).removePrefix(".")
+        val ext = when {
+            validRaw && sniffed == "mp4" && rawExt == "m4a" -> "m4a"
+            validRaw && sniffed == "png" && rawExt == "apng" -> "apng"
+            validRaw && sniffed == "jpg" && rawExt == "jpeg" -> "jpeg"
+            sniffed.isNotEmpty() -> sniffed
+            validRaw -> rawExt
+            else -> ""
+        }
         return if (ext.isEmpty()) md5 else md5 + "." + ext
     }
 

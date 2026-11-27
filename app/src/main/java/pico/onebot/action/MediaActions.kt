@@ -4,6 +4,7 @@ import android.util.Base64
 import org.json.JSONObject
 import pico.onebot.core.Config
 import pico.onebot.core.PicoLog
+import pico.onebot.kernel.KernelGate
 import pico.onebot.media.MediaDownloader
 import pico.onebot.media.MediaFiles
 import pico.onebot.media.MediaRefStore
@@ -40,11 +41,19 @@ object MediaActions {
             .firstOrNull { it.isNotEmpty() }
             ?: return Ob.failed(Ob.RC_BAD_PARAM, "需要 file / file_id / element_id")
 
+        val epoch = KernelGate.currentEpoch()
+        if (!KernelGate.isEpochCurrent(epoch)) {
+            return Ob.notReady("get_$kind")
+        }
+
         val ref = MediaRefStore.get(key)
             ?: return Ob.failed(
                 Ob.RC_BAD_PARAM,
                 "该媒体不在本实例的记录里(只有本次运行期间收到过的才查得到): $key"
             )
+        if (!KernelGate.isEpochCurrent(epoch)) {
+            return Ob.failed(Ob.RC_KERNEL_ERROR, "会话已切换，媒体请求已取消")
+        }
 
         val thumb = p.optBoolean("thumb", false)
         var kernelErr = ""
@@ -57,6 +66,10 @@ object MediaActions {
             null
         }
 
+        if (!KernelGate.isEpochCurrent(epoch)) {
+            return Ob.failed(Ob.RC_KERNEL_ERROR, "会话已切换，媒体请求已取消")
+        }
+
         // 合并转发内部的媒体走不通内核下载(内层 msgId 不是会话里的真实消息,永不回调),
         // 但消息里带的那条 rkey 直链是能下到原文件的 —— 实测 md5 与原件一致。
         if (f == null && ref.url.isNotEmpty()) {
@@ -67,6 +80,9 @@ object MediaActions {
                 null
             }
             if (f != null) PicoLog.i("get_$kind 走直链回退: " + ref.fileName)
+        }
+        if (!KernelGate.isEpochCurrent(epoch)) {
+            return Ob.failed(Ob.RC_KERNEL_ERROR, "会话已切换，媒体请求已取消")
         }
         if (f == null) {
             return Ob.failed(
@@ -101,6 +117,9 @@ object MediaActions {
                     PicoLog.w("base64 encode failed for " + f.name, t)
                 }
             }
+        }
+        if (!KernelGate.isEpochCurrent(epoch)) {
+            return Ob.failed(Ob.RC_KERNEL_ERROR, "会话已切换，媒体请求已取消")
         }
         PicoLog.i("get_$kind -> " + f.absolutePath + " " + fileLen + "B")
         return Ob.ok(data)

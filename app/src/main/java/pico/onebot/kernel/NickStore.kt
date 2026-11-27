@@ -58,13 +58,15 @@ object NickStore {
         val found = lookup(uid)
         if (found.isEmpty()) {
             misses.incrementAndGet()
-            if (KernelGate.currentEpoch() == epoch) {
-                synchronized(cache) { negCache[uid] = System.nanoTime() }
+            synchronized(cache) {
+                if (KernelGate.isEpochCurrent(epoch)) {
+                    negCache[uid] = System.nanoTime()
+                }
             }
             return ""
         }
-        if (KernelGate.currentEpoch() == epoch) {
-            synchronized(cache) {
+        synchronized(cache) {
+            if (KernelGate.isEpochCurrent(epoch)) {
                 negCache.remove(uid)
                 cache[uid] = found
             }
@@ -75,9 +77,10 @@ object NickStore {
     /**
      * 权威来源写入(好友列表、备注/昵称变更回调、群成员信息):**覆盖旧值**。
      */
-    fun feed(uid: String?, name: String?) {
+    fun feed(uid: String?, name: String?, expectedEpoch: Long? = null) {
         if (uid.isNullOrEmpty() || name.isNullOrEmpty()) return
         synchronized(cache) {
+            if (expectedEpoch != null && !KernelGate.isEpochCurrent(expectedEpoch)) return
             negCache.remove(uid)
             cache[uid] = name
         }
@@ -86,9 +89,10 @@ object NickStore {
     /**
      * 弱来源写入(逐条消息里的 sendMemberName 等):只在没值时补齐。
      */
-    fun feedIfAbsent(uid: String?, name: String?) {
+    fun feedIfAbsent(uid: String?, name: String?, expectedEpoch: Long? = null) {
         if (uid.isNullOrEmpty() || name.isNullOrEmpty()) return
         synchronized(cache) {
+            if (expectedEpoch != null && !KernelGate.isEpochCurrent(expectedEpoch)) return
             negCache.remove(uid)
             if (cache.containsKey(uid)) return
             cache[uid] = name

@@ -36,6 +36,12 @@ object MediaDownloader {
     @Volatile
     private var thumbSizeField: java.lang.reflect.Field? = null
 
+    @Volatile
+    private var fileDownTypeFieldChecked = false
+
+    @Volatile
+    private var fileDownTypeField: java.lang.reflect.Field? = null
+
     private fun key(msgId: Long, elementId: Long, thumb: Boolean) =
         msgId.toString() + ":" + elementId + ":" + thumb
 
@@ -96,6 +102,10 @@ object MediaDownloader {
                 try {
                     svc.downloadRichMedia(req)
                 } catch (t: Throwable) {
+                    synchronized(waitingLock) {
+                        waiting.remove(k, promise)
+                    }
+                    failed.incrementAndGet()
                     promise.resolve("")
                     throw DownloadError("downloadRichMedia 抛出: " + t.javaClass.simpleName + " " + t.message)
                 }
@@ -147,11 +157,16 @@ object MediaDownloader {
         if (path.isNullOrEmpty()) return
 
         val inferredThumb = inferThumb(i, path)
-        val primaryKey = key(i.msgId, i.msgElementId, inferredThumb ?: false)
-        val secondaryKey = key(i.msgId, i.msgElementId, !(inferredThumb ?: false))
         val target: Promise<String>? = synchronized(waitingLock) {
-            val found = waiting[primaryKey]?.let { primaryKey to it }
-                ?: waiting[secondaryKey]?.let { secondaryKey to it }
+            val found = if (inferredThumb != null) {
+                val exactKey = key(i.msgId, i.msgElementId, inferredThumb)
+                waiting[exactKey]?.let { exactKey to it }
+            } else {
+                val originKey = key(i.msgId, i.msgElementId, false)
+                val thumbKey = key(i.msgId, i.msgElementId, true)
+                waiting[originKey]?.let { originKey to it }
+                    ?: waiting[thumbKey]?.let { thumbKey to it }
+            }
             if (found != null) {
                 waiting.remove(found.first, found.second)
                 found.second
@@ -179,30 +194,46 @@ object MediaDownloader {
         }
     }
 
+    private fun lookupIntField(cls: Class<*>, name: String): java.lang.reflect.Field? = try {
+        cls.getField(name)
+    } catch (_: Throwable) {
+        try {
+            cls.getDeclaredField(name).apply { isAccessible = true }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun readIntField(target: Any, field: java.lang.reflect.Field?): Int {
+        if (field == null) return -1
+        return try {
+            field.getInt(target)
+        } catch (_: Throwable) {
+            -1
+        }
+    }
+
     private fun inferThumb(i: Any, path: String): Boolean? {
+        if (!fileDownTypeFieldChecked) {
+            fileDownTypeField = lookupIntField(i.javaClass, "fileDownType")
+            fileDownTypeFieldChecked = true
+        }
         if (!thumbSizeFieldChecked) {
-            thumbSizeField = try {
-                i.javaClass.getField("thumbSize")
-            } catch (_: Throwable) {
-                try {
-                    i.javaClass.getDeclaredField("thumbSize").apply { isAccessible = true }
-                } catch (_: Throwable) {
-                    null
-                }
-            }
+            thumbSizeField = lookupIntField(i.javaClass, "thumbSize")
             thumbSizeFieldChecked = true
         }
-        val field = thumbSizeField
-        if (field != null) {
-            val v = try {
-                field.getInt(i)
-            } catch (_: Throwable) {
-                -1
-            }
-            if (v > 0) return true
-            if (v == 0) return false
-        }
-        if (path.contains("/Thumb/", ignoreCase = true) || path.contains("_750")) return true
+        val downType = readIntField(i, fileDownTypeField)
+        val thumbSize = readIntField(i, thumbSizeField)
+
+        // fileDownType == 2 明确为缩略图（含 thumbSize == 0 的视频缩略图）
+        if (downType == 2) return true
+        if (thumbSize > 0) return true
+        // 优先于 thumbSize == 0 检查 /Thumb/ 路径，防止视频缩略图落入死代码
+        if (path.contains("/Thumb/", ignoreCase = true)) return true
+        // fileDownType == 1 且未命中缩略图信号，明确为原件
+        if (downType == 1) return false
+        if (path.contains("_750")) return true
+        if (thumbSize == 0) return false
         return null
     }
 

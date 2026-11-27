@@ -7,6 +7,7 @@ import android.content.pm.SigningInfo
 import android.os.Build
 import android.util.Base64
 import android.util.Log
+import androidx.annotation.RequiresApi
 import com.tencent.mobileqq.dt.app.Dtc
 import com.tencent.mobileqq.msf.core.o
 import com.tencent.qimei.sdk.QimeiSDK
@@ -84,8 +85,8 @@ object QimeiCompat {
             }
             val interfaceClass = Class.forName("android.content.pm.IPackageManager")
             val tencentSignature = Signature(Base64.decode(TENCENT_CERT, Base64.DEFAULT))
-            val spoofedSigningInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                buildSigningInfo(tencentSignature)
+            val spoofedSigningInfo: Any? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                Api28SigningInfo.buildSigningInfo(tencentSignature)
             } else {
                 null
             }
@@ -100,21 +101,19 @@ object QimeiCompat {
                     @Suppress("DEPRECATION")
                     result.signatures = arrayOf(tencentSignature)
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                        if (spoofedSigningInfo != null) {
-                            result.signingInfo = spoofedSigningInfo
-                        } else {
-                            result.signingInfo?.let { patchSigningInfoInPlace(it, tencentSignature) }
-                        }
+                        Api28SigningInfo.applyToPackageInfo(result, spoofedSigningInfo, tencentSignature)
                     }
                 }
                 result
             }
 
             pmField.set(packageManager, proxy)
-            runCatching {
+            try {
                 val activityThread = Class.forName("android.app.ActivityThread")
                 val staticPmField = findField(activityThread, "sPackageManager")
                 if (staticPmField.get(null) === original) staticPmField.set(null, proxy)
+            } catch (t: Throwable) {
+                Log.w("PicoOB", "ActivityThread.sPackageManager patch failed: ${t.javaClass.simpleName}: ${t.message}")
             }
             Log.i("PicoOB", "Package signature compatibility installed (signingInfo=${spoofedSigningInfo != null})")
         } catch (t: Throwable) {
@@ -123,65 +122,98 @@ object QimeiCompat {
         }
     }
 
-    private fun buildSigningInfo(sig: Signature): SigningInfo? {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return null
-        val detailsClassNames = arrayOf(
-            "android.content.pm.SigningDetails",
-            "android.content.pm.PackageParser\$SigningDetails"
-        )
-        val sigArray = arrayOf(sig)
-        for (className in detailsClassNames) {
-            try {
-                val detailsCls = Class.forName(className)
-                val details = constructSigningDetails(detailsCls, sigArray) ?: continue
-                val ctor = SigningInfo::class.java.getDeclaredConstructor(detailsCls).apply { isAccessible = true }
-                val info = ctor.newInstance(details)
-                if (info.apkContentsSigners?.firstOrNull() == sig) {
-                    return info
-                }
-            } catch (_: Throwable) {
-            }
-        }
-        return null
-    }
+    @RequiresApi(Build.VERSION_CODES.P)
+    private object Api28SigningInfo {
+        private val inPlaceFailureLogged = AtomicBoolean(false)
 
-    private fun constructSigningDetails(detailsCls: Class<*>, sigArray: Array<Signature>): Any? {
-        val sigArrayClass = Array<Signature>::class.java
-        try {
-            val ctor = detailsCls.getDeclaredConstructor(sigArrayClass, Int::class.javaPrimitiveType)
-                .apply { isAccessible = true }
-            return ctor.newInstance(sigArray, 2)
-        } catch (_: Throwable) {
-        }
-        try {
-            val ctor = detailsCls.getDeclaredConstructor(
-                sigArrayClass,
-                Int::class.javaPrimitiveType,
-                sigArrayClass
-            ).apply { isAccessible = true }
-            return ctor.newInstance(sigArray, 2, null)
-        } catch (_: Throwable) {
-        }
-        return null
-    }
-
-    private fun patchSigningInfoInPlace(info: SigningInfo, sig: Signature) {
-        runCatching {
-            val detailsField = findField(info.javaClass, "mSigningDetails")
-            val details = detailsField.get(info) ?: return@runCatching
+        fun buildSigningInfo(sig: Signature): SigningInfo? {
+            val detailsClassNames = arrayOf(
+                "android.content.pm.SigningDetails",
+                "android.content.pm.PackageParser\$SigningDetails"
+            )
             val sigArray = arrayOf(sig)
-            for (name in arrayOf("mSignatures", "signatures")) {
+            val errors = ArrayList<String>(detailsClassNames.size)
+            for (className in detailsClassNames) {
                 try {
-                    findField(details.javaClass, name).set(details, sigArray)
-                    break
-                } catch (_: NoSuchFieldException) {
+                    val detailsCls = Class.forName(className)
+                    val details = constructSigningDetails(detailsCls, sigArray, errors) ?: continue
+                    val ctor = SigningInfo::class.java.getDeclaredConstructor(detailsCls).apply { isAccessible = true }
+                    val info = ctor.newInstance(details)
+                    if (info.apkContentsSigners?.firstOrNull() == sig) {
+                        return info
+                    }
+                    errors.add("$className: apkContentsSigners mismatch")
+                } catch (t: Throwable) {
+                    errors.add("$className: ${t.javaClass.simpleName}: ${t.message}")
                 }
             }
-            for (name in arrayOf("mPastSigningCertificates", "pastSigningCertificates")) {
-                try {
-                    findField(details.javaClass, name).set(details, null)
-                    break
-                } catch (_: NoSuchFieldException) {
+            if (errors.isNotEmpty()) {
+                Log.w("PicoOB", "SigningInfo synthesis failed (Hidden API restricted?): " + errors.joinToString("; "))
+            }
+            return null
+        }
+
+        fun applyToPackageInfo(info: PackageInfo, spoofed: Any?, sig: Signature) {
+            if (spoofed is SigningInfo) {
+                info.signingInfo = spoofed
+            } else {
+                info.signingInfo?.let { patchSigningInfoInPlace(it, sig) }
+            }
+        }
+
+        private fun constructSigningDetails(
+            detailsCls: Class<*>,
+            sigArray: Array<Signature>,
+            errors: MutableList<String>
+        ): Any? {
+            val sigArrayClass = Array<Signature>::class.java
+            try {
+                val ctor = detailsCls.getDeclaredConstructor(sigArrayClass, Int::class.javaPrimitiveType)
+                    .apply { isAccessible = true }
+                return ctor.newInstance(sigArray, 2)
+            } catch (t: Throwable) {
+                errors.add("${detailsCls.simpleName}(sig[],int): ${t.javaClass.simpleName}: ${t.message}")
+            }
+            try {
+                val ctor = detailsCls.getDeclaredConstructor(
+                    sigArrayClass,
+                    Int::class.javaPrimitiveType,
+                    sigArrayClass
+                ).apply { isAccessible = true }
+                return ctor.newInstance(sigArray, 2, null)
+            } catch (t: Throwable) {
+                errors.add("${detailsCls.simpleName}(sig[],int,sig[]): ${t.javaClass.simpleName}: ${t.message}")
+            }
+            return null
+        }
+
+        private fun patchSigningInfoInPlace(info: SigningInfo, sig: Signature) {
+            try {
+                val detailsField = findField(info.javaClass, "mSigningDetails")
+                val details = detailsField.get(info) ?: return
+                val sigArray = arrayOf(sig)
+                var patchedSig = false
+                for (name in arrayOf("mSignatures", "signatures")) {
+                    try {
+                        findField(details.javaClass, name).set(details, sigArray)
+                        patchedSig = true
+                        break
+                    } catch (_: NoSuchFieldException) {
+                    }
+                }
+                for (name in arrayOf("mPastSigningCertificates", "pastSigningCertificates")) {
+                    try {
+                        findField(details.javaClass, name).set(details, null)
+                        break
+                    } catch (_: NoSuchFieldException) {
+                    }
+                }
+                if (!patchedSig && inPlaceFailureLogged.compareAndSet(false, true)) {
+                    Log.w("PicoOB", "SigningInfo in-place patch: signature field not found on ${details.javaClass.name}")
+                }
+            } catch (t: Throwable) {
+                if (inPlaceFailureLogged.compareAndSet(false, true)) {
+                    Log.w("PicoOB", "SigningInfo in-place patch failed (Hidden API restricted?)", t)
                 }
             }
         }

@@ -35,6 +35,7 @@ object UinUidStore {
             return true
         }
     }
+    private val negLock = Any()
     private val negUidMiss = ConcurrentHashMap<String, Long>()
     private val negUinMiss = ConcurrentHashMap<Long, Long>()
 
@@ -93,6 +94,15 @@ object UinUidStore {
         }
     }
 
+    /** 切号/会话失效时清空 30s 负缓存，避免旧账号的查无结果阻断新账号回查。 */
+    fun reset() {
+        synchronized(negLock) {
+            negUidMiss.clear()
+            negUinMiss.clear()
+        }
+        PicoLog.d("uid/uin negative cache reset")
+    }
+
     /** uid → uin,缓存未命中时问内核。 */
     fun uin(uid: String?): Long {
         if (uid.isNullOrEmpty()) return 0
@@ -109,6 +119,7 @@ object UinUidStore {
             negUidMiss.remove(uid, failedAtNs)
         }
         misses.incrementAndGet()
+        val epoch = KernelGate.currentEpoch()
         val svc = KernelGate.profileService() ?: return 0
         return try {
             val map = svc.getUinByUid("", arrayListOf(uid))
@@ -116,11 +127,11 @@ object UinUidStore {
             if (uin > 0) {
                 feed(uid, uin)
             } else {
-                recordUidMiss(uid, System.nanoTime())
+                recordUidMiss(uid, System.nanoTime(), epoch)
             }
             uin
         } catch (t: Throwable) {
-            recordUidMiss(uid, System.nanoTime())
+            recordUidMiss(uid, System.nanoTime(), epoch)
             PicoLog.d("getUinByUid failed: " + t.message)
             0
         }
@@ -147,6 +158,7 @@ object UinUidStore {
             negUinMiss.remove(uin, failedAtNs)
         }
         misses.incrementAndGet()
+        val epoch = KernelGate.currentEpoch()
         val svc = KernelGate.profileService() ?: return ""
         return try {
             val map = svc.getUidByUin("", arrayListOf(uin))
@@ -154,24 +166,30 @@ object UinUidStore {
             if (uid.isNotEmpty()) {
                 feed(uid, uin)
             } else {
-                recordUinMiss(uin, System.nanoTime())
+                recordUinMiss(uin, System.nanoTime(), epoch)
             }
             uid
         } catch (t: Throwable) {
-            recordUinMiss(uin, System.nanoTime())
+            recordUinMiss(uin, System.nanoTime(), epoch)
             PicoLog.d("getUidByUin failed: " + t.message)
             ""
         }
     }
 
-    private fun recordUidMiss(uid: String, nowNs: Long) {
-        if (negUidMiss.size >= NEGATIVE_CAP) negUidMiss.clear()
-        negUidMiss[uid] = nowNs
+    private fun recordUidMiss(uid: String, nowNs: Long, epoch: Long) {
+        synchronized(negLock) {
+            if (!KernelGate.isEpochCurrent(epoch)) return
+            if (negUidMiss.size >= NEGATIVE_CAP) negUidMiss.clear()
+            negUidMiss[uid] = nowNs
+        }
     }
 
-    private fun recordUinMiss(uin: Long, nowNs: Long) {
-        if (negUinMiss.size >= NEGATIVE_CAP) negUinMiss.clear()
-        negUinMiss[uin] = nowNs
+    private fun recordUinMiss(uin: Long, nowNs: Long, epoch: Long) {
+        synchronized(negLock) {
+            if (!KernelGate.isEpochCurrent(epoch)) return
+            if (negUinMiss.size >= NEGATIVE_CAP) negUinMiss.clear()
+            negUinMiss[uin] = nowNs
+        }
     }
 
     private fun saveAsync() {

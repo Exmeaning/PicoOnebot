@@ -36,6 +36,9 @@ object ContactStore {
     /** 监听器推回来的完整好友信息(带 uin/昵称),比纯 uid 列表好用,作为补充来源。 */
     private val buddyRich = ConcurrentHashMap<String, Friend>()
 
+    /** 保护名册写入与 reset 的原子互斥，避免旧会话延迟回调在 reset 之后污染新账号缓存。 */
+    private val mutationLock = Any()
+
     /** 等待队列统一受 waiterLock 保护,杜绝登记/排空/回收竞态与空桶泄漏。 */
     private val waiterLock = Any()
     private var groupWaiters = ArrayList<Promise<Boolean>>()
@@ -53,10 +56,12 @@ object ContactStore {
      * 连"重新向内核要一次"都不做。
      */
     fun reset() {
-        groups.clear()
-        groupDetails.clear()
-        buddyRich.clear()
-        groupListLoaded = false
+        synchronized(mutationLock) {
+            groups.clear()
+            groupDetails.clear()
+            buddyRich.clear()
+            groupListLoaded = false
+        }
         val allGroup: List<Promise<Boolean>>
         val allDetail: List<Promise<Boolean>>
         synchronized(waiterLock) {
@@ -72,33 +77,40 @@ object ContactStore {
         PicoLog.i("contact store reset")
     }
 
-    fun onGroupListUpdate(updateType: Any?, list: ArrayList<*>?) {
+    fun onGroupListUpdate(updateType: Any?, list: ArrayList<*>?, expectedEpoch: Long? = null) {
         if (list == null) return
         val remove = updateType?.toString().equals("REMOVE", true)
         var n = 0
-        for (g in list) {
-            val info = g as? GroupSimpleInfo ?: continue
-            n++
-            if (remove) groups.remove(info.groupCode) else groups[info.groupCode] = info
+        synchronized(mutationLock) {
+            if (expectedEpoch != null && !KernelGate.isEpochCurrent(expectedEpoch)) return
+            for (g in list) {
+                val info = g as? GroupSimpleInfo ?: continue
+                n++
+                if (remove) groups.remove(info.groupCode) else groups[info.groupCode] = info
+            }
+            groupListLoaded = true
         }
-        groupListLoaded = true
         PicoLog.d("group list update type=" + updateType + " n=" + n + " total=" + groups.size)
         drainGroupWaiters(true)
     }
 
-    fun onGroupDetailInfo(d: Any?) {
+    fun onGroupDetailInfo(d: Any?, expectedEpoch: Long? = null) {
         val info = d as? GroupDetailInfo ?: return
-        groupDetails[info.groupCode] = info
+        synchronized(mutationLock) {
+            if (expectedEpoch != null && !KernelGate.isEpochCurrent(expectedEpoch)) return
+            groupDetails[info.groupCode] = info
+        }
         drainDetailWaiters(info.groupCode, true)
     }
 
     /** 群成员信息变更的副产物:顺手喂 uid↔uin 和昵称,省掉后面一堆回查。 */
-    fun onMemberInfoChange(map: Any?) {
+    fun onMemberInfoChange(map: Any?, expectedEpoch: Long? = null) {
         val m = map as? HashMap<*, *> ?: return
         for (v in m.values) {
+            if (expectedEpoch != null && !KernelGate.isEpochCurrent(expectedEpoch)) return
             val mi = v as? MemberInfo ?: continue
             UinUidStore.feed(mi.uid, mi.uin)
-            NickStore.feedIfAbsent(mi.uid, if (!mi.cardName.isNullOrEmpty()) mi.cardName else mi.nick)
+            NickStore.feedIfAbsent(mi.uid, if (!mi.cardName.isNullOrEmpty()) mi.cardName else mi.nick, expectedEpoch)
         }
     }
 
@@ -204,19 +216,22 @@ object ContactStore {
 
     class Friend(val uid: String, val uin: Long, val nick: String, val remark: String)
 
-    fun onBuddyListChange(list: ArrayList<*>?) {
+    fun onBuddyListChange(list: ArrayList<*>?, expectedEpoch: Long? = null) {
         if (list == null) return
-        for (c in list) {
-            val cat = c as? BuddyCategory ?: continue
-            for (u in cat.buddyList ?: ArrayList()) {
-                val uid = u.uid ?: continue
-                val core = u.coreInfo
-                val nick = core?.nick ?: ""
-                val remark = core?.remark ?: ""
-                val uin = if (u.uin > 0) u.uin else (core?.uin ?: 0L)
-                buddyRich[uid] = Friend(uid, uin, nick, remark)
-                UinUidStore.feed(uid, uin)
-                NickStore.feed(uid, if (remark.isNotEmpty()) remark else nick)
+        synchronized(mutationLock) {
+            if (expectedEpoch != null && !KernelGate.isEpochCurrent(expectedEpoch)) return
+            for (c in list) {
+                val cat = c as? BuddyCategory ?: continue
+                for (u in cat.buddyList ?: ArrayList()) {
+                    val uid = u.uid ?: continue
+                    val core = u.coreInfo
+                    val nick = core?.nick ?: ""
+                    val remark = core?.remark ?: ""
+                    val uin = if (u.uin > 0) u.uin else (core?.uin ?: 0L)
+                    buddyRich[uid] = Friend(uid, uin, nick, remark)
+                    UinUidStore.feed(uid, uin)
+                    NickStore.feed(uid, if (remark.isNotEmpty()) remark else nick, expectedEpoch)
+                }
             }
         }
         PicoLog.d("buddy list change, rich=" + buddyRich.size)
@@ -227,36 +242,43 @@ object ContactStore {
      * 再用同步批量接口补昵称/备注/QQ 号 —— 这三个都是读本地库,不走网络。
      */
     fun friends(refresh: Boolean): List<Friend> {
-        val buddy = KernelGate.buddyService() ?: return buddyRich.values.sortedBy { it.uin }
+        val epoch = KernelGate.currentEpoch()
+        val buddy = KernelGate.buddyService()
+            ?: return if (KernelGate.isEpochCurrent(epoch)) buddyRich.values.sortedBy { it.uin } else emptyList()
         var uids = if (refresh) emptyList() else uidsFromCache(buddy)
         if (uids.isEmpty()) uids = uidsFromV2(buddy, refresh)
         if (uids.isEmpty()) uids = uidsFromCache(buddy)
+        if (!KernelGate.isEpochCurrent(epoch)) return emptyList()
         if (uids.isEmpty()) return buddyRich.values.sortedBy { it.uin }
 
         val out = ArrayList<Friend>(uids.size)
         // 分片:uid 清单可能上千,单次 JNI 调用塞太多没有好处
         for (chunk in uids.chunked(200)) {
+            if (!KernelGate.isEpochCurrent(epoch)) return emptyList()
             val list = ArrayList(chunk)
             val nicks = safeMap { buddy.getBuddyNick(list) }
             val remarks = safeMap { buddy.getBuddyRemark(list) }
             val uins = try {
-                KernelGate.profileService()?.getUinByUid("pico", list) ?: HashMap()
+                if (!KernelGate.isEpochCurrent(epoch)) HashMap()
+                else KernelGate.profileService()?.getUinByUid("pico", list) ?: HashMap()
             } catch (t: Throwable) {
                 HashMap<String, Long>()
             }
+            if (!KernelGate.isEpochCurrent(epoch)) return emptyList()
             for (uid in chunk) {
                 val rich = buddyRich[uid]
                 val nick = nicks[uid]?.takeIf { it.isNotEmpty() } ?: rich?.nick ?: ""
                 val remark = remarks[uid]?.takeIf { it.isNotEmpty() } ?: rich?.remark ?: ""
                 val uin = (uins[uid] ?: 0L).takeIf { it > 0 } ?: rich?.uin ?: UinUidStore.uin(uid)
+                if (!KernelGate.isEpochCurrent(epoch)) return emptyList()
                 if (uin > 0) UinUidStore.feed(uid, uin)
                 if (nick.isNotEmpty() || remark.isNotEmpty()) {
-                    NickStore.feed(uid, if (remark.isNotEmpty()) remark else nick)
+                    NickStore.feed(uid, if (remark.isNotEmpty()) remark else nick, epoch)
                 }
                 out.add(Friend(uid, uin, nick, remark))
             }
         }
-        return out.sortedBy { it.uin }
+        return if (KernelGate.isEpochCurrent(epoch)) out.sortedBy { it.uin } else emptyList()
     }
 
     /**

@@ -4,13 +4,15 @@ import org.json.JSONArray
 import org.json.JSONObject
 import pico.onebot.core.Config
 import pico.onebot.core.PicoLog
+import pico.onebot.kernel.KernelGate
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.Executors
 
 /**
  * OneBot 的 `message_id` 是 int32,NT 的消息标识是 `msgId`(u64)+ `msgSeq` + 会话。
- * 这里维护双向映射并落盘,重启后 `delete_msg` / `get_msg` / reply 仍能回溯。
+ * 这里维护双向映射并按登录账号 (`selfUin`) 分文件落盘,重启后 `delete_msg` / `get_msg` / reply
+ * 仍能回溯,同时避免多账号切换时串号污染。
  */
 object MsgIdStore {
 
@@ -33,7 +35,16 @@ object MsgIdStore {
             .put("time", time)
     }
 
+    private class SaveSnap(
+        val targetFile: File,
+        val rev: Long,
+        val curCounter: Int,
+        val entries: List<Entry>
+    )
+
     private const val CAP = 10000
+    private const val LEGACY_FILE_NAME = "msgid.json"
+    private const val LEGACY_MIGRATED_NAME = "msgid.json.migrated"
 
     private val byMessageId = LinkedHashMap<Int, Entry>(256, 0.75f, false)
     private val byMsgId = HashMap<Long, Entry>()
@@ -47,47 +58,155 @@ object MsgIdStore {
     private fun seqKey(chatType: Int, peerUid: String, msgSeq: Long): String =
         chatType.toString() + ":" + peerUid + ":" + msgSeq
 
+    private var activeUin = 0L
     private var counter = 1
     private var dirty = 0
     private var revision = 0L
-    private var lastWrittenRev = -1L
     private var saveRunning = false
     private var resaveNeeded = false
     @Volatile
     private var file: File? = null
     private val saveLock = Any()
+    private val lastWrittenRevByPath = HashMap<String, Long>()
     private val ioExecutor = Executors.newSingleThreadExecutor { r ->
         Thread(r, "pico-msgid-io").apply { isDaemon = true }
     }
 
-    @Synchronized
+    private fun accountFile(uin: Long): File = File(Config.dataDir, "msgid-$uin.json")
+    private fun legacyFile(): File = File(Config.dataDir, LEGACY_FILE_NAME)
+
     fun load() {
-        val f = File(Config.dataDir, "msgid.json")
-        file = f
-        if (!f.isFile) return
-        try {
+        val uin = KernelGate.selfUin()
+        if (uin > 0L) {
+            switchAccount(uin)
+        }
+    }
+
+    /**
+     * 切换或绑定当前登录账号的消息 ID 持久化命名空间 (`msgid-<uin>.json`)。
+     * 若新账号文件尚未存在但存在旧版 `msgid.json`，执行一次性兼容加载并迁移，
+     * 避免后续切换至其他账号时重复导入旧账号记录。
+     */
+    fun switchAccount(uin: Long, expectedEpoch: Long? = null) {
+        if (uin <= 0L) return
+        if (expectedEpoch != null && !KernelGate.isEpochCurrent(expectedEpoch)) return
+        val prevSnap: SaveSnap? = synchronized(this) {
+            if (expectedEpoch != null && !KernelGate.isEpochCurrent(expectedEpoch)) return
+            if (activeUin == uin && file != null) return
+            val snap = captureDirtySnapLocked()
+            clearMemoryLocked()
+            snap
+        }
+        if (prevSnap != null) {
+            writeSnapshot(prevSnap)
+        }
+        if (expectedEpoch != null && !KernelGate.isEpochCurrent(expectedEpoch)) return
+
+        val acctFile = accountFile(uin)
+        val legacy = legacyFile()
+        val sourceFile = when {
+            acctFile.isFile -> acctFile
+            legacy.isFile -> legacy
+            else -> null
+        }
+        val fromLegacy = (sourceFile != null && sourceFile == legacy)
+        val parsed = sourceFile?.let { readEntriesFromFile(it) }
+
+        val migratedSnap: SaveSnap? = synchronized(this) {
+            if (expectedEpoch != null && !KernelGate.isEpochCurrent(expectedEpoch)) return
+            if (activeUin == uin && file != null) return
+            clearMemoryLocked()
+            activeUin = uin
+            file = acctFile
+            if (parsed != null) {
+                counter = parsed.first
+                for (e in parsed.second) put(e)
+            }
+            revision++
+            if (fromLegacy && byMessageId.isNotEmpty()) {
+                SaveSnap(acctFile, revision, counter, ArrayList(byMessageId.values))
+            } else {
+                null
+            }
+        }
+
+        if (sourceFile != null) {
+            PicoLog.i(
+                "msgid store loaded for uin=$uin: ${size()} entries" +
+                    (if (fromLegacy) " (migrated from $LEGACY_FILE_NAME)" else "")
+            )
+        }
+
+        if (fromLegacy) {
+            val persisted = if (migratedSnap != null) writeSnapshot(migratedSnap) else true
+            if (persisted) {
+                val backup = File(Config.dataDir, LEGACY_MIGRATED_NAME)
+                if (!legacy.renameTo(backup)) {
+                    PicoLog.w("msgid legacy file rename failed: " + legacy.absolutePath)
+                }
+            }
+        }
+    }
+
+    /** 切号/会话丢失时先将当前账号脏数据落盘，再清空内存映射，防止跨账号串号查询。 */
+    fun onSessionLost() {
+        val snap: SaveSnap? = synchronized(this) {
+            val pending = captureDirtySnapLocked()
+            clearMemoryLocked()
+            activeUin = 0L
+            file = null
+            pending
+        }
+        if (snap != null) {
+            writeSnapshot(snap)
+        }
+    }
+
+    private fun clearMemoryLocked() {
+        byMessageId.clear()
+        byMsgId.clear()
+        bySeq.clear()
+        counter = 1
+        dirty = 0
+        resaveNeeded = false
+    }
+
+    private fun captureDirtySnapLocked(): SaveSnap? {
+        val target = file ?: return null
+        if (dirty <= 0 && !resaveNeeded) return null
+        resaveNeeded = false
+        dirty = 0
+        return SaveSnap(target, revision, counter, ArrayList(byMessageId.values))
+    }
+
+    private fun readEntriesFromFile(f: File): Pair<Int, List<Entry>>? {
+        if (!f.isFile) return null
+        return try {
             val root = JSONObject(f.readText())
-            counter = root.optInt("counter", 1).coerceAtLeast(1)
+            val savedCounter = root.optInt("counter", 1).coerceAtLeast(1)
             val arr = root.optJSONArray("entries") ?: JSONArray()
+            val list = ArrayList<Entry>(arr.length())
             for (i in 0 until arr.length()) {
                 val o = arr.optJSONObject(i) ?: continue
                 val messageId = o.optInt("message_id", 0)
                 if (messageId <= 0) continue
                 val peerUid = if (o.isNull("peer_uid")) "" else o.optString("peer_uid", "")
-                val e = Entry(
-                    messageId,
-                    o.optLong("msg_id"),
-                    o.optLong("msg_seq"),
-                    o.optInt("chat_type"),
-                    peerUid,
-                    o.optLong("sender_uin"),
-                    o.optLong("time")
+                list.add(
+                    Entry(
+                        messageId,
+                        o.optLong("msg_id"),
+                        o.optLong("msg_seq"),
+                        o.optInt("chat_type"),
+                        peerUid,
+                        o.optLong("sender_uin"),
+                        o.optLong("time")
+                    )
                 )
-                put(e)
             }
-            PicoLog.i("msgid store loaded: " + byMessageId.size + " entries")
+            savedCounter to list
         } catch (t: Throwable) {
-            PicoLog.w("msgid store load failed", t)
+            PicoLog.w("msgid store load failed (${f.name})", t)
+            null
         }
     }
 
@@ -179,7 +298,7 @@ object MsgIdStore {
     private fun markDirtyLocked() {
         revision++
         dirty++
-        if (dirty >= 50) {
+        if (dirty >= 50 && file != null) {
             resaveNeeded = true
             if (!saveRunning) {
                 saveRunning = true
@@ -192,19 +311,20 @@ object MsgIdStore {
         var completedNormally = false
         try {
             while (true) {
-                val snap: Triple<Long, Int, List<Entry>>? = synchronized(this) {
-                    if (!resaveNeeded && dirty == 0) {
+                val snap: SaveSnap? = synchronized(this) {
+                    val target = file
+                    if (target == null || (!resaveNeeded && dirty == 0)) {
                         saveRunning = false
                         completedNormally = true
                         null
                     } else {
                         resaveNeeded = false
                         dirty = 0
-                        Triple(revision, counter, ArrayList(byMessageId.values))
+                        SaveSnap(target, revision, counter, ArrayList(byMessageId.values))
                     }
                 }
                 if (snap == null) return
-                writeSnapshot(snap.first, snap.second, snap.third)
+                writeSnapshot(snap)
             }
         } finally {
             if (!completedNormally) {
@@ -215,23 +335,26 @@ object MsgIdStore {
 
     fun save() {
         val snap = synchronized(this) {
+            val target = file ?: return
             resaveNeeded = false
             dirty = 0
-            Triple(revision, counter, ArrayList(byMessageId.values))
+            SaveSnap(target, revision, counter, ArrayList(byMessageId.values))
         }
-        writeSnapshot(snap.first, snap.second, snap.third)
+        writeSnapshot(snap)
     }
 
-    private fun writeSnapshot(rev: Long, curCounter: Int, entries: List<Entry>) {
-        val f = file ?: return
+    private fun writeSnapshot(snap: SaveSnap): Boolean {
+        val f = snap.targetFile
+        val path = f.absolutePath
         synchronized(saveLock) {
-            if (rev < lastWrittenRev) return
-            if (rev == lastWrittenRev && f.isFile) return
+            val prevRev = lastWrittenRevByPath[path] ?: -1L
+            if (snap.rev < prevRev) return true
+            if (snap.rev == prevRev && f.isFile) return true
             var tmp: File? = null
             try {
                 val arr = JSONArray()
-                for (e in entries) arr.put(e.toJson())
-                val payload = JSONObject().put("counter", curCounter).put("entries", arr).toString()
+                for (e in snap.entries) arr.put(e.toJson())
+                val payload = JSONObject().put("counter", snap.curCounter).put("entries", arr).toString()
                 val parent = f.parentFile
                 if (parent != null && !parent.isDirectory) parent.mkdirs()
                 val tempFile = File.createTempFile(f.name + ".", ".tmp", parent)
@@ -246,11 +369,13 @@ object MsgIdStore {
                 }
                 if (!tempFile.renameTo(f)) {
                     PicoLog.w("msgid store atomic rename failed: " + f.absolutePath)
-                } else {
-                    lastWrittenRev = rev
+                    return false
                 }
+                lastWrittenRevByPath[path] = snap.rev
+                return true
             } catch (t: Throwable) {
                 PicoLog.w("msgid store save failed", t)
+                return false
             } finally {
                 tmp?.delete()
             }

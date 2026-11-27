@@ -76,7 +76,7 @@ object KernelGate {
     private var sessionEpoch: Long = 0
 
     @Volatile
-    private var loggingOut: Boolean = false
+    private var loggingOutCount: Int = 0
 
     private var logoutSuppressUntilNs: Long = 0L
     private var hasLogoutSuppress: Boolean = false
@@ -107,7 +107,7 @@ object KernelGate {
     fun currentEpoch(): Long = sessionEpoch
 
     fun isEpochCurrent(epoch: Long): Boolean = synchronized(this) {
-        sessionEpoch == epoch && !loggingOut && state != State.LOGGED_OUT
+        sessionEpoch == epoch && loggingOutCount == 0 && state != State.LOGGED_OUT
     }
 
     fun setState(next: State) {
@@ -146,6 +146,13 @@ object KernelGate {
     }
 
     private fun notifyStateChanged(from: State, next: State) {
+        if (next == State.ONLINE) {
+            try {
+                PicoLoginManager.clearQr()
+            } catch (t: Throwable) {
+                PicoLog.w("PicoLoginManager.clearQr failed: " + t.message)
+            }
+        }
         try {
             MetaEvents.stateChanged(from.name, next.name)
         } catch (t: Throwable) {
@@ -214,7 +221,7 @@ object KernelGate {
         val suppressUntil: Long
         val suppressedSession: IQQNTWrapperSession?
         synchronized(this) {
-            if (loggingOut) return
+            if (loggingOutCount > 0) return
             epochAtStart = sessionEpoch
             cached = sessionRef
             suppressActive = hasLogoutSuppress
@@ -253,7 +260,7 @@ object KernelGate {
             val shouldLose: Boolean
             val shouldTransportUp: Boolean
             synchronized(this) {
-                if (sessionEpoch != epochAtStart || loggingOut) return
+                if (sessionEpoch != epochAtStart || loggingOutCount > 0) return
                 shouldLose = state == State.ONLINE || state == State.LOGGED_IN ||
                     state == State.SESSION_READY || sessionRef != null || listenerId != 0L
                 shouldTransportUp = !shouldLose && state == State.INIT
@@ -274,7 +281,7 @@ object KernelGate {
         }
 
         val transitionedToReady = synchronized(this) {
-            if (sessionEpoch != epochAtStart || loggingOut) return
+            if (sessionEpoch != epochAtStart || loggingOutCount > 0) return
             if (sessionRef !== live) sessionRef = live
             if (state == State.INIT || state == State.TRANSPORT_UP || state == State.LOGGED_OUT) {
                 transitionLocked(State.SESSION_READY)
@@ -288,22 +295,35 @@ object KernelGate {
         if (uin <= 0L) return
         val uid = readSelfUid()
 
+        val accountChanged: Boolean
         val needRegisterListener: Boolean
         val transitionedAfterLogin: Boolean
         synchronized(this) {
-            if (sessionEpoch != epochAtStart || loggingOut || sessionRef !== live) return
-            selfUinCache = uin
-            if (uid.isNotEmpty()) selfUidCache = uid
-            var changed = false
-            if (state == State.SESSION_READY) {
-                changed = transitionLocked(State.LOGGED_IN) || changed
+            if (sessionEpoch != epochAtStart || loggingOutCount > 0 || sessionRef !== live) return
+            accountChanged = (selfUinCache > 0L && selfUinCache != uin) ||
+                (selfUidCache.isNotEmpty() && uid.isNotEmpty() && selfUidCache != uid)
+            if (accountChanged) {
+                needRegisterListener = false
+                transitionedAfterLogin = false
+            } else {
+                selfUinCache = uin
+                if (uid.isNotEmpty()) selfUidCache = uid
+                var changed = false
+                if (state == State.SESSION_READY) {
+                    changed = transitionLocked(State.LOGGED_IN) || changed
+                }
+                needRegisterListener = (listenerId == 0L)
+                if (!needRegisterListener && state == State.LOGGED_IN) {
+                    changed = transitionLocked(State.ONLINE) || changed
+                }
+                transitionedAfterLogin = changed
             }
-            needRegisterListener = (listenerId == 0L)
-            if (!needRegisterListener && state == State.LOGGED_IN) {
-                changed = transitionLocked(State.ONLINE) || changed
-            }
-            transitionedAfterLogin = changed
         }
+        if (accountChanged) {
+            onSessionLost("account_changed")
+            return
+        }
+        pico.onebot.msg.MsgIdStore.switchAccount(uin, epochAtStart)
         if (transitionedAfterLogin) drainStateTransitions()
 
         if (needRegisterListener) {
@@ -311,7 +331,7 @@ object KernelGate {
             val id = MsgListenerProxy.register(msg)
             if (id != 0L) {
                 val committed = synchronized(this) {
-                    if (sessionEpoch != epochAtStart || loggingOut || sessionRef !== live || listenerId != 0L) {
+                    if (sessionEpoch != epochAtStart || loggingOutCount > 0 || sessionRef !== live || listenerId != 0L) {
                         false
                     } else {
                         listenerId = id
@@ -332,7 +352,7 @@ object KernelGate {
 
         // 名册监听器单独注册:它失败不该拖垮消息通路,传入 session 与 epoch 做代际守护
         val shouldRegisterContacts = synchronized(this) {
-            sessionEpoch == epochAtStart && !loggingOut && state == State.ONLINE && !ContactListeners.registered
+            sessionEpoch == epochAtStart && loggingOutCount == 0 && state == State.ONLINE && !ContactListeners.registered
         }
         if (shouldRegisterContacts) {
             ContactListeners.register(live, epochAtStart)
@@ -346,7 +366,7 @@ object KernelGate {
         val transitioned: Boolean
         synchronized(this) {
             if (listenerId == 0L && sessionRef == null && state == State.LOGGED_OUT && reason != "api_logout") return
-            loggingOut = true
+            loggingOutCount++
             oldId = listenerId
             oldSession = sessionRef
             listenerId = 0
@@ -358,10 +378,13 @@ object KernelGate {
             if (reason == "api_logout") {
                 hasLogoutSuppress = true
                 logoutSuppressUntilNs = System.nanoTime() + LOGOUT_SUPPRESS_NS
-                logoutSuppressedSession = oldSession
+                if (oldSession != null) {
+                    logoutSuppressedSession = oldSession
+                }
             }
             transitioned = transitionLocked(State.LOGGED_OUT)
         }
+        var shouldWakeWatch = false
         try {
             PicoLog.w("session lost: $reason")
             if (oldId != 0L && oldSession != null) {
@@ -372,14 +395,18 @@ object KernelGate {
             // 名册/昵称/消息管道/发送回执均是当前账号视角,切号必须统一清空
             ContactStore.reset()
             NickStore.reset()
+            UinUidStore.reset()
             MsgPipeline.reset()
             SendTracker.reset()
             ReadReporter.reset()
             MsgWatchdog.reset()
+            pico.onebot.msg.MsgIdStore.onSessionLost()
             pico.onebot.media.MediaRefStore.reset()
             pico.onebot.msg.ForwardStore.reset()
             pico.onebot.media.MediaDownloader.reset()
             pico.onebot.media.MediaFiles.clearServed()
+            PicoLoginManager.clearQr()
+            // TODO(pr4-merge): wire pico.onebot.net.Transport.clearReplay() here after merging Transport.clearReplay()
             for (hook in sessionLostHooks) {
                 try {
                     hook()
@@ -390,22 +417,23 @@ object KernelGate {
             if (transitioned) drainStateTransitions()
         } finally {
             synchronized(this) {
-                loggingOut = false
+                loggingOutCount = (loggingOutCount - 1).coerceAtLeast(0)
+                shouldWakeWatch = (loggingOutCount == 0)
             }
         }
-        wakeWatch()
+        if (shouldWakeWatch) wakeWatch()
     }
 
     // ---------------- 会话与服务 ----------------
 
     fun session(): IQQNTWrapperSession? {
-        if (loggingOut || state == State.LOGGED_OUT) return null
+        if (loggingOutCount > 0 || state == State.LOGGED_OUT) return null
         sessionRef?.let { return it }
         if (!loggedIn()) return null
         val epochAtStart = sessionEpoch
         val found = findSessionByReturnType() ?: return null
         synchronized(this) {
-            if (loggingOut || state == State.LOGGED_OUT || sessionEpoch != epochAtStart) return null
+            if (loggingOutCount > 0 || state == State.LOGGED_OUT || sessionEpoch != epochAtStart) return null
             if (sessionRef == null) sessionRef = found
             return sessionRef
         }
@@ -592,28 +620,28 @@ object KernelGate {
     // ---------------- 自身身份 ----------------
 
     fun selfUin(): Long {
-        if (loggingOut || state == State.LOGGED_OUT) return 0L
+        if (loggingOutCount > 0 || state == State.LOGGED_OUT) return 0L
         val cached = selfUinCache
         if (cached > 0L) return cached
         val epochAtStart = sessionEpoch
         val v = readSelfUin()
         if (v <= 0L) return 0L
         synchronized(this) {
-            if (loggingOut || state == State.LOGGED_OUT || sessionEpoch != epochAtStart) return 0L
+            if (loggingOutCount > 0 || state == State.LOGGED_OUT || sessionEpoch != epochAtStart) return 0L
             selfUinCache = v
             return v
         }
     }
 
     fun selfUid(): String {
-        if (loggingOut || state == State.LOGGED_OUT) return ""
+        if (loggingOutCount > 0 || state == State.LOGGED_OUT) return ""
         val cached = selfUidCache
         if (cached.isNotEmpty()) return cached
         val epochAtStart = sessionEpoch
         val v = readSelfUid()
         if (v.isEmpty()) return ""
         synchronized(this) {
-            if (loggingOut || state == State.LOGGED_OUT || sessionEpoch != epochAtStart) return ""
+            if (loggingOutCount > 0 || state == State.LOGGED_OUT || sessionEpoch != epochAtStart) return ""
             selfUidCache = v
             return v
         }
