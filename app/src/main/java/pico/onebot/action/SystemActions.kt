@@ -19,9 +19,12 @@ import pico.onebot.kernel.UinUidStore
 import pico.onebot.msg.MsgIdStore
 import pico.onebot.net.Transport
 import pico.onebot.proto.Ob
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** 不依赖登录就能回答的动作 —— M1 的验收面。 */
 object SystemActions {
+
+    private val delayedRestartPending = AtomicBoolean(false)
 
     fun register() {
         ActionRouter.register("get_version_info") {
@@ -169,22 +172,36 @@ object SystemActions {
         }
         val delayMs = if (params.isNull("delay")) 0L else params.optLong("delay", 0L).coerceIn(0L, 60_000L)
         if (delayMs > 0L) {
+            if (!delayedRestartPending.compareAndSet(false, true)) {
+                return Ob.failed(Ob.RC_TIMEOUT, "QQ 延迟重启请求已在队列中,请勿重复提交")
+            }
             PicoLog.i("set_restart requested by action (delay=${delayMs}ms)")
-            Thread({
-                try {
-                    Thread.sleep(delayMs)
-                    if (!ContainerRestart.request()) {
-                        PicoLog.w("delayed set_restart skipped: restart request already pending or cooling down")
+            try {
+                Thread({
+                    try {
+                        Thread.sleep(delayMs)
+                        if (!ContainerRestart.request()) {
+                            PicoLog.w("delayed set_restart skipped: restart request already pending or cooling down")
+                        }
+                    } catch (t: Throwable) {
+                        PicoLog.w("delayed set_restart failed: " + t.message)
+                    } finally {
+                        delayedRestartPending.set(false)
                     }
-                } catch (t: Throwable) {
-                    PicoLog.w("delayed set_restart failed: " + t.message)
-                }
-            }, "pico-set-restart").apply { isDaemon = true }.start()
+                }, "pico-set-restart").apply { isDaemon = true }.start()
+            } catch (t: Throwable) {
+                delayedRestartPending.set(false)
+                PicoLog.e("delayed set_restart thread start failed", t)
+                return Ob.failed(Ob.RC_KERNEL_ERROR, "无法调度延迟重启任务: " + (t.message ?: t.javaClass.simpleName))
+            }
             return Ob.ok(
                 JSONObject()
                     .put("message", "QQ restart scheduled")
                     .put("delay", delayMs)
             )
+        }
+        if (delayedRestartPending.get()) {
+            return Ob.failed(Ob.RC_TIMEOUT, "QQ 延迟重启请求已在队列中,请稍后再试")
         }
         PicoLog.i("set_restart requested by action")
         return try {

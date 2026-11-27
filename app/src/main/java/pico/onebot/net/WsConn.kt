@@ -28,7 +28,9 @@ class WsConn(
     /** 客户端角色必须给帧加掩码(RFC 6455)。 */
     private val maskOut: Boolean,
     /** 产生这条连接的网络配置项 id;WebUI 要按配置项如实统计在线对端。 */
-    val ownerId: String = ""
+    val ownerId: String = "",
+    /** 可选的周期性保活检查(每轮 PING 前触发;返回 false 时以 1008 关闭连接,如校验日志流会话 TTL)。 */
+    private val onPingCheck: (() -> Boolean)? = null
 ) {
 
     enum class Role { API, EVENT, BOTH }
@@ -121,7 +123,17 @@ class WsConn(
     }
 
     /** 把一个可能阻塞的 [close] 挪到后台线程;重复调用只生效一次。 */
-    private fun closeAsync(code: Int = 1000) {
+    internal fun closeAsync(code: Int = 1000) {
+        queueLock.lock()
+        try {
+            if (!closed) {
+                closed = true
+                pending.clear()
+                notEmpty.signalAll()
+            }
+        } finally {
+            queueLock.unlock()
+        }
         if (!closeRequested.compareAndSet(false, true)) return
         try {
             Thread({ close(code) }, "pico-ws-close").apply { isDaemon = true }.start()
@@ -142,6 +154,10 @@ class WsConn(
                 val now = System.nanoTime()
                 if ((now - nextPingAt) >= 0L) {
                     if (closed) return
+                    if (onPingCheck != null && !onPingCheck.invoke()) {
+                        close(1008)
+                        return
+                    }
                     if (!writeFrame(WsFrame.OP_PING, ByteArray(0))) return
                     nextPingAt = System.nanoTime() + PING_INTERVAL_NS
                 }
@@ -221,15 +237,30 @@ class WsConn(
     private fun closePayload(code: Int): ByteArray =
         byteArrayOf(((code shr 8) and 0xFF).toByte(), (code and 0xFF).toByte())
 
-    private fun decodeUtf8Strict(bytes: ByteArray): String {
+    private fun decodeUtf8Strict(bytes: ByteArray, offset: Int = 0, length: Int = bytes.size): String {
         return try {
             Charsets.UTF_8.newDecoder()
                 .onMalformedInput(CodingErrorAction.REPORT)
                 .onUnmappableCharacter(CodingErrorAction.REPORT)
-                .decode(ByteBuffer.wrap(bytes))
+                .decode(ByteBuffer.wrap(bytes, offset, length))
                 .toString()
         } catch (_: CharacterCodingException) {
             throw WsFrame.ProtocolException(1007, "protocol error: invalid UTF-8 payload")
+        }
+    }
+
+    /** RFC 6455 §5.5.1 / §7.4.1: 校验对端 CLOSE 帧的状态码合法范围及 UTF-8 reason。 */
+    private fun validateClosePayload(payload: ByteArray) {
+        if (payload.isEmpty()) return
+        if (payload.size == 1) {
+            throw WsFrame.ProtocolException(1002, "protocol error: close frame payload length 1")
+        }
+        val peerCode = ((payload[0].toInt() and 0xFF) shl 8) or (payload[1].toInt() and 0xFF)
+        if (!WsFrame.isValidCloseCode(peerCode)) {
+            throw WsFrame.ProtocolException(1002, "protocol error: invalid close status code $peerCode")
+        }
+        if (payload.size > 2) {
+            decodeUtf8Strict(payload, 2, payload.size - 2)
         }
     }
 
@@ -251,7 +282,10 @@ class WsConn(
                 when (f.opcode) {
                     WsFrame.OP_PING -> if (!writeFrame(WsFrame.OP_PONG, f.payload)) return
                     WsFrame.OP_PONG -> Unit
-                    WsFrame.OP_CLOSE -> return
+                    WsFrame.OP_CLOSE -> {
+                        validateClosePayload(f.payload)
+                        return
+                    }
                     WsFrame.OP_TEXT, WsFrame.OP_BIN -> {
                         if (accOpcode != -1) {
                             throw WsFrame.ProtocolException(1002, "protocol error: new data frame while fragment open")

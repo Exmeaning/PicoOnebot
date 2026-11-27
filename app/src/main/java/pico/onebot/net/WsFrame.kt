@@ -45,6 +45,14 @@ object WsFrame {
         else -> false
     }
 
+    /** RFC 6455 §7.4.1 / IANA: 合法的线上传输 CLOSE 状态码(排除 1004/1005/1006/1015 等禁用码)。 */
+    fun isValidCloseCode(code: Int): Boolean = when (code) {
+        in 1000..1003 -> true
+        in 1007..1014 -> true
+        in 3000..4999 -> true
+        else -> false
+    }
+
     /**
      * @param requireMask 读到的帧是否**必须**带掩码位。
      *   服务端读客户端帧时必须为 true(RFC 6455 §5.1),否则不符合规范的对端
@@ -181,15 +189,15 @@ object WsFrame {
                 throw IOException("malformed line: bare CR")
             }
             if (b == '\n'.code) break
+            if (b == '\r'.code) {
+                prevCr = true
+                continue
+            }
             count++
             if (count > maxLen) {
                 throw LineTooLongException("line exceeds $maxLen bytes")
             }
-            if (b == '\r'.code) {
-                prevCr = true
-            } else {
-                sb.append(b.toChar())
-            }
+            sb.append(b.toChar())
         }
         return sb.toString()
     }

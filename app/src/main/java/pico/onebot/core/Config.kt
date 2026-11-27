@@ -11,6 +11,7 @@ import java.io.IOException
 import java.net.URI
 import java.security.MessageDigest
 import java.security.SecureRandom
+import java.util.Locale
 import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.PBEKeySpec
 
@@ -30,8 +31,39 @@ object Config {
     private const val PASSWORD_BITS = 256
     private const val OWNER_RW_MODE = 0b110_000_000 // 0600
 
+    enum class PasswordInitResult {
+        OK,
+        ALREADY_INITIALIZED,
+        CORRUPT_RECOVERY_MODE,
+        PERSIST_FAILED
+    }
+
+    enum class PasswordChangeResult {
+        OK,
+        NOT_INITIALIZED,
+        INVALID_CURRENT,
+        CORRUPT_RECOVERY_MODE,
+        PERSIST_FAILED
+    }
+
+    data class NormalizedOrigin(val scheme: String, val host: String, val port: Int)
+
     @Volatile
     private var root: JSONObject = JSONObject()
+
+    /** config.json 解析失败回退默认配置时置位:强制仅监听 127.0.0.1、禁用 picopico、拒绝覆盖磁盘配置。 */
+    @Volatile
+    var corruptRecoveryMode: Boolean = false
+        private set
+
+    @Volatile
+    private var corruptRecoveryToken: String? = null
+
+    @Volatile
+    private var corruptFallbackSecrets: Map<String, Pair<String?, String?>> = emptyMap()
+
+    @Volatile
+    private var corruptRecoveredWebuiCreds: Pair<String, String>? = null
 
     lateinit var dataDir: File
         private set
@@ -61,22 +93,28 @@ object Config {
             } catch (t: Throwable) {
                 PicoLog.e("config initial persist failed", t)
             }
+            corruptRecoveryMode = false
+            corruptRecoveryToken = null
+            corruptFallbackSecrets = emptyMap()
+            corruptRecoveredWebuiCreds = null
             root = fresh
             PicoLog.i("config v2 initialized at " + internal.absolutePath)
             return
         }
 
+        val rawText = try {
+            source.readText(Charsets.UTF_8)
+        } catch (t: Throwable) {
+            PicoLog.e("config read failed: " + source.absolutePath, t)
+            enterCorruptRecoveryMode(source, null)
+            return
+        }
+
         val parsed = try {
-            JSONObject(source.readText(Charsets.UTF_8))
+            JSONObject(rawText)
         } catch (t: Throwable) {
             PicoLog.e("config parse failed: " + source.absolutePath, t)
-            backupCorruptConfig(source)
-            // 绝不静默以未初始化的默认 picopico 配置覆盖磁盘上的损坏文件
-            val fallback = migrateV1(JSONObject())
-            fillDefaults(fallback)
-            sanitizeWebuiDir(fallback)
-            root = fallback
-            PicoLog.w("loaded in-memory defaults without overwriting corrupt config file")
+            enterCorruptRecoveryMode(source, rawText)
             return
         }
 
@@ -97,11 +135,75 @@ object Config {
         } else {
             restrictPermissions(internal)
         }
+        corruptRecoveryMode = false
+        corruptRecoveryToken = null
+        corruptFallbackSecrets = emptyMap()
+        corruptRecoveredWebuiCreds = null
         root = next
         if (importedFromExternal) {
             PicoLog.i("config v2 migrated one-time from /sdcard to " + internal.absolutePath)
+            PicoLog.w("legacy plaintext config remains at " + external.absolutePath + "; please delete it after verifying migration")
         } else {
             PicoLog.i("config v2 loaded from " + internal.absolutePath)
+            if (external.isFile) {
+                PicoLog.w("unused legacy config still exists at " + external.absolutePath + "; please remove it to avoid keeping plaintext secrets on /sdcard")
+            }
+        }
+    }
+
+    private fun enterCorruptRecoveryMode(source: File, rawText: String?) {
+        backupCorruptConfig(source)
+        val fallback = migrateV1(JSONObject())
+        fillDefaults(fallback)
+        sanitizeWebuiDir(fallback)
+        fallback.optJSONObject("webui")?.put("host", "127.0.0.1")
+        val recoveryBytes = ByteArray(24).also { SecureRandom().nextBytes(it) }
+        val recoveryToken = Base64.encodeToString(
+            recoveryBytes,
+            Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING
+        )
+        corruptFallbackSecrets = if (rawText != null) extractCorruptConnectionSecrets(rawText) else emptyMap()
+        corruptRecoveredWebuiCreds = if (rawText != null) extractCorruptWebuiCreds(rawText) else null
+        corruptRecoveryToken = recoveryToken
+        corruptRecoveryMode = true
+        root = fallback
+        PicoLog.w(
+            "corrupt config recovery mode enabled (config.json NOT overwritten): " +
+                "WebUI bound strictly to 127.0.0.1:${webuiPort}; " +
+                "one-time local recovery token=$recoveryToken; " +
+                "restore valid config.json via File Manager to exit recovery mode"
+        )
+    }
+
+    /** 尽量从损坏的 config.json 原始文本中提取连接 id -> (token, secret),供修复保存时还原 \"***\" 掩码。 */
+    private fun extractCorruptConnectionSecrets(raw: String): Map<String, Pair<String?, String?>> {
+        val out = HashMap<String, Pair<String?, String?>>()
+        val objPattern = Regex("\\{[^{}]*\"id\"\\s*:\\s*\"([^\"\\\\]+)\"[^{}]*\\}")
+        val tokenPattern = Regex("\"token\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"")
+        val secretPattern = Regex("\"secret\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"")
+        for (match in objPattern.findAll(raw)) {
+            val block = match.value
+            val id = match.groupValues[1]
+            if (id.isEmpty()) continue
+            val token = tokenPattern.find(block)?.groupValues?.get(1)?.takeIf { it.isNotEmpty() && it != REDACTED_MASK }
+            val secret = secretPattern.find(block)?.groupValues?.get(1)?.takeIf { it.isNotEmpty() && it != REDACTED_MASK }
+            if (token != null || secret != null) {
+                out[id] = token to secret
+            }
+        }
+        return out
+    }
+
+    /** 若损坏配置文件里保留了合法的 PBKDF2 盐与哈希,修复保存时继续沿用而非降级回未初始化状态。 */
+    private fun extractCorruptWebuiCreds(raw: String): Pair<String, String>? {
+        val salt = Regex("\"passwordSalt\"\\s*:\\s*\"([A-Za-z0-9+/=]{16,128})\"").find(raw)?.groupValues?.get(1) ?: return null
+        val hash = Regex("\"passwordHash\"\\s*:\\s*\"([A-Za-z0-9+/=]{32,128})\"").find(raw)?.groupValues?.get(1) ?: return null
+        return try {
+            val saltBytes = Base64.decode(salt, Base64.NO_WRAP)
+            val hashBytes = Base64.decode(hash, Base64.NO_WRAP)
+            if (saltBytes.size == 16 && hashBytes.size == PASSWORD_BITS / 8) salt to hash else null
+        } catch (_: Throwable) {
+            null
         }
     }
 
@@ -149,7 +251,7 @@ object Config {
                     .put("port", v1.optInt("port", 3001))
                     .put("token", v1.optString("access_token", ""))
                     // v1 的这些是进程级语义,归入 general(见下方 general 段)
-                    .put("cors", true)
+                    .put("cors", false)
                     .put("websocket", true)
             )
         }
@@ -196,7 +298,7 @@ object Config {
                 .put("post_timeout_ms", v1.optInt("post_timeout_ms", 10000))
                 .put("post_queue_size", v1.optInt("post_queue_size", 1024))
                 .put("event_queue_size", v1.optInt("event_queue_size", 8192))
-                .put("kernel_probe_delay_ms", v1.optLong("kernel_probe_delay_ms", 5000))
+                .put("kernel_probe_delay_ms", v1.optLong("kernel_probe_delay_ms", 1000))
                 .put("webui_dir", v1.optString("webui_dir", "webui"))
                 // v1 的进程级行为字段,原样带过来(此前误放在每条连接里)
                 .put("heartbeat", v1.optLong("heartbeat_interval", 5000))
@@ -239,7 +341,7 @@ object Config {
         if (!g.has("post_timeout_ms") || g.isNull("post_timeout_ms")) g.put("post_timeout_ms", 10000)
         if (!g.has("post_queue_size") || g.isNull("post_queue_size")) g.put("post_queue_size", 1024)
         if (!g.has("event_queue_size") || g.isNull("event_queue_size")) g.put("event_queue_size", 8192)
-        if (!g.has("kernel_probe_delay_ms") || g.isNull("kernel_probe_delay_ms")) g.put("kernel_probe_delay_ms", 5000)
+        if (!g.has("kernel_probe_delay_ms") || g.isNull("kernel_probe_delay_ms")) g.put("kernel_probe_delay_ms", 1000)
         if (!g.has("webui_dir") || g.isNull("webui_dir")) g.put("webui_dir", "webui")
         if (!g.has("autoMarkRead") || g.isNull("autoMarkRead")) g.put("autoMarkRead", true)
         if (!g.has("readReportBatch") || g.isNull("readReportBatch")) g.put("readReportBatch", 10)
@@ -280,6 +382,10 @@ object Config {
     @Synchronized
     fun save() {
         if (file == null) return
+        if (corruptRecoveryMode) {
+            PicoLog.w("config save skipped while in corrupt recovery mode")
+            return
+        }
         try {
             persist(root)
         } catch (t: Throwable) {
@@ -311,12 +417,61 @@ object Config {
     }
 
     val webuiHost: String
-        get() = webui().let { w ->
-            if (w.isNull("host")) "0.0.0.0" else w.optString("host", "0.0.0.0").ifBlank { "0.0.0.0" }
+        get() {
+            if (corruptRecoveryMode) return "127.0.0.1"
+            return webui().let { w ->
+                if (w.isNull("host")) "0.0.0.0" else w.optString("host", "0.0.0.0").ifBlank { "0.0.0.0" }
+            }
         }
 
     val webuiPort: Int
         get() = webui().optInt("port", 6099).let { if (it in 1..65535) it else 6099 }
+
+    /** 可选的 WebUI 显式跨源白名单(精确 origin 列表,默认空=仅同源)。 */
+    val webuiCorsAllowedOrigins: List<String>
+        get() {
+            if (corruptRecoveryMode) return emptyList()
+            val w = webui()
+            val arr = w.optJSONArray("cors_allowed_origins") ?: w.optJSONArray("corsAllowedOrigins") ?: return emptyList()
+            val out = ArrayList<String>(arr.length())
+            for (i in 0 until arr.length()) {
+                if (arr.isNull(i)) continue
+                val raw = arr.optString(i, "").trim().trimEnd('/')
+                if (normalizeOrigin(raw, allowTrailingSlash = false) != null) {
+                    out.add(raw)
+                }
+            }
+            return out
+        }
+
+    /** 严格解析并规范化 http/https Origin(scheme + host + port,默认端口 80/443 归一化,不允许通配符/路径/userinfo)。 */
+    fun normalizeOrigin(raw: String, allowTrailingSlash: Boolean = false): NormalizedOrigin? {
+        val trimmed = raw.trim()
+        if (trimmed.isEmpty() || trimmed == "*" || trimmed.indexOf('\r') >= 0 || trimmed.indexOf('\n') >= 0) {
+            return null
+        }
+        val uri = try {
+            URI(trimmed)
+        } catch (_: Throwable) {
+            return null
+        }
+        val scheme = uri.scheme?.lowercase(Locale.ROOT) ?: return null
+        if (scheme != "http" && scheme != "https") return null
+        if (uri.rawUserInfo != null || uri.rawQuery != null || uri.rawFragment != null) return null
+        val rawPath = uri.rawPath ?: ""
+        if (rawPath.isNotEmpty() && !(allowTrailingSlash && rawPath == "/")) return null
+        val host = uri.host?.trim()?.removePrefix("[")?.removeSuffix("]")?.lowercase(Locale.ROOT) ?: return null
+        if (host.isEmpty() || host == "*") return null
+        val port = when {
+            uri.port > 0 -> {
+                if (uri.port !in 1..65535) return null
+                uri.port
+            }
+            uri.port == -1 -> if (scheme == "https") 443 else 80
+            else -> return null
+        }
+        return NormalizedOrigin(scheme, host, port)
+    }
 
     val webuiPasswordInitialized: Boolean
         get() {
@@ -326,7 +481,17 @@ object Config {
                 w.optString("passwordSalt", "").isNotEmpty() && w.optString("passwordHash", "").isNotEmpty()
         }
 
+    fun requiresPbkdf2ForVerification(): Boolean = !corruptRecoveryMode && webuiPasswordInitialized
+
     fun verifyWebuiPassword(password: String): Boolean {
+        if (corruptRecoveryMode) {
+            val expected = corruptRecoveryToken ?: return false
+            if (expected.isEmpty()) return false
+            return MessageDigest.isEqual(
+                password.toByteArray(Charsets.UTF_8),
+                expected.toByteArray(Charsets.UTF_8)
+            )
+        }
         val snap = root
         val w = snap.optJSONObject("webui") ?: JSONObject()
         val initialized = w.optBoolean("passwordInitialized", false) &&
@@ -348,48 +513,62 @@ object Config {
         }
     }
 
-    /** 首次初始化密码。已初始化后必须走 [changeWebuiPassword](需旧密码)。 */
+    /**
+     * 首次初始化密码。已初始化后必须走 [changeWebuiPassword](需旧密码)。
+     * 通过 [commitAction] 允许调用方在同一会话锁内原子发布 `root` 并推进 `sessionEpoch`/吊销会话。
+     */
     @Synchronized
-    fun initializeWebuiPassword(password: String): Boolean {
-        if (webuiPasswordInitialized) return false
+    fun initializeWebuiPassword(
+        password: String,
+        commitAction: (commitRoot: () -> Unit) -> Unit = { it() }
+    ): PasswordInitResult {
+        if (corruptRecoveryMode) return PasswordInitResult.CORRUPT_RECOVERY_MODE
+        if (webuiPasswordInitialized) return PasswordInitResult.ALREADY_INITIALIZED
         val next = JSONObject(root.toString())
         val w = next.optJSONObject("webui") ?: JSONObject().also { next.put("webui", it) }
         storePasswordHash(w, password)
         return try {
             persist(next)
-            root = next
-            true
+            commitAction { root = next }
+            PasswordInitResult.OK
         } catch (t: Throwable) {
             PicoLog.e("webui password initialization persist failed", t)
-            false
+            PasswordInitResult.PERSIST_FAILED
         }
     }
 
     /**
      * 修改已初始化的密码,**必须验证旧密码**。
-     *
-     * @return true 已修改并落盘;false 旧密码不正确、尚未初始化或落盘失败(保持原状态不变)。
+     * 明确区分旧密码错误、损坏恢复模式与写盘失败,并通过 [commitAction] 原子发布新状态与吊销会话。
      */
     @Synchronized
-    fun changeWebuiPassword(currentPassword: String, newPassword: String): Boolean {
-        if (!webuiPasswordInitialized) return false
-        if (!verifyWebuiPassword(currentPassword)) return false
+    fun changeWebuiPassword(
+        currentPassword: String,
+        newPassword: String,
+        commitAction: (commitRoot: () -> Unit) -> Unit = { it() }
+    ): PasswordChangeResult {
+        if (corruptRecoveryMode) return PasswordChangeResult.CORRUPT_RECOVERY_MODE
+        if (!webuiPasswordInitialized) return PasswordChangeResult.NOT_INITIALIZED
+        if (!verifyWebuiPassword(currentPassword)) return PasswordChangeResult.INVALID_CURRENT
         val next = JSONObject(root.toString())
-        val w = next.optJSONObject("webui") ?: return false
+        val w = next.optJSONObject("webui") ?: return PasswordChangeResult.PERSIST_FAILED
         storePasswordHash(w, newPassword)
         return try {
             persist(next)
-            root = next
-            true
+            commitAction { root = next }
+            PasswordChangeResult.OK
         } catch (t: Throwable) {
             PicoLog.e("webui password change persist failed", t)
-            false
+            PasswordChangeResult.PERSIST_FAILED
         }
     }
 
-    /** 写回 WebUI 提交的 AppConfig(webui.host/port + network + general),token 不在此改。 */
+    /** 写回 WebUI 提交的 AppConfig(webui.host/port/cors_allowed_origins + network + general),token 不在此改。 */
     @Synchronized
     fun applyAppConfig(patch: JSONObject) {
+        check(!corruptRecoveryMode) {
+            "当前处于损坏配置恢复模式，拒绝覆盖 config.json；请先在文件管理器中修复并保存 config.json"
+        }
         val previous = root
         val next = JSONObject(previous.toString())
         val prevNetwork = previous.optJSONObject("network") ?: JSONObject()
@@ -425,6 +604,19 @@ object Config {
             val cur = next.optJSONObject("webui") ?: JSONObject()
             if (w.has("host") && !w.isNull("host")) cur.put("host", w.optString("host").trim())
             if (w.has("port") && !w.isNull("port")) cur.put("port", w.optInt("port"))
+            val corsKey = when {
+                w.has("cors_allowed_origins") -> "cors_allowed_origins"
+                w.has("corsAllowedOrigins") -> "corsAllowedOrigins"
+                else -> null
+            }
+            if (corsKey != null) {
+                cur.remove("corsAllowedOrigins")
+                if (w.isNull(corsKey)) {
+                    cur.put("cors_allowed_origins", JSONArray())
+                } else {
+                    cur.put("cors_allowed_origins", normalizeCorsOriginsArray(w.getJSONArray(corsKey)))
+                }
+            }
             next.put("webui", cur)
         }
         fillDefaults(next)
@@ -434,17 +626,29 @@ object Config {
     }
 
     @Synchronized
-    fun replaceConfig(candidate: JSONObject) {
+    fun replaceConfig(
+        candidate: JSONObject,
+        commitAction: (commitRoot: () -> Unit) -> Unit = { it() }
+    ) {
         require(candidate.optInt("version", 0) == 2) { "文件编辑仅支持 version: 2 配置" }
         val previous = root
         val next = JSONObject(candidate.toString())
 
         val webuiErrors = validateWebui(next.optJSONObject("webui"))
         require(webuiErrors.isEmpty()) { webuiErrors.joinToString("；") }
+        normalizeWebuiCorsField(next.optJSONObject("webui"))
 
         validateWebuiDirField(next)
 
-        val netErrors = validateNetwork(next.optJSONObject("network") ?: JSONObject())
+        // 先还原 "***" 掩码(含损坏配置恢复时的回退提取值),防止文件管理器保存把 OneBot token 覆写为字面量 "***"
+        val nextNet = next.optJSONObject("network") ?: JSONObject().also { next.put("network", it) }
+        val prevNet = previous.optJSONObject("network") ?: JSONObject()
+        restoreMaskedConnectionSecrets(
+            nextNet,
+            prevNet,
+            if (corruptRecoveryMode) corruptFallbackSecrets else emptyMap()
+        )
+        val netErrors = validateNetwork(nextNet)
         require(netErrors.isEmpty()) { netErrors.joinToString("；") }
 
         // 禁止通过原始配置文件编辑绕过改密流程或重置密码派生值
@@ -453,7 +657,38 @@ object Config {
         fillDefaults(next)
         sanitizeWebuiDir(next)
         persist(next)
-        root = next
+        commitAction {
+            root = next
+            corruptRecoveryMode = false
+            corruptRecoveryToken = null
+            corruptFallbackSecrets = emptyMap()
+            corruptRecoveredWebuiCreds = null
+        }
+    }
+
+    private fun normalizeCorsOriginsArray(arr: JSONArray): JSONArray {
+        val out = JSONArray()
+        val seen = LinkedHashSet<String>()
+        for (i in 0 until arr.length()) {
+            if (arr.isNull(i)) continue
+            val cleaned = arr.optString(i, "").trim().trimEnd('/')
+            if (cleaned.isNotEmpty() && seen.add(cleaned)) {
+                out.put(cleaned)
+            }
+        }
+        return out
+    }
+
+    private fun normalizeWebuiCorsField(webui: JSONObject?) {
+        if (webui == null) return
+        val corsKey = when {
+            webui.has("cors_allowed_origins") -> "cors_allowed_origins"
+            webui.has("corsAllowedOrigins") -> "corsAllowedOrigins"
+            else -> return
+        }
+        val raw = if (webui.isNull(corsKey)) null else webui.optJSONArray(corsKey)
+        webui.remove("corsAllowedOrigins")
+        webui.put("cors_allowed_origins", if (raw != null) normalizeCorsOriginsArray(raw) else JSONArray())
     }
 
     private fun preserveWebuiCredentials(previous: JSONObject, next: JSONObject) {
@@ -461,22 +696,31 @@ object Config {
         val nextWebui = next.optJSONObject("webui") ?: JSONObject().also { next.put("webui", it) }
         nextWebui.remove("token")
         nextWebui.remove("tokenIsDefault")
+        val recovered = if (corruptRecoveryMode) corruptRecoveredWebuiCreds else null
         val prevSalt = prevWebui?.takeIf { !it.isNull("passwordSalt") }?.optString("passwordSalt", "") ?: ""
         val prevHash = prevWebui?.takeIf { !it.isNull("passwordHash") }?.optString("passwordHash", "") ?: ""
         val prevInit = prevWebui?.optBoolean("passwordInitialized", false) == true &&
             prevSalt.isNotEmpty() && prevHash.isNotEmpty()
-        if (prevInit) {
-            nextWebui.put("passwordInitialized", true)
-            nextWebui.put("passwordSalt", prevSalt)
-            nextWebui.put("passwordHash", prevHash)
-        } else {
-            nextWebui.put("passwordInitialized", false)
-            nextWebui.remove("passwordSalt")
-            nextWebui.remove("passwordHash")
+        when {
+            prevInit -> {
+                nextWebui.put("passwordInitialized", true)
+                nextWebui.put("passwordSalt", prevSalt)
+                nextWebui.put("passwordHash", prevHash)
+            }
+            recovered != null -> {
+                nextWebui.put("passwordInitialized", true)
+                nextWebui.put("passwordSalt", recovered.first)
+                nextWebui.put("passwordHash", recovered.second)
+            }
+            else -> {
+                nextWebui.put("passwordInitialized", false)
+                nextWebui.remove("passwordSalt")
+                nextWebui.remove("passwordHash")
+            }
         }
     }
 
-    private fun validateWebui(webui: JSONObject?): List<String> {
+    internal fun validateWebui(webui: JSONObject?): List<String> {
         if (webui == null) return emptyList()
         val errors = ArrayList<String>()
         if (webui.has("host")) {
@@ -486,6 +730,20 @@ object Config {
         if (webui.has("port")) {
             val port = if (webui.isNull("port")) -1 else webui.optInt("port", -1)
             if (port !in 1..65535) errors.add("控制台端口必须在 1-65535 之间")
+        }
+        for (key in arrayOf("cors_allowed_origins", "corsAllowedOrigins")) {
+            if (!webui.has(key) || webui.isNull(key)) continue
+            val arr = webui.optJSONArray(key)
+            if (arr == null) {
+                errors.add("webui.$key 必须是字符串数组")
+                continue
+            }
+            for (i in 0 until arr.length()) {
+                val entry = if (arr.isNull(i)) null else (arr.opt(i) as? String)
+                if (entry == null || normalizeOrigin(entry, allowTrailingSlash = true) == null) {
+                    errors.add("webui.$key[${i}] 不是合法的精确 Origin(仅支持 http:// 或 https://，不支持通配符或路径)")
+                }
+            }
         }
         return errors
     }
@@ -601,9 +859,9 @@ object Config {
     fun validateNetwork(candidate: JSONObject = network()): List<String> {
         val errors = ArrayList<String>()
         validateServers(candidate.optJSONArray("wsServers"), "正向 WebSocket", errors)
-        validateClients(candidate.optJSONArray("wsClients"), "反向 WebSocket", errors)
+        validateClients(candidate.optJSONArray("wsClients"), "反向 WebSocket", setOf("ws", "wss"), errors)
         validateServers(candidate.optJSONArray("httpServers"), "HTTP 服务端", errors)
-        validateClients(candidate.optJSONArray("httpClients"), "HTTP 上报", errors)
+        validateClients(candidate.optJSONArray("httpClients"), "HTTP 上报", setOf("http", "https"), errors)
         return errors
     }
 
@@ -627,7 +885,12 @@ object Config {
         }
     }
 
-    private fun validateClients(arr: JSONArray?, kind: String, errors: MutableList<String>) {
+    private fun validateClients(
+        arr: JSONArray?,
+        kind: String,
+        allowedSchemes: Set<String>,
+        errors: MutableList<String>
+    ) {
         if (arr == null) return
         for (i in 0 until arr.length()) {
             val o = arr.optJSONObject(i) ?: continue
@@ -635,9 +898,12 @@ object Config {
             val name = o.optString("name", "$kind ${i + 1}")
             val url = if (o.isNull("url")) "" else o.optString("url", "").trim()
             val token = if (o.isNull("token")) "" else o.optString("token", "")
-            val host = try { URI(url).host ?: "" } catch (_: Throwable) { "" }
-            if (host.isEmpty()) {
-                errors.add("$name: 目标地址无效")
+            val uri = try { URI(url) } catch (_: Throwable) { null }
+            val scheme = uri?.scheme?.lowercase(Locale.ROOT) ?: ""
+            val host = uri?.host?.trim()?.removePrefix("[")?.removeSuffix("]") ?: ""
+            if (uri == null || scheme !in allowedSchemes || host.isEmpty()) {
+                val expected = allowedSchemes.joinToString("/") { "$it://" }
+                errors.add("$name: 目标地址无效(必须以 $expected 开头且包含有效主机)")
             } else if (!isLoopbackHost(host) && token.isBlank()) {
                 errors.add("$name: 非回环目标地址必须填写 Access Token")
             }
@@ -658,7 +924,13 @@ object Config {
     fun appConfigJson(): JSONObject {
         val snap = root
         val w = snap.optJSONObject("webui") ?: JSONObject()
-        val host = if (w.isNull("host")) "0.0.0.0" else w.optString("host", "0.0.0.0").ifBlank { "0.0.0.0" }
+        val host = if (corruptRecoveryMode) {
+            "127.0.0.1"
+        } else if (w.isNull("host")) {
+            "0.0.0.0"
+        } else {
+            w.optString("host", "0.0.0.0").ifBlank { "0.0.0.0" }
+        }
         val port = w.optInt("port", 6099).let { if (it in 1..65535) it else 6099 }
         val init = w.optBoolean("passwordInitialized", false) &&
             !w.isNull("passwordSalt") && !w.isNull("passwordHash") &&
@@ -670,6 +942,7 @@ object Config {
                     .put("host", host)
                     .put("port", port)
                     .put("passwordInitialized", init)
+                    .put("cors_allowed_origins", JSONArray(webuiCorsAllowedOrigins))
             )
             .put("network", JSONObject((snap.optJSONObject("network") ?: JSONObject()).toString()))
             .put("general", JSONObject((snap.optJSONObject("general") ?: JSONObject()).toString()))
@@ -709,28 +982,39 @@ object Config {
     }
 
     /**
-     * 把 `GET /api/pico/config` 下发过的掩码原样还原成当前真值。
+     * 把 `GET /api/pico/config` 或文件管理器回退脱敏下发过的 `"***"` 掩码原样还原成当前真值。
      */
-    private fun restoreMaskedConnectionSecrets(incoming: JSONObject, current: JSONObject) {
+    private fun restoreMaskedConnectionSecrets(
+        incoming: JSONObject,
+        current: JSONObject,
+        corruptFallback: Map<String, Pair<String?, String?>> = emptyMap()
+    ) {
         for (key in SECRET_CONNECTION_ARRAYS) {
             val inArr = incoming.optJSONArray(key) ?: continue
-            val curArr = current.optJSONArray(key) ?: continue
+            val curArr = current.optJSONArray(key)
             val byId = HashMap<String, JSONObject>()
-            for (i in 0 until curArr.length()) {
-                val o = curArr.optJSONObject(i) ?: continue
-                val id = o.optString("id", "")
-                if (id.isNotEmpty()) byId[id] = o
+            if (curArr != null) {
+                for (i in 0 until curArr.length()) {
+                    val o = curArr.optJSONObject(i) ?: continue
+                    val id = o.optString("id", "")
+                    if (id.isNotEmpty()) byId[id] = o
+                }
             }
             for (i in 0 until inArr.length()) {
                 val item = inArr.optJSONObject(i) ?: continue
-                val old = byId[item.optString("id", "")] ?: continue
+                val id = item.optString("id", "")
+                val old = byId[id]
+                val fallbackPair = corruptFallback[id]
                 for (field in arrayOf("token", "secret")) {
                     if (!item.isNull(field) && item.optString(field, "") == REDACTED_MASK) {
-                        val oldValue = if (old.isNull(field)) "" else old.optString(field, "")
+                        val oldValue = old?.takeIf { !it.isNull(field) }?.optString(field, "")
+                            ?.takeIf { it.isNotEmpty() }
+                            ?: (if (field == "token") fallbackPair?.first else fallbackPair?.second)
+                            ?: ""
                         if (oldValue.isNotEmpty()) {
                             item.put(field, oldValue)
                         } else {
-                            PicoLog.w("connection " + item.optString("id", "?") + ": '" + field + "' 是掩码且无可还原的旧值,按原样保存")
+                            PicoLog.w("connection " + id.ifEmpty { "?" } + ": '" + field + "' 是掩码且无可还原的旧值,按原样保存")
                         }
                     }
                 }
@@ -914,8 +1198,8 @@ object Config {
                 if (!o.has("websocket") || o.isNull("websocket")) o.put("websocket", websocket)
             }
         }
-        fill("wsServers", cors = true, websocket = true)
-        fill("httpServers", cors = true, websocket = true)
+        fill("wsServers", cors = false, websocket = true)
+        fill("httpServers", cors = false, websocket = false)
     }
 
     private fun newId(): String = java.lang.Long.toHexString(

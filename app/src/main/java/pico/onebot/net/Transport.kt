@@ -241,6 +241,14 @@ object Transport {
         it.tag + "(" + it.role + (if (it.overflowCount() > 0) ", overflow=" + it.overflowCount() else "") + ")"
     }
 
+    /** 会话失效或切号时清空重连回放缓冲与游标,防止重连 WS 收到旧账号事件。 */
+    fun clearReplay() {
+        synchronized(lock) {
+            replayBuffer.clear()
+            lastReplayedSeqByTag.clear()
+        }
+    }
+
     fun closeAll() {
         val snapshot: List<WsConn>
         synchronized(lock) {

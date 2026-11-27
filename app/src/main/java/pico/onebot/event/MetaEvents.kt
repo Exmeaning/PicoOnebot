@@ -4,6 +4,7 @@ import org.json.JSONObject
 import pico.onebot.action.SystemActions
 import pico.onebot.core.Config
 import pico.onebot.core.PicoLog
+import pico.onebot.net.HttpReporter
 import pico.onebot.proto.Ob
 
 /** meta 事件:lifecycle(连接/状态变化)与 heartbeat。 */
@@ -32,7 +33,11 @@ object MetaEvents {
             heartbeatThread = t
             t.start()
         }
-        lifecycle("connect")
+        // 每条 WS 连接在 Transport.add() 时已单独发送 lifecycle.connect;
+        // 这里仅通知 HTTP 上报目标,避免启动期在 reloadNetwork() 与 MetaEvents.start() 之间连入的 WS 收到两次 connect。
+        if (HttpReporter.targetCount() > 0) {
+            HttpReporter.offer(lifecycleEvent("connect").toString())
+        }
     }
 
     fun stop() {

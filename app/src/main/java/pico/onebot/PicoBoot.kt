@@ -49,9 +49,8 @@ object PicoBoot {
     private val onebotServers = ArrayList<HttpServer>()
     private val reverseClients = ArrayList<WsClient>()
 
-    /** 配置项 id -> 真正起来的监听 / 实际生效的 token / 反向客户端 / 绑定失败原因。WebUI 的状态只看这几张表。 */
+    /** 配置项 id -> 真正起来的监听 / 反向客户端 / 绑定失败原因。WebUI 的状态只看这几张表。 */
     private val listenerById = LinkedHashMap<String, HttpServer>()
-    private val listenerTokenById = LinkedHashMap<String, String>()
     private val reverseById = LinkedHashMap<String, WsClient>()
     private val bindErrorById = LinkedHashMap<String, String>()
 
@@ -76,19 +75,15 @@ object PicoBoot {
     fun bindError(id: String): String? = synchronized(this) { bindErrorById[id] }
 
     /**
-     * 当前真正在 listening 的 OneBot 端口与它的实时 token。
+     * 当前真正在 listening 的 OneBot 监听地址与端口(优先非回环监听)。
      *
-     * 直接返回该运行中 [HttpServer] 启动时绑定的 token(而不是现查 Config),
-     * 避免 AdminApi 改完配置尚未 reloadNetwork 时媒体 URL 与实际鉴权口令失同步。
-     *
-     * @return (host, port, token);没有任何 OneBot 监听时返回 null。
+     * @return (host, port);没有任何 OneBot 监听时返回 null。
      */
-    fun activeOnebotEndpoint(): Triple<String, Int, String>? = synchronized(this) {
-        var loopback: Triple<String, Int, String>? = null
-        for ((id, server) in listenerById) {
+    fun activeOnebotEndpoint(): Pair<String, Int>? = synchronized(this) {
+        var loopback: Pair<String, Int>? = null
+        for ((_, server) in listenerById) {
             if (!server.running) continue
-            val token = listenerTokenById[id] ?: ""
-            val candidate = Triple(server.host, server.port, token)
+            val candidate = Pair(server.host, server.port)
             if (!Config.isLoopbackHost(server.host)) return@synchronized candidate
             if (loopback == null) loopback = candidate
         }
@@ -167,24 +162,34 @@ object PicoBoot {
         }
 
         // WebUI 独立监听(6099),静态页 + /api/*
+        val webuiBindHost = if (Config.corruptRecoveryMode) "127.0.0.1" else Config.webuiHost
         try {
-            val web = HttpServer(Config.webuiHost, Config.webuiPort, HttpServer.Role.WEBUI)
+            val web = HttpServer(
+                webuiBindHost,
+                Config.webuiPort,
+                HttpServer.Role.WEBUI,
+                corsAllowedOriginsProvider = {
+                    if (Config.corruptRecoveryMode) emptyList() else Config.webuiCorsAllowedOrigins
+                }
+            )
             web.start()
             webuiServer = web
-            PicoLog.i("WebUI 控制台: http://" + Config.webuiHost + ":" + Config.webuiPort + "/  password=" +
-                (if (!Config.webuiPasswordInitialized) Config.DEFAULT_WEBUI_PASSWORD + " (初始,首次进入必须修改)" else "已设置"))
+            if (Config.corruptRecoveryMode) {
+                PicoLog.w("WebUI 控制台(损坏配置恢复模式): http://127.0.0.1:" + Config.webuiPort + "/  仅限本机访问，请使用本地日志中的一次性恢复令牌登录并修复 config.json")
+            } else {
+                PicoLog.i("WebUI 控制台: http://" + webuiBindHost + ":" + Config.webuiPort + "/  password=" +
+                    (if (!Config.webuiPasswordInitialized) Config.DEFAULT_WEBUI_PASSWORD + " (初始,首次进入必须修改)" else "已设置"))
+            }
         } catch (t: Throwable) {
-            PicoLog.e("webui server bind failed on " + Config.webuiHost + ":" + Config.webuiPort, t)
+            PicoLog.e("webui server bind failed on " + webuiBindHost + ":" + Config.webuiPort, t)
         }
 
         PicoLog.i("WebUI 局域网地址: " + pico.onebot.core.NetUtil.webuiUrl())
 
         MetaEvents.start()
 
-        // 延迟首探:别在宿主自己 init 内核之前去碰 KernelServiceUtil 的静态初始化;
-        // 旧版默认 5000ms 会拉长启动/自动登录时的监听盲窗,默认(含旧默认值 5000)收敛到 1000ms
-        val configuredDelay = Config.long("kernel_probe_delay_ms", 1000L)
-        val delay = (if (configuredDelay == 5000L) 1000L else configuredDelay).coerceAtLeast(0L)
+        // 延迟首探:别在宿主自己 init 内核之前去碰 KernelServiceUtil 的静态初始化; 默认 1000ms,如实尊重用户显式配置
+        val delay = Config.long("kernel_probe_delay_ms", 1000L).coerceAtLeast(0L)
         if (delay > 0L) {
             try {
                 Thread.sleep(delay)
@@ -211,7 +216,6 @@ object PicoBoot {
         onebotServers.forEach { it.stop() }
         onebotServers.clear()
         listenerById.clear()
-        listenerTokenById.clear()
         reverseById.clear()
         bindErrorById.clear()
         pico.onebot.net.Transport.closeAll()
@@ -245,14 +249,13 @@ object PicoBoot {
             }
             val hs = HttpServer(
                 host, port, HttpServer.Role.ONEBOT, token, id,
-                allowCors = o.optBoolean("cors", true),
+                allowCors = o.optBoolean("cors", false),
                 allowWebSocket = o.optBoolean("websocket", true)
             )
             try {
                 hs.start()
                 onebotServers.add(hs)
                 listenerById[id] = hs
-                listenerTokenById[id] = token
             } catch (t: Throwable) {
                 errors.add("正向 WS $host:$port: ${t.message}")
                 bindErrorById[id] = t.message ?: t.javaClass.simpleName
@@ -287,14 +290,13 @@ object PicoBoot {
             // httpServers 项:cors / websocket 两个开关在配置里存在,必须真的生效
             val hs = HttpServer(
                 host, port, HttpServer.Role.ONEBOT, token, id,
-                allowCors = o.optBoolean("cors", true),
+                allowCors = o.optBoolean("cors", false),
                 allowWebSocket = o.optBoolean("websocket", false)
             )
             try {
                 hs.start()
                 onebotServers.add(hs)
                 listenerById[id] = hs
-                listenerTokenById[id] = token
             } catch (t: Throwable) {
                 errors.add("HTTP $host:$port: ${t.message}")
                 bindErrorById[id] = t.message ?: t.javaClass.simpleName
@@ -320,7 +322,7 @@ object PicoBoot {
             reverseClients.add(c)
             reverseById[id] = c
             c.start()
-            PicoLog.i("reverse ws target: $url")
+            PicoLog.i("reverse ws target: " + WsClient.safeUrl(url))
         }
 
         pico.onebot.net.HttpReporter.start()

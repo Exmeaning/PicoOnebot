@@ -2,6 +2,7 @@ package pico.onebot.net
 
 import android.os.Build
 import android.util.Base64
+import androidx.annotation.RequiresApi
 import pico.onebot.core.Config
 import pico.onebot.core.PicoLog
 import pico.onebot.kernel.KernelGate
@@ -34,17 +35,18 @@ class WsClient(
     private val configId: String = ""
 ) {
 
-    private companion object {
-        const val WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-        const val MAX_HANDSHAKE_HEADERS = 64
-        const val MAX_HANDSHAKE_HEADER_BYTES = 32 * 1024
-        const val STABLE_CONN_MS = 5_000L
-        val rng = SecureRandom()
+    companion object {
+        private const val WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+        private const val MAX_HANDSHAKE_HEADERS = 64
+        private const val MAX_HANDSHAKE_HEADER_BYTES = 32 * 1024
+        private const val STABLE_CONN_MS = 5_000L
+        private val rng = SecureRandom()
 
-        fun hasCrLf(s: String): Boolean = s.indexOf('\r') >= 0 || s.indexOf('\n') >= 0
+        private fun hasCrLf(s: String): Boolean = s.indexOf('\r') >= 0 || s.indexOf('\n') >= 0
 
-        fun isIpLiteral(host: String): Boolean {
-            val h = host.removePrefix("[").removeSuffix("]")
+        private fun isIpLiteral(host: String): Boolean {
+            val h = host.trim().removePrefix("[").removeSuffix("]")
+            if (h.isEmpty()) return false
             if (h.contains(':')) return true
             val parts = h.split('.')
             return parts.size == 4 && parts.all { it.toIntOrNull() in 0..255 }
@@ -180,13 +182,18 @@ class WsClient(
             "wss" -> true
             else -> throw IllegalArgumentException("unsupported websocket scheme '$scheme' (only ws:// and wss://)")
         }
-        val host = uri.host?.takeIf { it.isNotBlank() }
+        val rawHost = uri.host?.takeIf { it.isNotBlank() }
             ?: throw IllegalArgumentException("missing host in reverse ws url")
+        // 剥离 IPv6 字面量方括号(如 [::1] -> ::1),供 InetSocketAddress / TLS / HostnameVerifier 使用
+        val host = rawHost.trim().removePrefix("[").removeSuffix("]")
+        if (host.isEmpty()) {
+            throw IllegalArgumentException("missing host in reverse ws url")
+        }
         val port = if (uri.port > 0) uri.port else if (secure) 443 else 80
         if (port !in 1..65535) throw IllegalArgumentException("invalid port: $port")
         val path = (if (uri.rawPath.isNullOrEmpty()) "/" else uri.rawPath) +
             (if (uri.rawQuery.isNullOrEmpty()) "" else "?" + uri.rawQuery)
-        if (hasCrLf(host) || hasCrLf(path) || hasCrLf(accessToken)) {
+        if (hasCrLf(rawHost) || hasCrLf(host) || hasCrLf(path) || hasCrLf(accessToken)) {
             throw IllegalArgumentException("CR/LF not allowed in websocket handshake target or accessToken")
         }
 
@@ -335,6 +342,7 @@ class WsClient(
         }
     }
 
+    @RequiresApi(24)
     private fun configureTlsApi24(ssl: SSLSocket, host: String) {
         val params = ssl.sslParameters
         params.endpointIdentificationAlgorithm = "HTTPS"

@@ -34,9 +34,8 @@ abstract class PicoQrLoginHook : QrLoginFragment() {
 
     // LoginQrCodeStateCallback:二维码图片字节到达。混淆名随宿主版本漂移:官方 9.0.7(2563) 是 S,官方 9.0.1(2340) 是 J,NWear 9.0.3 改版是 P;
     // 认法:接口里唯一带 byte[] 参数的方法,体内是 ThreadManagerV2.excute。
-    override fun S(picBuf: ByteArray?) {
+    override fun S(picBuf: ByteArray) {
         super.S(picBuf)
-        if (picBuf == null) return
         try {
             PicoLoginManager.onQrReceived(this, picBuf)
         } catch (t: Throwable) {

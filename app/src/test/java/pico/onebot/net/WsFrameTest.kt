@@ -2,6 +2,7 @@ package pico.onebot.net
 
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
@@ -35,6 +36,22 @@ class WsFrameTest {
             WsFrame.MAX_LINE_BYTES,
             WsFrame.readLine(ByteArrayInputStream(maxLf.toByteArray(StandardCharsets.ISO_8859_1)))?.length
         )
+
+        // Exact 8192 bytes before CRLF succeeds (CR is line terminator, not line content)
+        val maxCrLf = "b".repeat(WsFrame.MAX_LINE_BYTES) + "\r\n"
+        assertEquals(
+            WsFrame.MAX_LINE_BYTES,
+            WsFrame.readLine(ByteArrayInputStream(maxCrLf.toByteArray(StandardCharsets.ISO_8859_1)))?.length
+        )
+
+        // 8193 bytes before CRLF exceeds MAX_LINE_BYTES -> LineTooLongException
+        val overCrLf = "b".repeat(WsFrame.MAX_LINE_BYTES + 1) + "\r\n"
+        try {
+            WsFrame.readLine(ByteArrayInputStream(overCrLf.toByteArray(StandardCharsets.ISO_8859_1)))
+            fail("Expected LineTooLongException for >8 KiB CRLF line")
+        } catch (_: WsFrame.LineTooLongException) {
+            // expected
+        }
 
         // 8193 bytes exceeds MAX_LINE_BYTES -> LineTooLongException
         val overLimit = "a".repeat(WsFrame.MAX_LINE_BYTES + 1) + "\n"
@@ -145,6 +162,16 @@ class WsFrameTest {
                 assertEquals(opcode, decoded.opcode)
                 assertArrayEquals(payload, decoded.payload)
             }
+        }
+    }
+
+    @Test
+    fun closeCodeValidationMatchesRfc6455Ranges() {
+        for (valid in listOf(1000, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014, 3000, 4000, 4999)) {
+            assertTrue("Expected valid close code $valid", WsFrame.isValidCloseCode(valid))
+        }
+        for (invalid in listOf(0, 999, 1004, 1005, 1006, 1015, 1016, 2000, 2999, 5000, 65535)) {
+            assertFalse("Expected invalid close code $invalid", WsFrame.isValidCloseCode(invalid))
         }
     }
 }

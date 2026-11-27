@@ -23,6 +23,7 @@ import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
 import java.security.SecureRandom
 import java.util.Locale
+import java.util.concurrent.Semaphore
 
 /**
  * WebUI 后端(端口 6099 的 `/api/…`)。契约见 docs/design §5.1,前端 `web/src/lib/api.ts` 为准。
@@ -37,6 +38,7 @@ object WebApi {
     private const val SESSION_CAP = 64
     private const val SESSION_IDLE_TTL_NS = 24L * 3600L * 1_000_000_000L
     private const val SESSION_ABS_TTL_NS = 7L * 24L * 3600L * 1_000_000_000L
+    private const val PRE_INIT_SESSION_TTL_NS = 10L * 60L * 1_000_000_000L
     const val MAX_LOG_STREAMS = 16
 
     // 鉴权失败限流与指数退避参数(单调时钟)
@@ -45,9 +47,15 @@ object WebApi {
     private const val AUTH_DECAY_NS = 15L * 60L * 1_000_000_000L
     private const val AUTH_MAX_LOCKOUT_MS = 300_000L
     private const val GLOBAL_PBKDF2_WINDOW_NS = 60L * 1_000_000_000L
-    private const val GLOBAL_PBKDF2_MAX_FAILS = 20
+    private const val GLOBAL_PBKDF2_MAX_FAILS = 100
+    private const val MAX_CONCURRENT_PBKDF2 = 3
 
-    private data class SessionEntry(val createdAtNanos: Long, var lastSeenAtNanos: Long)
+    private data class SessionEntry(
+        val createdAtNanos: Long,
+        var lastSeenAtNanos: Long,
+        val preInitOnly: Boolean = false
+    )
+    private data class SessionLookup(val epoch: Long, val preInitOnly: Boolean)
     private data class LogStreamEntry(val conn: WsConn, val sessionToken: String?)
     private data class AuthFailureState(
         var failures: Int = 0,
@@ -61,7 +69,17 @@ object WebApi {
         val sessionToken: String? = null,
         val rateLimited: Boolean = false,
         val retryAfterSec: Long = 0L,
-        val authEpoch: Long = 0L
+        val authEpoch: Long = 0L,
+        val preInitOnly: Boolean = false,
+        val rateLimitMessage: String? = null
+    )
+
+    internal data class PreAuthCheck(
+        val status: Int,
+        val message: String? = null,
+        val mustChangePassword: Boolean = false,
+        val isAuthenticatedSession: Boolean = false,
+        val expectedEpoch: Long? = null
     )
 
     /**
@@ -76,6 +94,7 @@ object WebApi {
     private val authFailures = LinkedHashMap<String, AuthFailureState>(64, 0.75f, true)
     private val globalFailWindow = ArrayDeque<Long>(GLOBAL_PBKDF2_MAX_FAILS + 1)
     private val authRateLock = Any()
+    private val pbkdf2Semaphore = Semaphore(MAX_CONCURRENT_PBKDF2)
 
     private val secureRandom = SecureRandom()
     private val fileWriteLock = Any()
@@ -109,15 +128,7 @@ object WebApi {
         val candidateNet = patch.optJSONObject("network") ?: if (validateNetworkFallback) Config.network() else null
         val errors = if (candidateNet != null) Config.validateNetwork(candidateNet).toMutableList() else mutableListOf()
         patch.optJSONObject("webui")?.let { w ->
-            if (w.has("host")) {
-                if (w.isNull("host") || w.optString("host", "").trim().isEmpty()) {
-                    errors.add("控制台监听地址不能为空")
-                }
-            }
-            if (w.has("port")) {
-                val p = if (w.isNull("port")) -1 else w.optInt("port", -1)
-                if (p !in 1..65535) errors.add("控制台端口必须在 1-65535 之间")
-            }
+            errors.addAll(Config.validateWebui(w))
         }
         fun checkWebuiDirHolder(obj: JSONObject?) {
             if (obj == null) return
@@ -160,6 +171,61 @@ object WebApi {
         else -> false
     }
 
+    internal fun isAllowedForPreInit(method: String, path: String): Boolean =
+        (path == "/api/status" && method == "GET") ||
+            (path == "/api/logout" && method == "POST") ||
+            (path == "/api/webui/token" && method == "PUT")
+
+    /**
+     * 读请求体前的廉价 O(1) 预检(不执行 PBKDF2,不免除读完 body 后的完整鉴权):
+     * - 无 Authorization 头立刻拒 401;
+     * - 单 IP 已锁定立刻拒 429;
+     * - 命中会话表时校验预初始化/恢复模式路由门禁并记录预期 sessionEpoch;
+     * - 未命中会话表时(可能是运维脚本直传密码或伪造令牌)交由调用方走未鉴权并发限流读体,再由 [handle] 完整校验。
+     */
+    internal fun preCheckRequest(
+        method: String,
+        path: String,
+        headers: Map<String, String>,
+        clientIp: String
+    ): PreAuthCheck {
+        val headerCred = extractBearer(headers["authorization"])
+        if (headerCred.isEmpty()) {
+            return PreAuthCheck(status = 401, message = "unauthorized")
+        }
+        val ipWaitSec = checkIpRateLimit(clientIp)
+        if (ipWaitSec > 0L) {
+            return PreAuthCheck(status = 429, message = "认证尝试过于频繁，请 ${ipWaitSec} 秒后再试")
+        }
+        val session = lookupSession(headerCred, touch = false)
+        if (session != null) {
+            if (Config.corruptRecoveryMode &&
+                ((path == "/api/config" && method == "PUT") || (path == "/api/webui/token" && method == "PUT"))
+            ) {
+                return PreAuthCheck(
+                    status = 409,
+                    message = "当前处于损坏配置恢复模式，拒绝覆盖 config.json；请先在文件管理器中修复并保存 config.json"
+                )
+            }
+            if (!Config.corruptRecoveryMode &&
+                (session.preInitOnly || !Config.webuiPasswordInitialized) &&
+                !isAllowedForPreInit(method, path)
+            ) {
+                return PreAuthCheck(
+                    status = 428,
+                    mustChangePassword = true,
+                    message = "首次使用必须先修改控制台密码"
+                )
+            }
+            return PreAuthCheck(
+                status = 200,
+                isAuthenticatedSession = true,
+                expectedEpoch = session.epoch
+            )
+        }
+        return PreAuthCheck(status = 200, isAuthenticatedSession = false, expectedEpoch = null)
+    }
+
     fun handle(
         method: String,
         path: String,
@@ -167,25 +233,28 @@ object WebApi {
         headers: Map<String, String>,
         body: ByteArray,
         clientIp: String = "unknown",
-        preAuthorized: Boolean = false
+        expectedSessionEpoch: Long? = null
     ): Response {
         // 登录不需要先有票据
         if (path == "/api/auth/login" && method == "POST") return login(body, clientIp)
 
-        // HTTP 路由仅接受 Authorization 头,不接受 ?token= 查询串认证(防 CSRF 与日志泄露);
-        // 若 HttpServer 读体前已完成预鉴权则直接复用,绝不对单次请求执行两次 PBKDF2。
-        if (!preAuthorized) {
-            val auth = checkAuthorization(headers, query, clientIp, allowQuerySession = false)
-            if (auth.rateLimited) {
-                return error(429, "认证尝试过于频繁，请 ${auth.retryAfterSec} 秒后再试")
-            }
-            if (!auth.authorized) {
-                return Response(401, JSONObject().put("ok", false).put("message", "unauthorized"))
-            }
+        // 读取完整请求体后始终重新校验 Session / sessionEpoch / mustChangePassword / IP 锁定,绝不使用 preAuthorized 旁路。
+        val auth = checkAuthorization(
+            headers,
+            query,
+            clientIp,
+            allowQuerySession = false,
+            expectedSessionEpoch = expectedSessionEpoch
+        )
+        if (auth.rateLimited) {
+            return error(429, auth.rateLimitMessage ?: "认证尝试过于频繁，请 ${auth.retryAfterSec} 秒后再试")
         }
-        if (!Config.webuiPasswordInitialized &&
-            !(path == "/api/webui/token" && method == "PUT") &&
-            !(path == "/api/logout" && method == "POST")
+        if (!auth.authorized) {
+            return Response(401, JSONObject().put("ok", false).put("message", "unauthorized"))
+        }
+        if (!Config.corruptRecoveryMode &&
+            (auth.preInitOnly || !Config.webuiPasswordInitialized) &&
+            !isAllowedForPreInit(method, path)
         ) {
             return Response(
                 428,
@@ -236,45 +305,92 @@ object WebApi {
         headers: Map<String, String>,
         query: Map<String, String>,
         clientIp: String,
-        allowQuerySession: Boolean
+        allowQuerySession: Boolean,
+        expectedSessionEpoch: Long? = null
     ): AuthCheck {
+        // 单 IP 触发锁定后连带阻断该 IP 的后续请求(含慢体期间触发锁定的写请求),但不因全局 PBKDF2 节流影响已登录会话
+        val ipWaitSec = checkIpRateLimit(clientIp)
+        if (ipWaitSec > 0L) {
+            return AuthCheck(authorized = false, rateLimited = true, retryAfterSec = ipWaitSec)
+        }
+
         val headerCred = extractBearer(headers["authorization"])
         val queryCred = if (allowQuerySession) (query["token"] ?: "") else ""
 
         // 1. 优先 O(1) 校验已签发的会话令牌(零 PBKDF2 开销)
         if (headerCred.isNotEmpty()) {
-            val epoch = lookupSessionEpoch(headerCred)
-            if (epoch != null) {
-                return AuthCheck(authorized = true, sessionToken = headerCred, authEpoch = epoch)
+            val found = lookupSession(headerCred, touch = true, expectedEpoch = expectedSessionEpoch)
+            if (found != null) {
+                return AuthCheck(
+                    authorized = true,
+                    sessionToken = headerCred,
+                    authEpoch = found.epoch,
+                    preInitOnly = found.preInitOnly
+                )
             }
         }
         if (queryCred.isNotEmpty()) {
-            val epoch = lookupSessionEpoch(queryCred)
-            if (epoch != null) {
-                return AuthCheck(authorized = true, sessionToken = queryCred, authEpoch = epoch)
+            val found = lookupSession(queryCred, touch = true, expectedEpoch = expectedSessionEpoch)
+            if (found != null) {
+                return AuthCheck(
+                    authorized = true,
+                    sessionToken = queryCred,
+                    authEpoch = found.epoch,
+                    preInitOnly = found.preInitOnly
+                )
             }
         }
 
-        // 2. 仅允许 Authorization 头回退校验密码(兼容运维脚本),且单请求最多跑一次 PBKDF2 并受限流保护;
+        // 2. 仅允许 Authorization 头回退校验密码(兼容运维脚本),受限流与 PBKDF2 并发信号量保护;
         //    绝不对 ?token= 查询串运行 PBKDF2。
         if (headerCred.isNotEmpty()) {
             val waitSec = checkAuthRateLimit(clientIp)
             if (waitSec > 0L) {
                 return AuthCheck(authorized = false, rateLimited = true, retryAfterSec = waitSec)
             }
-            val epochBefore = synchronized(sessionsLock) { sessionEpoch }
-            val initBefore = Config.webuiPasswordInitialized
-            if (Config.verifyWebuiPassword(headerCred)) {
+            val epochBefore: Long
+            val initBefore: Boolean
+            val recoveryBefore: Boolean
+            synchronized(sessionsLock) {
+                epochBefore = sessionEpoch
+                initBefore = Config.webuiPasswordInitialized
+                recoveryBefore = Config.corruptRecoveryMode
+            }
+            if (expectedSessionEpoch != null && epochBefore != expectedSessionEpoch) {
+                return AuthCheck(authorized = false)
+            }
+            val needsPbkdf2 = !recoveryBefore && initBefore
+            if (needsPbkdf2 && !pbkdf2Semaphore.tryAcquire()) {
+                return AuthCheck(
+                    authorized = false,
+                    rateLimited = true,
+                    retryAfterSec = 2L,
+                    rateLimitMessage = "认证服务繁忙，请稍后再试"
+                )
+            }
+            val verified = try {
+                Config.verifyWebuiPassword(headerCred)
+            } finally {
+                if (needsPbkdf2) pbkdf2Semaphore.release()
+            }
+            if (verified) {
                 val stillValid = synchronized(sessionsLock) {
-                    sessionEpoch == epochBefore && Config.webuiPasswordInitialized == initBefore
+                    sessionEpoch == epochBefore &&
+                        Config.webuiPasswordInitialized == initBefore &&
+                        Config.corruptRecoveryMode == recoveryBefore
                 }
                 if (!stillValid) {
                     return AuthCheck(authorized = false)
                 }
                 recordAuthSuccess(clientIp)
-                return AuthCheck(authorized = true, sessionToken = null, authEpoch = epochBefore)
+                return AuthCheck(
+                    authorized = true,
+                    sessionToken = null,
+                    authEpoch = epochBefore,
+                    preInitOnly = !recoveryBefore && !initBefore
+                )
             }
-            recordAuthFailure(clientIp)
+            recordAuthFailure(clientIp, countGlobal = needsPbkdf2)
         }
         return AuthCheck(authorized = false)
     }
@@ -284,15 +400,10 @@ object WebApi {
         return if (auth.startsWith("Bearer ", ignoreCase = true)) auth.substring(7) else auth
     }
 
-    private fun checkAuthRateLimit(clientIp: String): Long {
+    /** 仅检查单 IP 退避锁定(不影响全局兜底计数)。 */
+    private fun checkIpRateLimit(clientIp: String): Long {
         val now = System.nanoTime()
         synchronized(authRateLock) {
-            pruneGlobalFailuresLocked(now)
-            if (globalFailWindow.size >= GLOBAL_PBKDF2_MAX_FAILS) {
-                val oldest = globalFailWindow.first()
-                val remNs = ((oldest + GLOBAL_PBKDF2_WINDOW_NS) - now).coerceAtLeast(1_000_000_000L)
-                return (remNs + 999_999_999L) / 1_000_000_000L
-            }
             val state = authFailures[clientIp] ?: return 0L
             if ((now - state.lastFailureNanos) > AUTH_DECAY_NS) {
                 authFailures.remove(clientIp)
@@ -309,11 +420,39 @@ object WebApi {
         }
     }
 
-    private fun recordAuthFailure(clientIp: String) {
+    /** 单 IP 退避为主 + 全局 PBKDF2 兜底节流(仅针对密码验证)。 */
+    private fun checkAuthRateLimit(clientIp: String): Long {
         val now = System.nanoTime()
         synchronized(authRateLock) {
+            val state = authFailures[clientIp]
+            if (state != null) {
+                if ((now - state.lastFailureNanos) > AUTH_DECAY_NS) {
+                    authFailures.remove(clientIp)
+                } else if (state.hasLockout) {
+                    val remNs = state.lockedUntilNanos - now
+                    if (remNs > 0L) {
+                        return ((remNs + 999_999_999L) / 1_000_000_000L).coerceAtLeast(1L)
+                    }
+                    state.hasLockout = false
+                }
+            }
             pruneGlobalFailuresLocked(now)
-            globalFailWindow.addLast(now)
+            if (globalFailWindow.size >= GLOBAL_PBKDF2_MAX_FAILS) {
+                val oldest = globalFailWindow.first()
+                val remNs = ((oldest + GLOBAL_PBKDF2_WINDOW_NS) - now).coerceAtLeast(1_000_000_000L)
+                return (remNs + 999_999_999L) / 1_000_000_000L
+            }
+            return 0L
+        }
+    }
+
+    private fun recordAuthFailure(clientIp: String, countGlobal: Boolean) {
+        val now = System.nanoTime()
+        synchronized(authRateLock) {
+            if (countGlobal) {
+                pruneGlobalFailuresLocked(now)
+                globalFailWindow.addLast(now)
+            }
             val state = authFailures[clientIp] ?: AuthFailureState().also {
                 while (authFailures.size >= MAX_AUTH_TRACKED_IPS) {
                     val it = authFailures.entries.iterator()
@@ -352,64 +491,96 @@ object WebApi {
     }
 
     private fun login(body: ByteArray, clientIp: String): Response {
-        val token = try {
-            JSONObject(String(body, Charsets.UTF_8)).optString("token", "")
+        val req = try {
+            JSONObject(String(body, Charsets.UTF_8))
         } catch (_: Throwable) {
             return error(400, "请求内容不是合法 JSON")
         }
-        if (token.isNotEmpty() && hasSession(token)) {
-            return loginResponse(token)
+        val ipWaitSec = checkIpRateLimit(clientIp)
+        if (ipWaitSec > 0L) {
+            return error(429, "登录失败次数过多，请 ${ipWaitSec} 秒后再试")
+        }
+        val rawToken = req.opt("token")
+        val token = rawToken as? String ?: ""
+        if (token.isEmpty()) {
+            // 空值或畸形 token 仅计入单 IP 退避,绝不计入 globalFailWindow 防止全局 DoS 锁死
+            recordAuthFailure(clientIp, countGlobal = false)
+            return Response(401, JSONObject().put("ok", false).put("message", "密码不正确或会话已失效"))
+        }
+        val existing = lookupSession(token, touch = true)
+        if (existing != null) {
+            val recovery = Config.corruptRecoveryMode
+            val mustChange = !recovery && (existing.preInitOnly || !Config.webuiPasswordInitialized)
+            return loginResponse(token, mustChangePassword = mustChange, recoveryMode = recovery)
         }
         val waitSec = checkAuthRateLimit(clientIp)
         if (waitSec > 0L) {
             return error(429, "登录失败次数过多，请 ${waitSec} 秒后再试")
         }
-        val epochBefore = synchronized(sessionsLock) { sessionEpoch }
-        val initBefore = Config.webuiPasswordInitialized
-        if (token.isNotEmpty() && Config.verifyWebuiPassword(token)) {
-            val session = newSessionIfEpoch(epochBefore, initBefore)
+        val epochBefore: Long
+        val initBefore: Boolean
+        val recoveryBefore: Boolean
+        synchronized(sessionsLock) {
+            epochBefore = sessionEpoch
+            initBefore = Config.webuiPasswordInitialized
+            recoveryBefore = Config.corruptRecoveryMode
+        }
+        val needsPbkdf2 = !recoveryBefore && initBefore
+        if (needsPbkdf2 && !pbkdf2Semaphore.tryAcquire()) {
+            return error(429, "认证服务繁忙，请稍后再试")
+        }
+        val verified = try {
+            Config.verifyWebuiPassword(token)
+        } finally {
+            if (needsPbkdf2) pbkdf2Semaphore.release()
+        }
+        if (verified) {
+            val preInit = !recoveryBefore && !initBefore
+            val session = newSessionIfState(epochBefore, initBefore, recoveryBefore, preInitOnly = preInit)
                 ?: return Response(401, JSONObject().put("ok", false).put("message", "密码已变更，请使用新密码重新登录"))
             recordAuthSuccess(clientIp)
-            return loginResponse(session, !initBefore)
+            return loginResponse(session, mustChangePassword = preInit, recoveryMode = recoveryBefore)
         }
-        recordAuthFailure(clientIp)
+        recordAuthFailure(clientIp, countGlobal = needsPbkdf2)
         return Response(401, JSONObject().put("ok", false).put("message", "密码不正确或会话已失效"))
     }
 
     private fun loginResponse(
         session: String,
-        mustChangePassword: Boolean = !Config.webuiPasswordInitialized
+        mustChangePassword: Boolean = !Config.corruptRecoveryMode && !Config.webuiPasswordInitialized,
+        recoveryMode: Boolean = Config.corruptRecoveryMode
     ): Response =
         Response(
             200, JSONObject()
                 .put("ok", true)
                 .put("token", session)
                 .put("mustChangePassword", mustChangePassword)
+                .put("recoveryMode", recoveryMode)
         )
 
-    private fun newSession(): String {
+    private fun generateSessionToken(): String {
         val bytes = ByteArray(32).also { secureRandom.nextBytes(it) }
-        val session = Base64.encodeToString(bytes, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
-        val now = System.nanoTime()
-        val evictedStreams = ArrayList<WsConn>()
-        synchronized(sessionsLock) {
-            insertSessionLocked(session, now, evictedStreams)
-        }
-        for (c in evictedStreams) c.close()
-        return session
+        return Base64.encodeToString(bytes, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
     }
 
-    /** 仅当会话代际与初始化状态均未变更时才签发新会话,彻底消除登录与改密/初始化的 TOCTOU 会话固定。 */
-    private fun newSessionIfEpoch(expectedEpoch: Long, expectedInitialized: Boolean): String? {
-        val bytes = ByteArray(32).also { secureRandom.nextBytes(it) }
-        val session = Base64.encodeToString(bytes, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+    /** 仅当会话代际、初始化状态与恢复模式均未变更时才签发新会话,彻底消除登录与改密/初始化的 TOCTOU 会话固定。 */
+    private fun newSessionIfState(
+        expectedEpoch: Long,
+        expectedInitialized: Boolean,
+        expectedRecoveryMode: Boolean,
+        preInitOnly: Boolean
+    ): String? {
+        val session = generateSessionToken()
         val now = System.nanoTime()
         val evictedStreams = ArrayList<WsConn>()
         val minted = synchronized(sessionsLock) {
-            if (sessionEpoch != expectedEpoch || Config.webuiPasswordInitialized != expectedInitialized) {
+            if (sessionEpoch != expectedEpoch ||
+                Config.webuiPasswordInitialized != expectedInitialized ||
+                Config.corruptRecoveryMode != expectedRecoveryMode
+            ) {
                 false
             } else {
-                insertSessionLocked(session, now, evictedStreams)
+                insertSessionLocked(session, now, preInitOnly, evictedStreams)
                 true
             }
         }
@@ -417,7 +588,12 @@ object WebApi {
         return if (minted) session else null
     }
 
-    private fun insertSessionLocked(session: String, now: Long, evictedStreams: MutableList<WsConn>) {
+    private fun insertSessionLocked(
+        session: String,
+        now: Long,
+        preInitOnly: Boolean,
+        evictedStreams: MutableList<WsConn>
+    ) {
         pruneExpiredSessionsLocked(now, evictedStreams)
         while (sessions.size >= SESSION_CAP) {
             val oldest = sessions.keys.iterator()
@@ -426,37 +602,45 @@ object WebApi {
             oldest.remove()
             collectStreamsForSessionLocked(evictedToken, evictedStreams)
         }
-        sessions[session] = SessionEntry(now, now)
+        sessions[session] = SessionEntry(now, now, preInitOnly)
     }
 
-    private fun hasSession(token: String): Boolean = lookupSessionEpoch(token) != null
-
-    private fun lookupSessionEpoch(token: String): Long? {
+    private fun lookupSession(
+        token: String,
+        touch: Boolean,
+        expectedEpoch: Long? = null
+    ): SessionLookup? {
         val now = System.nanoTime()
         val expiredStreams = ArrayList<WsConn>()
-        val epoch = synchronized(sessionsLock) {
-            val entry = sessions[token] ?: return null
-            if (isExpired(entry, now)) {
+        val result = synchronized(sessionsLock) {
+            if (expectedEpoch != null && sessionEpoch != expectedEpoch) return@synchronized null
+            val entry = sessions[token] ?: return@synchronized null
+            if (isExpired(entry, now) || (entry.preInitOnly && Config.webuiPasswordInitialized)) {
                 sessions.remove(token)
                 collectStreamsForSessionLocked(token, expiredStreams)
                 null
             } else {
-                entry.lastSeenAtNanos = now
-                sessionEpoch
+                if (touch) entry.lastSeenAtNanos = now
+                SessionLookup(sessionEpoch, entry.preInitOnly)
             }
         }
         for (c in expiredStreams) c.close()
-        return epoch
+        return result
     }
 
-    private fun isExpired(entry: SessionEntry, now: Long): Boolean =
-        ((now - entry.lastSeenAtNanos) > SESSION_IDLE_TTL_NS) || ((now - entry.createdAtNanos) > SESSION_ABS_TTL_NS)
+    private fun isExpired(entry: SessionEntry, now: Long): Boolean {
+        if (entry.preInitOnly) {
+            return (now - entry.createdAtNanos) > PRE_INIT_SESSION_TTL_NS
+        }
+        return ((now - entry.lastSeenAtNanos) > SESSION_IDLE_TTL_NS) ||
+            ((now - entry.createdAtNanos) > SESSION_ABS_TTL_NS)
+    }
 
     private fun pruneExpiredSessionsLocked(now: Long, toClose: MutableList<WsConn>) {
         val it = sessions.entries.iterator()
         while (it.hasNext()) {
             val e = it.next()
-            if (isExpired(e.value, now)) {
+            if (isExpired(e.value, now) || (e.value.preInitOnly && Config.webuiPasswordInitialized)) {
                 it.remove()
                 collectStreamsForSessionLocked(e.key, toClose)
             }
@@ -484,15 +668,13 @@ object WebApi {
         for (c in toClose) c.close()
     }
 
-    private fun clearSessions() {
-        val toClose: List<WsConn>
-        synchronized(sessionsLock) {
-            sessionEpoch++
-            sessions.clear()
-            toClose = logStreams.map { it.conn }
-            logStreams.clear()
+    private fun revokeAllSessionsLocked(toClose: MutableList<WsConn>) {
+        sessionEpoch++
+        sessions.clear()
+        for (entry in logStreams) {
+            toClose.add(entry.conn)
         }
-        for (c in toClose) c.close()
+        logStreams.clear()
     }
 
     internal fun logStreamCount(): Int = synchronized(sessionsLock) {
@@ -505,11 +687,11 @@ object WebApi {
         val expiredStreams = ArrayList<WsConn>()
         val registered = synchronized(sessionsLock) {
             logStreams.removeAll { it.conn.closed }
-            if (!Config.webuiPasswordInitialized) return@synchronized false
+            if (!Config.webuiPasswordInitialized && !Config.corruptRecoveryMode) return@synchronized false
             if (sessionEpoch != expectedEpoch) return@synchronized false
             if (sessionToken != null) {
                 val entry = sessions[sessionToken]
-                if (entry == null) return@synchronized false
+                if (entry == null || entry.preInitOnly) return@synchronized false
                 if (isExpired(entry, now)) {
                     sessions.remove(sessionToken)
                     collectStreamsForSessionLocked(sessionToken, expiredStreams)
@@ -522,6 +704,28 @@ object WebApi {
         }
         for (c in expiredStreams) c.close()
         return registered
+    }
+
+    /** 校验空闲/推送中的日志流会话是否仍有效(不刷新 lastSeenAtNanos,避免空闲 WS 无限续期)。 */
+    internal fun isLogStreamSessionValid(sessionToken: String?, expectedEpoch: Long): Boolean {
+        val now = System.nanoTime()
+        val expiredStreams = ArrayList<WsConn>()
+        val valid = synchronized(sessionsLock) {
+            if (sessionEpoch != expectedEpoch) return@synchronized false
+            if (!Config.webuiPasswordInitialized && !Config.corruptRecoveryMode) return@synchronized false
+            if (sessionToken != null) {
+                val entry = sessions[sessionToken] ?: return@synchronized false
+                if (entry.preInitOnly) return@synchronized false
+                if (isExpired(entry, now)) {
+                    sessions.remove(sessionToken)
+                    collectStreamsForSessionLocked(sessionToken, expiredStreams)
+                    return@synchronized false
+                }
+            }
+            true
+        }
+        for (c in expiredStreams) c.closeAsync(1008)
+        return valid
     }
 
     internal fun unregisterLogStream(conn: WsConn) {
@@ -578,6 +782,7 @@ object WebApi {
             .put("lastHeartbeat", MetaEvents.lastHeartbeatAt)
             .put("webuiUrl", NetUtil.webuiUrl())
             .put("lanIp", NetUtil.lanIp() ?: "")
+            .put("recoveryMode", Config.corruptRecoveryMode)
     }
 
     private fun selfNick(): String = try {
@@ -672,6 +877,9 @@ object WebApi {
     }
 
     private fun putConfig(body: ByteArray): Response = synchronized(fileWriteLock) {
+        if (Config.corruptRecoveryMode) {
+            return error(409, "当前处于损坏配置恢复模式，拒绝覆盖 config.json；请先在文件管理器中修复并保存 config.json")
+        }
         val patch = try {
             JSONObject(String(body, Charsets.UTF_8))
         } catch (_: JSONException) {
@@ -694,6 +902,8 @@ object WebApi {
         val previous = Config.raw().toString()
         try {
             Config.applyAppConfig(patch)
+        } catch (err: IllegalStateException) {
+            return error(409, err.message ?: "当前处于损坏配置恢复模式")
         } catch (err: IllegalArgumentException) {
             return error(400, err.message ?: "配置无效")
         }
@@ -825,17 +1035,19 @@ object WebApi {
         val savedModifiedAt: Long
         val savedRelPath: String
 
+        val streamsToClose = ArrayList<WsConn>()
         synchronized(fileWriteLock) {
             val target = resolveManagedPath(rawPath)
                 ?: return error(400, "文件路径无效")
             if (isBlockedManagedPath(target)) {
                 return error(403, "不允许通过文件管理器修改受保护文件或 webui 静态资源")
             }
-            if (!target.isFile) return error(404, "文件不存在")
-            if (!isEditableText(target)) {
+            val activeConfig = isActiveConfigFile(target)
+            val allowCreateInRecovery = activeConfig && Config.corruptRecoveryMode && !target.exists()
+            if (!target.isFile && !allowCreateInRecovery) return error(404, "文件不存在")
+            if (target.isFile && !isEditableText(target)) {
                 return error(415, "仅支持编辑不超过 1 MiB 的 UTF-8 文本文件")
             }
-            val activeConfig = isActiveConfigFile(target)
             if (target.extension.equals("json", ignoreCase = true)) {
                 try {
                     if (activeConfig) JSONObject(content) else org.json.JSONTokener(content).nextValue()
@@ -843,7 +1055,7 @@ object WebApi {
                     return error(400, "JSON 格式错误: " + t.message)
                 }
             }
-            if (expectedModifiedAt >= 0 && target.lastModified() != expectedModifiedAt) {
+            if (target.isFile && expectedModifiedAt >= 0 && target.lastModified() != expectedModifiedAt) {
                 return error(409, "文件已被其他程序修改，请重新加载后再保存")
             }
             try {
@@ -853,11 +1065,23 @@ object WebApi {
                     if (errors.isNotEmpty()) {
                         return error(400, "配置无效: " + errors.joinToString("；"))
                     }
-                    // 保留既有密码认证状态,禁止通过文件编辑绕过改密或降级密码策略
-                    preserveConfigAuthFields(candidate)
                     val previous = Config.raw().toString()
-                    Config.replaceConfig(candidate)
+                    val wasCorruptRecovery = Config.corruptRecoveryMode
+                    // Config.replaceConfig 在锁内还原 "***" 连接密钥、保留既有密码哈希并清除恢复模式
+                    Config.replaceConfig(candidate) { commitRoot ->
+                        if (wasCorruptRecovery) {
+                            synchronized(sessionsLock) {
+                                commitRoot()
+                                revokeAllSessionsLocked(streamsToClose)
+                            }
+                        } else {
+                            commitRoot()
+                        }
+                    }
                     runtime = applyRuntimeConfig(previous)
+                    if (wasCorruptRecovery) {
+                        PicoLog.i("corrupt config recovery mode cleared after restoring config.json; recovery sessions revoked")
+                    }
                 } else {
                     writeFileAtomically(target, bytes)
                 }
@@ -871,6 +1095,7 @@ object WebApi {
             savedModifiedAt = target.lastModified()
             savedRelPath = relativePath(target) ?: target.name
         }
+        for (c in streamsToClose) c.close()
 
         PicoLog.i("file updated via webui: $savedRelPath")
         return Response(
@@ -907,22 +1132,6 @@ object WebApi {
                 Regex("\"(passwordSalt|passwordHash|token)\"\\s*:\\s*\"[^\"]*\""),
                 "\"$1\": \"***\""
             )
-        }
-    }
-
-    private fun preserveConfigAuthFields(candidate: JSONObject) {
-        val curWebui = Config.webui()
-        val nextWebui = candidate.optJSONObject("webui") ?: JSONObject().also { candidate.put("webui", it) }
-        nextWebui.remove("token")
-        nextWebui.remove("tokenIsDefault")
-        if (Config.webuiPasswordInitialized) {
-            nextWebui.put("passwordInitialized", true)
-            nextWebui.put("passwordSalt", curWebui.optString("passwordSalt", ""))
-            nextWebui.put("passwordHash", curWebui.optString("passwordHash", ""))
-        } else {
-            nextWebui.put("passwordInitialized", false)
-            nextWebui.remove("passwordSalt")
-            nextWebui.remove("passwordHash")
         }
     }
 
@@ -1084,6 +1293,9 @@ object WebApi {
     }
 
     private fun setToken(body: ByteArray, clientIp: String): Response {
+        if (Config.corruptRecoveryMode) {
+            return error(409, "当前处于损坏配置恢复模式，拒绝覆盖 config.json；请先在文件管理器中修复并保存 config.json")
+        }
         val req = try {
             JSONObject(String(body, Charsets.UTF_8))
         } catch (_: Throwable) {
@@ -1109,34 +1321,78 @@ object WebApi {
             if (current.isEmpty()) {
                 return Response(400, JSONObject().put("ok", false).put("message", "修改密码需要提供当前密码"))
             }
-            if (!Config.changeWebuiPassword(current, token)) {
-                recordAuthFailure(clientIp)
-                return Response(403, JSONObject().put("ok", false).put("message", "当前密码不正确"))
+            if (!pbkdf2Semaphore.tryAcquire()) {
+                return error(429, "认证服务繁忙，请稍后再试")
             }
-            recordAuthSuccess(clientIp)
-            // 改密后让所有已签发的会话与日志流失效,旧浏览器需重新登录
-            clearSessions()
-            PicoLog.i("webui password changed")
-            return Response(200, JSONObject().put("ok", true).put("sessionsRevoked", true))
+            val toClose = ArrayList<WsConn>()
+            val result = try {
+                Config.changeWebuiPassword(current, token) { commitRoot ->
+                    synchronized(sessionsLock) {
+                        commitRoot()
+                        revokeAllSessionsLocked(toClose)
+                    }
+                }
+            } finally {
+                pbkdf2Semaphore.release()
+            }
+            for (c in toClose) c.close()
+            return when (result) {
+                Config.PasswordChangeResult.OK -> {
+                    recordAuthSuccess(clientIp)
+                    PicoLog.i("webui password changed; all sessions revoked")
+                    Response(200, JSONObject().put("ok", true).put("sessionsRevoked", true))
+                }
+                Config.PasswordChangeResult.INVALID_CURRENT -> {
+                    recordAuthFailure(clientIp, countGlobal = true)
+                    Response(403, JSONObject().put("ok", false).put("message", "当前密码不正确"))
+                }
+                Config.PasswordChangeResult.CORRUPT_RECOVERY_MODE ->
+                    error(409, "当前处于损坏配置恢复模式，拒绝覆盖 config.json；请先在文件管理器中修复并保存 config.json")
+                Config.PasswordChangeResult.NOT_INITIALIZED ->
+                    error(409, "控制台密码尚未初始化，请刷新页面重新设置")
+                Config.PasswordChangeResult.PERSIST_FAILED ->
+                    error(500, "保存控制台密码失败，请检查存储空间或权限")
+            }
         }
-        if (!Config.initializeWebuiPassword(token)) {
-            return if (Config.webuiPasswordInitialized) {
+        if (!pbkdf2Semaphore.tryAcquire()) {
+            return error(429, "认证服务繁忙，请稍后再试")
+        }
+        val toClose = ArrayList<WsConn>()
+        var newToken: String? = null
+        val initResult = try {
+            Config.initializeWebuiPassword(token) { commitRoot ->
+                val fresh = generateSessionToken()
+                val now = System.nanoTime()
+                synchronized(sessionsLock) {
+                    commitRoot()
+                    // 原子撤销所有预初始化会话并推进 sessionEpoch,再签发常规会话令牌
+                    revokeAllSessionsLocked(toClose)
+                    insertSessionLocked(fresh, now, preInitOnly = false, evictedStreams = toClose)
+                    newToken = fresh
+                }
+            }
+        } finally {
+            pbkdf2Semaphore.release()
+        }
+        for (c in toClose) c.close()
+        return when (initResult) {
+            Config.PasswordInitResult.OK -> {
+                PicoLog.i("webui password initialized; pre-init sessions revoked")
+                Response(
+                    200,
+                    JSONObject()
+                        .put("ok", true)
+                        .put("token", newToken ?: "")
+                        .put("sessionsRevoked", true)
+                )
+            }
+            Config.PasswordInitResult.ALREADY_INITIALIZED ->
                 Response(409, JSONObject().put("ok", false).put("message", "控制台密码已设置，不允许再次修改"))
-            } else {
+            Config.PasswordInitResult.CORRUPT_RECOVERY_MODE ->
+                error(409, "当前处于损坏配置恢复模式，拒绝覆盖 config.json；请先在文件管理器中修复并保存 config.json")
+            Config.PasswordInitResult.PERSIST_FAILED ->
                 error(500, "保存控制台密码失败，请检查存储空间或权限")
-            }
         }
-        // 首次初始化密码必须撤销所有预初始化会话并轮换签发新会话令牌,封堵会话固定
-        clearSessions()
-        val newToken = newSession()
-        PicoLog.i("webui password initialized; pre-init sessions revoked")
-        return Response(
-            200,
-            JSONObject()
-                .put("ok", true)
-                .put("token", newToken)
-                .put("sessionsRevoked", true)
-        )
     }
 
     /** 二维码 TTL(秒),与 PicoLoginManager.info() 的过期判定一致。 */
@@ -1177,6 +1433,8 @@ object WebApi {
         val snap = PicoLoginManager.currentQrSnapshot()
         val url = snap.url ?: ""
         val bytes = snap.bytes
+        val hasImage = bytes != null && bytes.isNotEmpty()
+        val hasQr = url.isNotEmpty() || hasImage
         val age = if (snap.receivedAtWallMs <= 0L) {
             -1
         } else {
@@ -1184,11 +1442,11 @@ object WebApi {
         }
         val expired = snap.expired || (age > QR_TTL_SEC)
         val status = when {
-            url.isEmpty() -> "waiting_qr"
+            !hasQr -> "waiting_qr"
             expired -> "expired"
             else -> "ok"
         }
-        val image = if (status == "ok" && bytes != null)
+        val image = if (status == "ok" && bytes != null && bytes.isNotEmpty())
             "data:" + imageMime(bytes) + ";base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
         else ""
         return out.put("status", status).put("online", false)
