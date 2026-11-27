@@ -406,7 +406,7 @@ object KernelGate {
             pico.onebot.media.MediaDownloader.reset()
             pico.onebot.media.MediaFiles.clearServed()
             PicoLoginManager.clearQr()
-            // TODO(pr4-merge): wire pico.onebot.net.Transport.clearReplay() here after merging Transport.clearReplay()
+            pico.onebot.net.Transport.clearReplay()
             for (hook in sessionLostHooks) {
                 try {
                     hook()
