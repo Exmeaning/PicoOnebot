@@ -12,26 +12,36 @@ import java.util.zip.ZipFile
 import java.util.zip.ZipOutputStream
 
 object ZipUtil {
-    fun addOrReplaceFilesInZip(zipFile: File, filesToAdd: Map<String, File>) {
+    fun addOrReplaceFilesInZip(
+        zipFile: File,
+        filesToAdd: Map<String, File>,
+        removePredicate: (String) -> Boolean = { false }
+    ) {
         val tempFile = File.createTempFile("tempZip", ".zip", zipFile.parentFile)
         val originalStoredEntries = mutableSetOf<String>()
 
         try {
             ZipOutputStream(FileOutputStream(tempFile).buffered()).use { zos ->
-                // 处理原始 ZIP 条目，跳过需替换的文件，并保留 STORED 条目的无压缩方式与校验信息
+                // 处理原始 ZIP 条目，跳过需替换/剔除的文件，并保留 STORED 条目的无压缩方式、对齐 extra 与校验信息
                 ZipFile(zipFile).use { zip ->
                     zip.entries().asSequence().forEach { entry ->
                         if (filesToAdd.containsKey(entry.name)) {
                             if (entry.method == ZipEntry.STORED) {
                                 originalStoredEntries.add(entry.name)
                             }
+                        } else if (removePredicate(entry.name)) {
+                            // 剔除已失效的旧条目（例如多 DEX 数量缩减后的冗余 classes(M+1..K).dex）
                         } else if (entry.method == ZipEntry.STORED) {
+                            val preservedExtra = entry.extra?.let(::stripExtendedTimestampExtra)
                             if (entry.size >= 0 && entry.crc >= 0) {
                                 zos.putNextEntry(ZipEntry(entry.name).apply {
                                     method = ZipEntry.STORED
                                     size = entry.size
                                     compressedSize = entry.size
                                     crc = entry.crc
+                                    if (preservedExtra != null && preservedExtra.isNotEmpty()) {
+                                        extra = preservedExtra
+                                    }
                                     time = 0L
                                     comment = entry.comment
                                 })
@@ -47,6 +57,9 @@ object ZipUtil {
                                     size = bytes.size.toLong()
                                     compressedSize = bytes.size.toLong()
                                     crc = crc32.value
+                                    if (preservedExtra != null && preservedExtra.isNotEmpty()) {
+                                        extra = preservedExtra
+                                    }
                                     time = 0L
                                     comment = entry.comment
                                 })
@@ -110,6 +123,27 @@ object ZipUtil {
             tempFile.delete()
             throw e
         }
+    }
+
+    private fun stripExtendedTimestampExtra(raw: ByteArray): ByteArray {
+        val out = ArrayList<Byte>(raw.size)
+        var offset = 0
+        while (offset + 4 <= raw.size) {
+            val headerId = (raw[offset].toInt() and 0xFF) or ((raw[offset + 1].toInt() and 0xFF) shl 8)
+            val dataLen = (raw[offset + 2].toInt() and 0xFF) or ((raw[offset + 3].toInt() and 0xFF) shl 8)
+            val next = offset + 4 + dataLen
+            if (next > raw.size) {
+                // Non-standard trailing alignment bytes (e.g. raw zero padding): preserve verbatim
+                for (i in offset until raw.size) out.add(raw[i])
+                return out.toByteArray()
+            }
+            if (headerId != 0x5455 && headerId != 0x5855) {
+                for (i in offset until next) out.add(raw[i])
+            }
+            offset = next
+        }
+        for (i in offset until raw.size) out.add(raw[i])
+        return out.toByteArray()
     }
 
     private fun computeCrc32(file: File): Long {

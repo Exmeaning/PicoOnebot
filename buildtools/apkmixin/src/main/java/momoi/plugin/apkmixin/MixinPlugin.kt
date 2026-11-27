@@ -130,13 +130,12 @@ class MixinPlugin : Plugin<Project> {
 
             lifecycle("Signing...")
             try {
-                ApkSignerTool.main(arrayOf(
-                    "sign",
-                    "--key", keyFile.absolutePath,
-                    "--cert", certFile.absolutePath,
-                    "--out", signedApkFile.absolutePath,
-                    apkToSign.absolutePath
-                ))
+                runApkSigner(
+                    keyFile = keyFile,
+                    certFile = certFile,
+                    inputApk = apkToSign,
+                    outputApk = signedApkFile
+                )
             } finally {
                 if (alignedApkFile != null && alignedApkFile.exists()) {
                     alignedApkFile.delete()
@@ -147,10 +146,40 @@ class MixinPlugin : Plugin<Project> {
         }
     }
 
+    private fun runApkSigner(keyFile: File, certFile: File, inputApk: File, outputApk: File) {
+        val apksignerLocation = ApkSignerTool::class.java.protectionDomain?.codeSource?.location
+            ?: throw IOException("Cannot locate apksigner.jar on plugin classpath")
+        val apksignerJar = File(apksignerLocation.toURI())
+        val isWindows = System.getProperty("os.name").lowercase().contains("win")
+        val javaExe = File(System.getProperty("java.home"), if (isWindows) "bin/java.exe" else "bin/java")
+        val javaCmd = if (javaExe.isFile) javaExe.absolutePath else "java"
+
+        // 在独立子 JVM 进程中调用 ApkSignerTool，防止失败时 System.exit(1) 杀死 Gradle Daemon 并跳过 finally 清理
+        val process = ProcessBuilder(
+            javaCmd,
+            "-cp", apksignerJar.absolutePath,
+            ApkSignerTool::class.java.name,
+            "sign",
+            "--key", keyFile.absolutePath,
+            "--cert", certFile.absolutePath,
+            "--out", outputApk.absolutePath,
+            inputApk.absolutePath
+        ).redirectErrorStream(true).start()
+        val output = process.inputStream.bufferedReader().readText()
+        val exitCode = process.waitFor()
+        if (exitCode != 0) {
+            outputApk.delete()
+            throw IOException("apksigner failed with exit code $exitCode:\n$output")
+        }
+    }
+
     private fun alignApkIfAvailable(project: Project, unsignedApkFile: File): File? {
         val zipalign = findZipalignExecutable(project)
         if (zipalign == null) {
-            lifecycle("zipalign not found in Android SDK build-tools or PATH; signing without zipalign")
+            project.logger.warn(
+                "WARNING: zipalign not found in Android SDK build-tools or PATH; " +
+                    "signing without zipalign (resulting APK may fail install on Android 11+)"
+            )
             return null
         }
         val alignedFile = File(unsignedApkFile.parentFile, "${unsignedApkFile.nameWithoutExtension}.aligned.apk")
@@ -195,7 +224,7 @@ class MixinPlugin : Plugin<Project> {
             if (!buildToolsDir.isDirectory) continue
             val candidate = buildToolsDir.listFiles()
                 ?.filter { it.isDirectory }
-                ?.sortedByDescending { it.name }
+                ?.sortedWith { a, b -> compareBuildToolsVersion(b.name, a.name) }
                 ?.map { File(it, exeName) }
                 ?.firstOrNull { it.isFile && it.canExecute() }
             if (candidate != null) return candidate
@@ -251,6 +280,54 @@ class MixinPlugin : Plugin<Project> {
               "minSdkVersionForDexing": 24
             }
         """.trimIndent())
+    }
+
+    internal companion object {
+        private val PRE_RELEASE_TOKEN_REGEX = Regex("\\d+|\\D+")
+
+        internal fun compareBuildToolsVersion(a: String, b: String): Int {
+            val aDash = a.indexOf('-')
+            val bDash = b.indexOf('-')
+            val aCore = (if (aDash >= 0) a.substring(0, aDash) else a).split('.')
+            val bCore = (if (bDash >= 0) b.substring(0, bDash) else b).split('.')
+            val maxLen = maxOf(aCore.size, bCore.size)
+            for (i in 0 until maxLen) {
+                val aPart = aCore.getOrNull(i) ?: "0"
+                val bPart = bCore.getOrNull(i) ?: "0"
+                val aNum = aPart.toLongOrNull()
+                val bNum = bPart.toLongOrNull()
+                val cmp = if (aNum != null && bNum != null) {
+                    aNum.compareTo(bNum)
+                } else {
+                    aPart.compareTo(bPart)
+                }
+                if (cmp != 0) return cmp
+            }
+            val aPre = if (aDash >= 0) a.substring(aDash + 1) else null
+            val bPre = if (bDash >= 0) b.substring(bDash + 1) else null
+            if (aPre == null && bPre != null) return 1
+            if (aPre != null && bPre == null) return -1
+            if (aPre != null && bPre != null) {
+                val preCmp = comparePreRelease(aPre, bPre)
+                if (preCmp != 0) return preCmp
+            }
+            return a.compareTo(b)
+        }
+
+        private fun comparePreRelease(a: String, b: String): Int {
+            val aTokens = PRE_RELEASE_TOKEN_REGEX.findAll(a).map { it.value }.toList()
+            val bTokens = PRE_RELEASE_TOKEN_REGEX.findAll(b).map { it.value }.toList()
+            val minLen = minOf(aTokens.size, bTokens.size)
+            for (i in 0 until minLen) {
+                val at = aTokens[i]
+                val bt = bTokens[i]
+                val an = at.toLongOrNull()
+                val bn = bt.toLongOrNull()
+                val cmp = if (an != null && bn != null) an.compareTo(bn) else at.compareTo(bt)
+                if (cmp != 0) return cmp
+            }
+            return aTokens.size.compareTo(bTokens.size)
+        }
     }
 }
 

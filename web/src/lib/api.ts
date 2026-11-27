@@ -100,6 +100,16 @@ export function getBaseUrl(): string {
   return getStoredBaseUrl() || window.location.origin;
 }
 
+export function isCrossOriginBaseUrl(raw: string): boolean {
+  const checked = normalizeBaseUrl(raw);
+  if (!checked.ok || !checked.url) return false;
+  try {
+    return new URL(checked.url).origin !== window.location.origin;
+  } catch {
+    return false;
+  }
+}
+
 export function setBaseUrl(url: string): void {
   const checked = normalizeBaseUrl(url);
   if (!checked.ok) throw new Error(checked.error);
@@ -559,9 +569,9 @@ async function http<T>(path: string, init: RequestInit, options: HttpOptions<T>)
   if (hasBody && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
+  const requestToken = options.skipAuth ? null : getToken();
   if (!options.skipAuth && !headers.has("Authorization")) {
-    const token = getToken();
-    if (token) headers.set("Authorization", `Bearer ${token}`);
+    if (requestToken) headers.set("Authorization", `Bearer ${requestToken}`);
   }
 
   const base =
@@ -592,14 +602,14 @@ async function http<T>(path: string, init: RequestInit, options: HttpOptions<T>)
     }
   }
   if (response.status === 401) {
-    if (!options.skipAuth) {
+    if (!options.skipAuth && requestToken === getToken()) {
       setToken("");
       if (!options.suppressUnauthorized) unauthorizedHandler?.();
     }
     throw new ApiError(errorMessage || "登录已过期，请重新登录", 401);
   }
   if (response.status === 428) {
-    if (!options.skipAuth && !options.suppressUnauthorized) {
+    if (!options.skipAuth && !options.suppressUnauthorized && requestToken === getToken()) {
       mustChangePasswordHandler?.();
     }
     throw new ApiError(errorMessage || "首次使用必须先修改控制台密码", 428);
@@ -617,7 +627,62 @@ async function http<T>(path: string, init: RequestInit, options: HttpOptions<T>)
   return parseJsonResponse(data, options.parse, response.status);
 }
 
+export type BaseUrlProbeResult =
+  | { ok: true; crossOrigin: boolean }
+  | { ok: false; message: string; crossOrigin: boolean };
+
 export const api = {
+  /**
+   * 探测目标后端地址是否可达且允许当前来源跨域访问。
+   * 不附带任何凭据（不会触发 PBKDF2 校验或限流，也不会泄露当前会话令牌）；
+   * 携带 Content-Type: application/json 以触发真实的 CORS OPTIONS 预检。
+   */
+  probeBaseUrl: async (baseUrlOverride: string, signal?: AbortSignal): Promise<BaseUrlProbeResult> => {
+    const base = baseUrlOverride || window.location.origin;
+    let crossOrigin = false;
+    try {
+      crossOrigin = new URL(base).origin !== window.location.origin;
+    } catch {
+      crossOrigin = false;
+    }
+    let response: Response;
+    try {
+      response = await fetch(`${base}/api/status`, {
+        method: "GET",
+        headers: { "Content-Type": "application/json" },
+        signal,
+      });
+    } catch (err) {
+      if (isAbortError(err)) {
+        return { ok: false, message: `探测目标后端超时 (${base})，请检查网络与服务状态`, crossOrigin };
+      }
+      if (crossOrigin) {
+        return {
+          ok: false,
+          message: `无法跨源连接 ${base}：服务不可达或未放行当前来源 (${window.location.origin})。请在目标后端 config.json 的 webui.cors_allowed_origins 中加入 "${window.location.origin}"，或改用同源反向代理。`,
+          crossOrigin,
+        };
+      }
+      return { ok: false, message: `无法连接目标后端 ${base}，请检查后端地址和服务状态`, crossOrigin };
+    }
+    if (response.status === 200 || response.status === 401 || response.status === 428) {
+      return { ok: true, crossOrigin };
+    }
+    if (response.status === 403) {
+      return {
+        ok: false,
+        message: crossOrigin
+          ? `目标后端拒绝了跨源请求 (HTTP 403)，请确认目标 config.json 的 webui.cors_allowed_origins 包含 "${window.location.origin}"`
+          : "目标后端拒绝了探测请求 (HTTP 403)",
+        crossOrigin,
+      };
+    }
+    return {
+      ok: false,
+      message: `目标地址 ${base} 返回异常状态 (HTTP ${response.status})，请确认指向的是 PicoOnebot WebUI 服务`,
+      crossOrigin,
+    };
+  },
   login: (token: string, baseUrlOverride?: string) =>
     http<LoginResult>(
       "/api/auth/login",
@@ -625,6 +690,7 @@ export const api = {
       { skipAuth: true, baseUrlOverride, parse: parseLoginResult }
     ),
   logout: async () => {
+    const tokenBefore = getToken();
     try {
       await http<{ ok: boolean }>(
         "/api/logout",
@@ -634,7 +700,9 @@ export const api = {
     } catch {
       // Clear the local session even when the backend is unavailable.
     }
-    setToken("");
+    if (getToken() === tokenBefore) {
+      setToken("");
+    }
   },
   status: (signal?: AbortSignal) =>
     http<BotStatus>("/api/status", { signal }, { parse: parseBotStatus }),

@@ -55,7 +55,7 @@ class Smali(src: String) {
     }
 
     companion object {
-        private val CLASS_REGEX = Regex("^\\.class\\s+.*?\\s+(L[^;\\s]+;)", RegexOption.MULTILINE)
+        private val CLASS_REGEX = Regex("^\\.class\\s+(?:[\\w-]+\\s+)*(L[^;\\s]+;)", RegexOption.MULTILINE)
         private val SUPER_REGEX = Regex("^\\.super\\s+(L[^;\\s]+;)", RegexOption.MULTILINE)
         private val FIELD_REGEX = Regex(
             "^\\.field ((?:[\\w-]+ )*)([\\w$-]+):(\\S+)((?:.(?!^\\.(?!end)))*)",
@@ -94,6 +94,7 @@ data class SmaliMethod(
     var body: String
 ) {
     val isPrivate get() = modifiers.contains("private")
+    val isStatic get() = modifiers.contains("static")
     val sign: String
         get() {
             val modPrefix = modifiers.filter { it.isNotBlank() }.distinct().join { "$it " }

@@ -29,3 +29,4 @@
 # Keep host QQ & AndroidX classes referenced by hooks and reflection
 -keep class com.tencent.** { *; }
 -keep class androidx.lifecycle.** { *; }
+-keep class androidx.viewbinding.** { *; }

@@ -52,6 +52,9 @@ esac
 # 通过 curl -K - 从 stdin 传递 Authorization 头，避免 Token 暴露在进程命令行或 URL 中
 curl_auth() {
   local token="$1"; shift
+  # 过滤 CR/LF，防止 token 注入 curl -K 额外配置指令
+  token="${token//$'\r'/}"
+  token="${token//$'\n'/}"
   if [ -n "$token" ]; then
     local esc="${token//\\/\\\\}"
     esc="${esc//\"/\\\"}"
@@ -59,6 +62,14 @@ curl_auth() {
   else
     curl "$@"
   fi
+}
+
+# 仅将合法的 3 位 HTTP 状态码 ([1-5][0-9][0-9]) 视为可达，排除 curl 失败产出的 000 或空字符串
+is_valid_http_code() {
+  case "${1:-}" in
+    [1-5][0-9][0-9]) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # ---------------------------------------------------------------- 底层探测
@@ -104,16 +115,16 @@ app_running() { [ -n "$(adbx shell pidof "$PKG" | tr -d '\r\n ')" ]; }
 # 检查 WebUI 端口 (6099) 是否存活（不依赖 OneBot 3001 是否已配置）
 webui_ready() {
   local ip code; ip="$(android_ip)"; [ -z "$ip" ] && return 1
-  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "http://$ip:$WEBUI_PORT/" 2>/dev/null || echo 000)"
-  [ "$code" != "000" ]
+  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "http://$ip:$WEBUI_PORT/" 2>/dev/null || true)"
+  is_valid_http_code "$code"
 }
 
 # 通过 WebUI /api/status 探测状态（适配 v2 默认无 3001 监听或仅反向 WS 模式）
-# 输出: ONLINE / WAITING_LOGIN / NEEDS_INIT / WEBUI_UP / (空=不可达)
+# 输出: ONLINE / WAITING_LOGIN / NEEDS_INIT / WEBUI_UP / (PICO_STATE_DETAILED=1 时 401 输出 WEBUI_AUTH_REJECTED) / (空=不可达)
 webui_state() {
   local ip tmp code body; ip="$(android_ip)"; [ -z "$ip" ] && return 1
   tmp="$(mktemp)"
-  code="$(curl_auth "$WEBUI_TOKEN" -sS -o "$tmp" -w '%{http_code}' --max-time 8 "http://$ip:$WEBUI_PORT/api/status" 2>/dev/null || echo 000)"
+  code="$(curl_auth "$WEBUI_TOKEN" -sS -o "$tmp" -w '%{http_code}' --max-time 8 "http://$ip:$WEBUI_PORT/api/status" 2>/dev/null || true)"
   body="$(cat "$tmp" 2>/dev/null || true)"
   rm -f "$tmp"
   case "$code" in
@@ -125,9 +136,15 @@ webui_state() {
       fi
       ;;
     428) echo "NEEDS_INIT" ;;
-    401) echo "WEBUI_UP" ;;
-    000) return 1 ;;
-    *)   echo "WEBUI_UP" ;;
+    401)
+      if [ "${PICO_STATE_DETAILED:-0}" = "1" ]; then
+        echo "WEBUI_AUTH_REJECTED"
+      else
+        echo "WEBUI_UP"
+      fi
+      ;;
+    [1-5][0-9][0-9]) echo "WEBUI_UP" ;;
+    *) return 1 ;;
   esac
 }
 
@@ -411,13 +428,17 @@ cmd_watch() {
   local miss=0 last_restart=0 last_state="" webui_skip_auth=0
   cmd_up >/dev/null 2>&1 || true
   while :; do
-    local st now; st="$(PICO_WEBUI_SKIP_AUTH="$webui_skip_auth" pico_state || true)"; now="$(date +%s)"
+    local st now; st="$(PICO_WEBUI_SKIP_AUTH="$webui_skip_auth" PICO_STATE_DETAILED=1 pico_state || true)"; now="$(date +%s)"
+
+    if [ "$st" = "WEBUI_AUTH_REJECTED" ]; then
+      # 仅在明确收到 401 鉴权拒绝时暂停携带密码探测，避免瞬时 429/5xx 永久锁存跳过鉴权
+      webui_skip_auth=1
+      st="WEBUI_UP"
+    elif [ "$st" = "ONLINE" ] || [ "$st" = "NEEDS_INIT" ] || [ "$st" = "WAITING_LOGIN" ]; then
+      webui_skip_auth=0
+    fi
 
     if [ "$st" = "ONLINE" ] || [ "$st" = "WEBUI_UP" ]; then
-      if [ "$st" = "WEBUI_UP" ]; then
-        # 避免未更新 PICO_WEBUI_TOKEN 时每轮重复发送错误密码触发 WebUI 登录限流
-        webui_skip_auth=1
-      fi
       if [ "$last_state" != "$st" ]; then
         if [ "$st" = "ONLINE" ]; then
           log "ONLINE"
@@ -430,7 +451,7 @@ cmd_watch() {
       local n; n="$(msf_timeouts)"
       if { [ "${n:-0}" -gt 2 ] || msf_orphan; } && [ $((now - last_restart)) -gt 600 ]; then
         log "$st 但 :MSF 已僵(timeout x${n:-0} / PPID=1)—— 假在线,重启容器"
-        cmd_restart; last_restart="$now"; miss=0
+        cmd_restart; last_restart="$now"; miss=0; webui_skip_auth=0
       fi
       sleep "$INTERVAL"; continue
     fi
@@ -461,10 +482,10 @@ cmd_watch() {
 
     if ! session_running || ! container_running; then
       log "session/container 掉了,重新拉起"
-      cmd_up >/dev/null 2>&1 || true; miss=0
+      cmd_up >/dev/null 2>&1 || true; miss=0; webui_skip_auth=0
     elif [ "$miss" -ge 6 ] && [ $((now - last_restart)) -gt 300 ]; then
       log "连续 $miss 次异常,升级到重启容器"
-      cmd_restart; last_restart="$now"; miss=0
+      cmd_restart; last_restart="$now"; miss=0; webui_skip_auth=0
     elif [ "$miss" -ge 3 ]; then
       log "尝试重新拉起 $PKG"
       app_running || app_launch
@@ -500,16 +521,18 @@ cmd_login() {
   cmd_qr
 }
 
-case "${1:-status}" in
-  up)      shift; cmd_up "$@" ;;
-  install) shift; cmd_install "$@" ;;
-  qr)      shift; cmd_qr "$@" ;;
-  login)   shift; cmd_login "$@" ;;
-  logout)  shift; cmd_logout "$@" ;;
-  status)  cmd_status ;;
-  doctor)  cmd_doctor ;;
-  watch)   cmd_watch ;;
-  restart) cmd_restart ;;
-  stop)    session_stop ;;
-  *)       sed -n '2,30p' "$0"; exit 2 ;;
-esac
+if [ "${PICOCTL_SOURCE_ONLY:-0}" != "1" ]; then
+  case "${1:-status}" in
+    up)      shift; cmd_up "$@" ;;
+    install) shift; cmd_install "$@" ;;
+    qr)      shift; cmd_qr "$@" ;;
+    login)   shift; cmd_login "$@" ;;
+    logout)  shift; cmd_logout "$@" ;;
+    status)  cmd_status ;;
+    doctor)  cmd_doctor ;;
+    watch)   cmd_watch ;;
+    restart) cmd_restart ;;
+    stop)    session_stop ;;
+    *)       sed -n '2,30p' "$0"; exit 2 ;;
+  esac
+fi

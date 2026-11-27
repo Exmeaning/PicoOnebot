@@ -1,8 +1,17 @@
-import { useId, useState, type FormEvent } from "react";
+import { useId, useMemo, useState, type FormEvent } from "react";
 import { KeyRound, Server, ArrowRight, Eye, EyeOff, Sparkles } from "lucide-react";
 import { Logo } from "../components/Logo";
 import { Button, Field, Input, HeartDot, useToast, Badge } from "../components/ui";
-import { api, getErrorMessage, getStoredBaseUrl, normalizeBaseUrl, setBaseUrl, setToken } from "../lib/api";
+import {
+  ApiError,
+  api,
+  getErrorMessage,
+  getStoredBaseUrl,
+  isCrossOriginBaseUrl,
+  normalizeBaseUrl,
+  setBaseUrl,
+  setToken,
+} from "../lib/api";
 
 export function Login({ onSuccess }: { onSuccess: (mustChangePassword: boolean) => void }) {
   const [token, setTok] = useState("");
@@ -12,6 +21,7 @@ export function Login({ onSuccess }: { onSuccess: (mustChangePassword: boolean) 
   const [loading, setLoading] = useState(false);
   const idPrefix = useId();
   const toast = useToast();
+  const baseIsCrossOrigin = useMemo(() => isCrossOriginBaseUrl(base), [base]);
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
@@ -31,7 +41,14 @@ export function Login({ onSuccess }: { onSuccess: (mustChangePassword: boolean) 
       toast.push("success", "登录成功，欢迎回来");
       onSuccess(!!res.mustChangePassword);
     } catch (err) {
-      toast.push("error", getErrorMessage(err, "登录失败"));
+      if (isCrossOriginBaseUrl(parsedBase.url) && err instanceof ApiError && (err.status === 0 || err.status === 403)) {
+        toast.push(
+          "error",
+          `无法跨源登录目标后端：请确认目标 config.json 的 webui.cors_allowed_origins 包含 "${window.location.origin}"，或改用同源地址访问`
+        );
+      } else {
+        toast.push("error", getErrorMessage(err, "登录失败"));
+      }
     } finally {
       setLoading(false);
     }
@@ -116,25 +133,32 @@ export function Login({ onSuccess }: { onSuccess: (mustChangePassword: boolean) 
             </button>
 
             {advanced ? (
-              <Field label="后端地址" htmlFor={`${idPrefix}-base-url`} hint="留空则默认与当前页面同源，仅支持 http:// 或 https://">
-                <div className="flex items-center gap-2">
-                  <div className="relative min-w-0 flex-1">
-                    <Server className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-pico-muted" />
-                    <Input
-                      id={`${idPrefix}-base-url`}
-                      className="pl-10 font-mono text-xs"
-                      value={base}
-                      onChange={(e) => setBase(e.target.value)}
-                      placeholder={window.location.origin}
-                    />
+              <div className="space-y-2">
+                <Field label="后端地址" htmlFor={`${idPrefix}-base-url`} hint="留空则默认与当前页面同源；跨源地址需目标后端在 webui.cors_allowed_origins 中显式放行当前来源">
+                  <div className="flex items-center gap-2">
+                    <div className="relative min-w-0 flex-1">
+                      <Server className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-pico-muted" />
+                      <Input
+                        id={`${idPrefix}-base-url`}
+                        className="pl-10 font-mono text-xs"
+                        value={base}
+                        onChange={(e) => setBase(e.target.value)}
+                        placeholder={window.location.origin}
+                      />
+                    </div>
+                    {base.trim() ? (
+                      <Button type="button" variant="ghost" size="sm" onClick={() => setBase("")}>
+                        恢复同源
+                      </Button>
+                    ) : null}
                   </div>
-                  {base.trim() ? (
-                    <Button type="button" variant="ghost" size="sm" onClick={() => setBase("")}>
-                      恢复同源
-                    </Button>
-                  ) : null}
-                </div>
-              </Field>
+                </Field>
+                {baseIsCrossOrigin ? (
+                  <p className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] font-bold text-amber-800">
+                    跨源提示：请确保目标后端 <code className="font-mono">webui.cors_allowed_origins</code> 包含 <code className="font-mono">{window.location.origin}</code>，否则浏览器将拦截登录预检请求。
+                  </p>
+                ) : null}
+              </div>
             ) : null}
 
             <Button type="submit" size="lg" className="w-full" loading={loading} disabled={!token}>

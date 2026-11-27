@@ -66,9 +66,38 @@ write_apk_sha() {
     printf '%s\n' "$1" > "${APK_SHA_FILE}.tmp" 2>/dev/null && mv -f "${APK_SHA_FILE}.tmp" "$APK_SHA_FILE" 2>/dev/null
 }
 
+detect_webui_port() {
+    _cfg="${PICO_CONFIG_FILE:-/data/user/0/com.tencent.qqlite/files/pico-onebot/config.json}"
+    if [ -z "${PICO_CONFIG_FILE:-}" ] && [ ! -f "$_cfg" ]; then
+        _cfg="/sdcard/pico-onebot/config.json"
+    fi
+    _port=""
+    if [ -r "$_cfg" ] && [ ! -L "$_cfg" ]; then
+        _port="$(awk '
+            { buf = buf " " $0 }
+            END {
+                if (match(buf, /"webui"[[:space:]]*:[[:space:]]*\{[^}]*"port"[[:space:]]*:[[:space:]]*[0-9]+/)) {
+                    seg = substr(buf, RSTART, RLENGTH)
+                    sub(/^.*"port"[[:space:]]*:[[:space:]]*/, "", seg)
+                    print seg
+                }
+            }
+        ' "$_cfg" 2>/dev/null || true)"
+    fi
+    case "$_port" in
+        ''|*[!0-9]*) _port=6099 ;;
+    esac
+    if [ "$_port" -lt 1 ] || [ "$_port" -gt 65535 ]; then
+        _port=6099
+    fi
+    printf '%s\n' "$_port"
+}
+
 webui_listening() {
+    _wport="${1:-$(detect_webui_port)}"
+    _whex="$(printf '%04X' "$_wport")"
     (cat /proc/net/tcp /proc/net/tcp6 2>/dev/null || true) \
-        | awk '$4 == "0A" && $2 ~ /:17[Dd]3$/ { found = 1; exit 0 } END { exit(found ? 0 : 1) }'
+        | awk -v port_hex="$_whex" '$4 == "0A" && toupper($2) ~ (":" port_hex "$") { found = 1; exit 0 } END { exit(found ? 0 : 1) }'
 }
 
 log "=============================================================="
@@ -223,11 +252,13 @@ if [ "$is_first_install" -eq 1 ]; then
 fi
 
 # ── 6. 检测 WebUI 服务就绪 ──────────────────────────────────────────────────
-# 6099 = 0x17D3，严格校验本地地址 (:17D3) 且状态为 LISTEN (0A)
+# 从 config.json 读取 webui.port（回退默认 6099 = 0x17D3），严格校验本地 LISTEN (0A)
 webui_up=0
+webui_port="$(detect_webui_port)"
 i=0
 while [ "$i" -lt 30 ]; do
-    if webui_listening; then
+    webui_port="$(detect_webui_port)"
+    if webui_listening "$webui_port"; then
         webui_up=1
         break
     fi
@@ -236,11 +267,11 @@ while [ "$i" -lt 30 ]; do
 done
 
 if [ "$webui_up" = "1" ]; then
-    log "WebUI 服务已就绪 (0.0.0.0:6099)。"
-    log "  控制台: http://<宿主机IP>:6099 (首次默认密码: picopico，请立即修改)"
+    log "WebUI 服务已就绪 (0.0.0.0:${webui_port})。"
+    log "  控制台: http://<宿主机IP>:${webui_port} (首次默认密码: picopico，请立即修改)"
     log "  OneBot v11: 请在 WebUI 网络配置中启用正向/反向监听（默认常用 3001）"
 else
-    log "WARN: 应用已启动，但尚未检测到 6099 端口监听。"
+    log "WARN: 应用已启动，但尚未检测到 ${webui_port} 端口监听。"
     log "  可执行 pico-doctor.sh 或查看 logcat 排查。"
 fi
 

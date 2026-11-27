@@ -51,6 +51,7 @@ export function useDialogAccessibility(
     }
 
     const onKeyDown = (e: KeyboardEvent) => {
+      if (e.isComposing) return;
       if (e.key === "Escape") {
         e.preventDefault();
         onCloseRef.current();

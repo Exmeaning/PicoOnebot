@@ -80,6 +80,14 @@ jobs:
           shellcheck -s sh -S warning -e SC2034 docker/*.sh
           shellcheck -S warning -e SC2034,SC2155 docker/scripts/*.sh scripts/*.sh
 
+      - name: Ensure PyYAML is available
+        run: |
+          set -euo pipefail
+          if ! python3 -c "import yaml" 2>/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq python3-yaml
+          fi
+
       - name: Run Python and shell-filter test suite
         run: |
           set -euo pipefail
@@ -88,10 +96,6 @@ jobs:
       - name: Validate YAML manifests and workflows
         run: |
           set -euo pipefail
-          if ! python3 -c "import yaml" 2>/dev/null; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq python3-yaml
-          fi
           python3 - <<'PY'
           from pathlib import Path
           import yaml

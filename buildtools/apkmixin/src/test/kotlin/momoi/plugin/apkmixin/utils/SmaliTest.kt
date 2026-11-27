@@ -158,4 +158,41 @@ class SmaliTest {
         assertTrue(method.isPrivate)
         assertEquals(".method private static run()V", method.sign)
     }
+
+    @Test
+    fun parsesPackagePrivateClassWithoutModifiers() {
+        val src = """
+            .class Lcom/example/PkgPrivate;
+            .super Ljava/lang/Object;
+
+            .method constructor <init>()V
+                .registers 1
+
+                invoke-direct {p0}, Ljava/lang/Object;-><init>()V
+
+                return-void
+            .end method
+
+            .method static ping()I
+                .registers 1
+
+                const/4 v0, 0x1
+
+                return v0
+            .end method
+        """.trimIndent()
+
+        val smali = Smali(src)
+        assertEquals("Lcom/example/PkgPrivate;", smali.type)
+        assertEquals("Ljava/lang/Object;", smali.superClass)
+        assertEquals(2, smali.methods.size)
+        val ping = smali.methods.first { it.name == "ping" }
+        assertTrue(ping.isStatic)
+        assertFalse(ping.isPrivate)
+        assertEquals("Lcom/example/PkgPrivate;->ping()I", smali.getMethodCall(ping))
+
+        val assembled = smali.toText().toClassDefOrThrow(apiLevel = 21, classHint = smali.type)
+        assertEquals("Lcom/example/PkgPrivate;", assembled.type)
+        assertEquals(2, assembled.methods.count())
+    }
 }

@@ -51,8 +51,8 @@ class WsError(Exception):
 def resolve_ws_url(raw_url: str):
     """校验并解析 ws:///wss:// URL，保留 query，返回 (scheme, host, port, target, display_url)。"""
     raw = (raw_url or "").strip() or DEFAULT_WS_URL
-    if any(c in raw for c in ("\r", "\n")):
-        raise WsError("URL must not contain CR/LF characters")
+    if any(c in raw for c in ("\r", "\n", " ", "\t")) or any(ord(c) < 0x20 or ord(c) == 0x7F for c in raw):
+        raise WsError("URL must not contain whitespace or control characters")
     u = urlparse(raw)
     scheme = u.scheme.lower()
     if scheme == "http":
@@ -74,8 +74,8 @@ def resolve_ws_url(raw_url: str):
     target = u.path or "/"
     if u.query:
         target = f"{target}?{u.query}"
-    if any(c in target for c in ("\r", "\n")):
-        raise WsError("request target must not contain CR/LF characters")
+    if any(c in target for c in ("\r", "\n", " ", "\t")) or any(ord(c) < 0x20 or ord(c) == 0x7F for c in target):
+        raise WsError("request target must not contain whitespace or control characters")
     host_display = f"[{host}]" if ":" in host else host
     port_suffix = "" if port == default_port else f":{port}"
     display_url = f"{scheme}://{host_display}{port_suffix}{u.path or '/'}"
@@ -89,8 +89,8 @@ def format_host_header(host: str, port: int, scheme: str) -> str:
 
 
 def handshake(sock, host: str, port: int, path: str, token: str = "", scheme: str = "ws") -> bytes:
-    if any(c in path for c in ("\r", "\n")):
-        raise WsError("request path must not contain CR/LF characters")
+    if not path or any(c in path for c in ("\r", "\n", " ", "\t")) or any(ord(c) < 0x20 or ord(c) == 0x7F for c in path):
+        raise WsError("request path must not contain whitespace or control characters")
     if any(c in token for c in ("\r", "\n")):
         raise WsError("token must not contain CR/LF characters")
 
@@ -135,9 +135,17 @@ def handshake(sock, host: str, port: int, path: str, token: str = "", scheme: st
         if ":" not in line:
             continue
         name, value = line.split(":", 1)
-        headers[name.strip().lower()] = value.strip()
+        key = name.strip().lower()
+        val = value.strip()
+        if not key:
+            continue
+        if key in headers and headers[key]:
+            headers[key] = f"{headers[key]}, {val}" if val else headers[key]
+        else:
+            headers[key] = val
 
-    if headers.get("upgrade", "").lower() != "websocket":
+    upgrade_tokens = {t.strip().lower() for t in headers.get("upgrade", "").split(",") if t.strip()}
+    if "websocket" not in upgrade_tokens:
         raise WsError(f"invalid Upgrade header: {headers.get('upgrade')!r}")
     conn_tokens = {t.strip().lower() for t in headers.get("connection", "").split(",") if t.strip()}
     if "upgrade" not in conn_tokens:

@@ -226,13 +226,45 @@ def main() -> int:
             if last_status != "expired":
                 print("[picoqr] 二维码已过期，正在请求刷新...", file=sys.stderr)
                 last_status = "expired"
-            _, rcode, rerr = fetch_qr(api_base, token=auth_token, refresh=True)
+            rdata, rcode, rerr = fetch_qr(api_base, token=auth_token, refresh=True)
             if rcode in (401, 428):
                 return report_auth_error(api_base, rcode, rerr)
-            if args.once:
-                break
-            time.sleep(2)
-            continue
+            if rcode == 0 or rdata is None:
+                last_error = rerr or "无法刷新二维码"
+                if args.once:
+                    break
+                time.sleep(2)
+                continue
+            if rcode != 200:
+                last_error = f"HTTP {rcode}: {rerr}"
+                print(f"[picoqr] 刷新二维码失败 ({last_error})", file=sys.stderr)
+                if args.once:
+                    return 1
+                time.sleep(2)
+                continue
+            data = rdata
+            if data.get("status") == "online" or data.get("online"):
+                uin = data.get("user_id", "未知")
+                print(f"[picoqr] PicoOneBot 已登录在线！当前 QQ: {uin}")
+                return 0
+            status = data.get("status")
+            url = data.get("url", "")
+            expires_in = data.get("expiresIn", 0)
+            is_scanned = data.get("scanned", False)
+            if is_scanned:
+                if last_status != "scanned":
+                    print("[picoqr] 手机 QQ 已扫码，等待在手机上确认登录...", file=sys.stderr)
+                    last_status = "scanned"
+                if args.once:
+                    return 0
+                time.sleep(2)
+                continue
+            if status in ("expired", "waiting_qr") or not url:
+                if args.once:
+                    last_error = "刷新后仍未获取到有效二维码"
+                    break
+                time.sleep(2)
+                continue
 
         if status == "waiting_qr" or not url:
             if last_status != "waiting":

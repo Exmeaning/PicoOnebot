@@ -3,8 +3,8 @@
 #
 # 安全提示：
 #   1. Redroid 需要 privileged: true 挂载 binderfs，请部署在隔离节点并关闭 ServiceAccount Token 自动挂载。
-#   2. 容器内 Redroid adbd 监听 TCP 5555（无认证 root shell），切勿通过 Service 暴露 5555，
-#      强烈建议在支持 NetworkPolicy 的集群（Calico/Cilium/kube-router）中启用文末的 NetworkPolicy 封锁 5555。
+#   2. 容器内 Redroid adbd 默认通过 PICO_ENABLE_ADB=0 关闭，且文末默认启用 NetworkPolicy 封锁 TCP 5555，
+#      切勿通过 Service 暴露 5555 或在不受信任集群开启无认证 ADB。
 #   3. WebUI 初始密码为 picopico，生产环境建议将 Service 改为 ClusterIP 并通过 TLS Ingress/VPN 暴露，
 #      首次启动后立即修改默认控制台密码。
 apiVersion: apps/v1
@@ -36,9 +36,12 @@ spec:
           # Redroid 挂载 binderfs 与管理 Android 系统节点所需
           privileged: true
         env:
-        # 将 /dev/kmsg 核心系统日志转发至 stdout
+        # 默认关闭 /dev/kmsg 转发，避免向容器日志泄露宿主机内核日志（排障时可设为 "1" 或 "all"）
         - name: PICO_LOG_KMSG
-          value: "1"
+          value: "0"
+        # 默认在 K8s Pod 内禁用无认证 root adbd (TCP 5555)；仅在受控排障时改为 "1"
+        - name: PICO_ENABLE_ADB
+          value: "0"
         ports:
         - containerPort: 6099
           name: webui
@@ -131,24 +134,24 @@ spec:
     port: 3001
     targetPort: 3001
     nodePort: 30001
-# ---
-# 可选安全加固：NetworkPolicy（推荐在 Calico / Cilium / kube-router 等支持 NetworkPolicy 的集群启用）
+---
+# 默认启用 NetworkPolicy（适用于 Calico / Cilium / kube-router 等支持 NetworkPolicy 的集群）
 # 仅放行 WebUI (6099) 与 OneBot (3001) 入站流量，隐式拒绝集群内任意 Pod 访问无认证 Root ADB (5555)。
-# 若在 WebUI 中配置了其他自定义 OneBot 端口，请同步加入下方 ports 列表。
-# apiVersion: networking.k8s.io/v1
-# kind: NetworkPolicy
-# metadata:
-#   name: pico-onebot-block-adb
-#   namespace: default
-# spec:
-#   podSelector:
-#     matchLabels:
-#       app: pico-onebot
-#   policyTypes:
-#   - Ingress
-#   ingress:
-#   - ports:
-#     - protocol: TCP
-#       port: 6099
-#     - protocol: TCP
-#       port: 3001
+# 若在 WebUI 中配置了其他自定义端口，请同步加入下方 ports 列表。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pico-onebot-block-adb
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      app: pico-onebot
+  policyTypes:
+  - Ingress
+  ingress:
+  - ports:
+    - protocol: TCP
+      port: 6099
+    - protocol: TCP
+      port: 3001

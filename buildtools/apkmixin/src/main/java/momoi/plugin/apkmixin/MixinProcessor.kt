@@ -1,6 +1,7 @@
 package momoi.plugin.apkmixin
 
 import com.android.tools.smali.dexlib2.Opcode
+import com.android.tools.smali.dexlib2.Opcodes
 import com.android.tools.smali.dexlib2.ReferenceType
 import com.android.tools.smali.dexlib2.builder.MutableMethodImplementation
 import com.android.tools.smali.dexlib2.builder.instruction.BuilderInstruction10x
@@ -61,7 +62,7 @@ class MixinProcessor(
         val (newClassesDex, modifiedClasses) = processClasses(srcDex, trgDex, mixinClasses, apiLevel)
         lifecycle("Mixin processed in ${stopwatch.elapsed(TimeUnit.MILLISECONDS)}ms")
         ZipFile(targetApkFile).use { targetZipFile ->
-            writeDexOutput(trgDex, newClassesDex, modifiedClasses, targetZipFile)
+            writeDexOutput(trgDex, newClassesDex, modifiedClasses, targetZipFile, apiLevel)
         }
     }
 
@@ -219,6 +220,8 @@ class MixinProcessor(
             srcMethod.modifiers.add(0, "private")
         }
         val rawCall = trgSmali.getMethodCall(trgMethod)
+        val rawShortCall = "${trgMethod.name}(${trgMethod.args})${trgMethod.returnType}"
+        val isStatic = trgMethod.isStatic || srcMethod.isStatic
         val baseName = trgMethod.name
         var index = 0
         var candidateName: String
@@ -228,19 +231,35 @@ class MixinProcessor(
         trgMethod.name = candidateName
         val renamedCall = trgSmali.getMethodCall(trgMethod)
 
-        // 仅将当前被覆盖方法的 super 调用（invoke-super / invoke-super/range -> rawCall）
-        // 重定向到重命名后的原实现（invoke-virtual / invoke-virtual/range -> renamedCall），
-        // 避免全局字符串替换误伤其他 super 调用或字符串字面量。
-        val superCallRegex = Regex(
-            """^([ \t]*)invoke-super(/range)?([ \t]+\{[^}]*\},[ \t]*)${Regex.escape(rawCall)}([ \t]*(?:#.*)?)$""",
-            RegexOption.MULTILINE
-        )
-        srcMethod.body = superCallRegex.replace(srcMethod.body) { match ->
-            val indent = match.groupValues[1]
-            val rangeSuffix = match.groupValues[2]
-            val registers = match.groupValues[3]
-            val trailing = match.groupValues[4]
-            "${indent}invoke-virtual${rangeSuffix}${registers}${renamedCall}${trailing}"
+        // 精准重写当前被覆盖方法的委托调用，避免全局字符串替换误伤无关调用或字符串字面量：
+        // - 静态方法（如 @StaticHook）：将指向 rawCall / 隐式 rawShortCall 的 invoke-static(/range) 重定向至重命名原实现，防止无限递归；
+        // - 实例方法：将指向 rawCall 的 invoke-super(/range) 重定向至重命名原实现；当目标原方法为 private 时使用合法的 invoke-direct(/range)。
+        if (isStatic) {
+            val staticCallRegex = Regex(
+                """^([ \t]*)invoke-(?:static|super)(/range)?([ \t]+\{[^}]*\},[ \t]*)(?:${Regex.escape(rawCall)}|${Regex.escape(rawShortCall)})([ \t]*(?:#.*)?)$""",
+                RegexOption.MULTILINE
+            )
+            srcMethod.body = staticCallRegex.replace(srcMethod.body) { match ->
+                val indent = match.groupValues[1]
+                val rangeSuffix = match.groupValues[2]
+                val registers = match.groupValues[3]
+                val trailing = match.groupValues[4]
+                "${indent}invoke-static${rangeSuffix}${registers}${renamedCall}${trailing}"
+            }
+        } else {
+            val targetInvoke = if (trgMethod.isPrivate) "invoke-direct" else "invoke-virtual"
+            val sourceInvokePattern = if (trgMethod.isPrivate) "invoke-(?:super|direct)" else "invoke-super"
+            val instanceCallRegex = Regex(
+                """^([ \t]*)${sourceInvokePattern}(/range)?([ \t]+\{[^}]*\},[ \t]*)${Regex.escape(rawCall)}([ \t]*(?:#.*)?)$""",
+                RegexOption.MULTILINE
+            )
+            srcMethod.body = instanceCallRegex.replace(srcMethod.body) { match ->
+                val indent = match.groupValues[1]
+                val rangeSuffix = match.groupValues[2]
+                val registers = match.groupValues[3]
+                val trailing = match.groupValues[4]
+                "${indent}${targetInvoke}${rangeSuffix}${registers}${renamedCall}${trailing}"
+            }
         }
     }
 
@@ -252,11 +271,17 @@ class MixinProcessor(
         }
     }
 
-    private fun writeDexOutput(trgDex: DexFile, newDex: DexFile, modifiedClasses: Map<String, ClassDef>, targetZipFile: ZipFile) {
+    private fun writeDexOutput(
+        trgDex: DexFile,
+        newDex: DexFile,
+        modifiedClasses: Map<String, ClassDef>,
+        targetZipFile: ZipFile,
+        apiLevel: Int
+    ) {
         val stripVibrationCalls = PERMISSION_VIBRATE in extension.removeUsesPermissions
         val strippedVibrationMethods = ConcurrentHashMap<String, Int>()
         val strippedVibrationCalls = AtomicInteger(0)
-        val rewriter = createDexRewriter(newDex, modifiedClasses, stripVibrationCalls, strippedVibrationMethods, strippedVibrationCalls)
+        val rewriter = createDexRewriter(newDex, modifiedClasses, stripVibrationCalls, strippedVibrationMethods, strippedVibrationCalls, apiLevel)
         lifecycle("Writing dex...")
         val stopWatchWriteDex = Stopwatch.createStarted()
         val namer = BasicDexFileNamer()
@@ -313,7 +338,12 @@ class MixinProcessor(
             }
             filesToAdd[entryName] = file
         }
-        ZipUtil.addOrReplaceFilesInZip(mixinApkFile, filesToAdd)
+        // 写入新 DEX 前剔除根目录下所有旧 classes*.dex，避免多 DEX 数量缩减 (M < K) 时残留旧宿主 DEX
+        ZipUtil.addOrReplaceFilesInZip(
+            zipFile = mixinApkFile,
+            filesToAdd = filesToAdd,
+            removePredicate = { entryName -> ROOT_DEX_REGEX.matches(entryName) }
+        )
 
         stopWatchZipToApk.stop()
         lifecycle("Mixin apk written in ${stopWatchZipToApk.elapsed(TimeUnit.MILLISECONDS)}ms")
@@ -324,15 +354,17 @@ class MixinProcessor(
         modifiedClasses: Map<String, ClassDef>,
         stripVibrationCalls: Boolean,
         strippedVibrationMethods: ConcurrentHashMap<String, Int>,
-        strippedVibrationCalls: AtomicInteger
+        strippedVibrationCalls: AtomicInteger,
+        apiLevel: Int
     ): DexRewriter {
+        val targetOpcodes = Opcodes.forApi(apiLevel)
         return DexRewriter(object : RewriterModule() {
             override fun getDexFileRewriter(rewriters: Rewriters): Rewriter<DexFile?> {
                 return object : DexFileRewriter(rewriters) {
                     override fun rewrite(value: DexFile): DexFile {
                         return super.rewrite(
                             ImmutableDexFile(
-                                value.opcodes,
+                                targetOpcodes,
                                 buildList {
                                     addAll(value.classes)
                                     addAll(newClassesDex.classes)
@@ -402,5 +434,6 @@ class MixinProcessor(
 
     companion object {
         private const val PERMISSION_VIBRATE = "android.permission.VIBRATE"
+        internal val ROOT_DEX_REGEX = Regex("^classes\\d*\\.dex$")
     }
 }

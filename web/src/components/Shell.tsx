@@ -44,6 +44,24 @@ export function Shell({
   const closeDrawer = useCallback(() => setOpen(false), []);
   useDialogAccessibility(open, closeDrawer, drawerRef);
 
+  // 视口拉宽至桌面断点 (>=1024px) 时自动关闭移动抽屉，避免泄漏 body overflow:hidden、焦点陷阱并阻断快捷键
+  useEffect(() => {
+    if (!open) return;
+    const mq = window.matchMedia("(min-width: 1024px)");
+    const closeIfDesktop = () => {
+      if (mq.matches || window.innerWidth >= 1024) {
+        setOpen(false);
+      }
+    };
+    closeIfDesktop();
+    mq.addEventListener("change", closeIfDesktop);
+    window.addEventListener("resize", closeIfDesktop);
+    return () => {
+      mq.removeEventListener("change", closeIfDesktop);
+      window.removeEventListener("resize", closeIfDesktop);
+    };
+  }, [open]);
+
   useEffect(() => {
     mountedRef.current = true;
     return () => {

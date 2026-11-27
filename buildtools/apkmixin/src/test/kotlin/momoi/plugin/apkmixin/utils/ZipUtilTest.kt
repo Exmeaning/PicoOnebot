@@ -13,6 +13,7 @@ import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class ZipUtilTest {
@@ -36,12 +37,14 @@ class ZipUtilTest {
             zos.write(arscBytes)
             zos.closeEntry()
 
+            val soExtra = byteArrayOf(0x35, 0xD9.toByte(), 0x04, 0x00, 0x00, 0x10, 0x00, 0x00)
             zos.putNextEntry(ZipEntry("lib/armeabi-v7a/libdemo.so").apply {
                 method = ZipEntry.STORED
                 size = soBytes.size.toLong()
                 compressedSize = soBytes.size.toLong()
                 crc = crc32Of(soBytes)
                 time = 1_700_000_000_000L
+                extra = soExtra
             })
             zos.write(soBytes)
             zos.closeEntry()
@@ -100,7 +103,7 @@ class ZipUtilTest {
             assertTrue(leftovers.isEmpty(), "Expected no tempZip leftovers, found ${leftovers.map { it.name }}")
 
             ZipFile(zipA).use { zip ->
-                // Untouched STORED entry keeps method/size/crc and zeroed time
+                // Untouched STORED entry keeps method/size/crc, alignment extra bytes, and zeroed time
                 val soEntry = assertNotNull(zip.getEntry("lib/armeabi-v7a/libdemo.so"))
                 assertEquals(ZipEntry.STORED, soEntry.method)
                 val soData = zip.getInputStream(soEntry).use { it.readBytes() }
@@ -108,6 +111,16 @@ class ZipUtilTest {
                 assertEquals(soData.size.toLong(), soEntry.compressedSize)
                 assertEquals(crc32Of(soData), soEntry.crc)
                 assertEquals(0L, soEntry.time)
+                val expectedExtra = byteArrayOf(0x35, 0xD9.toByte(), 0x04, 0x00, 0x00, 0x10, 0x00, 0x00)
+                val actualExtra = assertNotNull(soEntry.extra, "STORED entry extra bytes must be preserved")
+                // ZipOutputStream prepends an extended timestamp (0x5455) block for time=0L (<1980);
+                // our original alignment extra record must remain intact at the tail.
+                assertTrue(
+                    actualExtra.size >= expectedExtra.size &&
+                        actualExtra.copyOfRange(actualExtra.size - expectedExtra.size, actualExtra.size)
+                            .contentEquals(expectedExtra),
+                    "Expected alignment extra record to be preserved, got ${actualExtra.contentToString()}"
+                )
 
                 // Replaced STORED entry stays STORED with recomputed size/crc and zeroed time
                 val arscEntry = assertNotNull(zip.getEntry("resources.arsc"))
@@ -158,6 +171,43 @@ class ZipUtilTest {
             // Temporary file must have been cleaned up on failure
             val leftovers = dir.listFiles { _, name -> name.startsWith("tempZip") }.orEmpty()
             assertTrue(leftovers.isEmpty(), "Expected tempZip cleanup on failure, found ${leftovers.map { it.name }}")
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun removePredicateStripsStaleRootDexEntriesWhilePreservingAssets() {
+        val dir = Files.createTempDirectory("ziputil-remove-test").toFile()
+        try {
+            val targetZip = File(dir, "multi.apk")
+            ZipOutputStream(FileOutputStream(targetZip)).use { zos ->
+                for (name in listOf("classes.dex", "classes2.dex", "classes3.dex", "assets/classes2.dex", "AndroidManifest.xml")) {
+                    zos.putNextEntry(ZipEntry(name).apply {
+                        method = ZipEntry.DEFLATED
+                        time = 0L
+                    })
+                    zos.write("payload-$name".toByteArray())
+                    zos.closeEntry()
+                }
+            }
+            val freshDex = File(dir, "classes.dex").apply { writeBytes("fresh-dex-1".toByteArray()) }
+            val rootDexRegex = Regex("^classes\\d*\\.dex$")
+
+            ZipUtil.addOrReplaceFilesInZip(
+                zipFile = targetZip,
+                filesToAdd = mapOf("classes.dex" to freshDex),
+                removePredicate = { rootDexRegex.matches(it) }
+            )
+
+            ZipFile(targetZip).use { zip ->
+                val dex1 = assertNotNull(zip.getEntry("classes.dex"))
+                assertContentEquals("fresh-dex-1".toByteArray(), zip.getInputStream(dex1).use { it.readBytes() })
+                assertNull(zip.getEntry("classes2.dex"), "Stale root classes2.dex must be stripped")
+                assertNull(zip.getEntry("classes3.dex"), "Stale root classes3.dex must be stripped")
+                assertNotNull(zip.getEntry("assets/classes2.dex"), "Non-root asset must be preserved")
+                assertNotNull(zip.getEntry("AndroidManifest.xml"))
+            }
         } finally {
             dir.deleteRecursively()
         }

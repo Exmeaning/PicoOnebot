@@ -20,6 +20,7 @@ import {
   getErrorMessage,
   getStoredBaseUrl,
   isAbortError,
+  isCrossOriginBaseUrl,
   normalizeBaseUrl,
   setBaseUrl,
 } from "../lib/api";
@@ -204,11 +205,24 @@ export function Settings({
       toast.push("info", parsed.url ? "后端地址未变化" : "已恢复默认同源地址");
       return;
     }
-    if (!confirm(`切换后端地址为 ${nextEffective} 将退出当前会话并需要重新登录，以避免将当前凭据发送到新主机。确定切换吗？`)) {
-      return;
-    }
     setSwitchingBase(true);
     try {
+      // 先探测目标后端连通性与 CORS 预检，避免切到不可达或未放行跨域的地址后被迫退出并卡在登录页。
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 6000);
+      let probe;
+      try {
+        probe = await api.probeBaseUrl(parsed.url, controller.signal);
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!probe.ok) {
+        toast.push("error", probe.message);
+        return;
+      }
+      if (!confirm(`已确认目标后端 ${nextEffective} 可达。切换后端地址将退出当前会话并需要重新登录，以避免将当前凭据发送到新主机。确定切换吗？`)) {
+        return;
+      }
       // Log out on the old host BEFORE switching baseUrl so the old token is never sent to the new host.
       await api.logout();
       setBaseUrl(parsed.url);
@@ -217,6 +231,8 @@ export function Settings({
       setSwitchingBase(false);
     }
   };
+
+  const baseIsCrossOrigin = useMemo(() => isCrossOriginBaseUrl(base), [base]);
 
   const g = cfg?.general;
 
@@ -484,26 +500,36 @@ export function Settings({
             <CardHeader title="WebUI 与安全" desc="控制台访问相关" icon={<ShieldCheck className="h-4 w-4" />} />
             <div className="space-y-4 p-4 pt-3 sm:p-6 sm:pt-4 min-w-0">
               {cfg ? (
-                <div className="grid gap-4 sm:grid-cols-2">
-                  <Field label="WebUI 监听地址" htmlFor={`${idPrefix}-webui-host`} hint="改动需重启 QQ 进程后生效">
-                    <Input id={`${idPrefix}-webui-host`} className="font-mono" value={cfg.webui.host} onChange={(e) => setWeb("host", e.target.value)} />
-                  </Field>
-                  <Field label="WebUI 端口" htmlFor={`${idPrefix}-webui-port`} hint="1 - 65535，改动需重启 QQ 生效">
-                    <Input
-                      id={`${idPrefix}-webui-port`}
-                      className="font-mono"
-                      type="number"
-                      min={1}
-                      max={65535}
-                      value={Number.isFinite(cfg.webui.port) ? cfg.webui.port : ""}
-                      onChange={(e) => setWeb("port", e.target.value === "" ? Number.NaN : Number(e.target.value))}
-                    />
-                  </Field>
-                </div>
+                <>
+                  <div className="grid gap-4 sm:grid-cols-2">
+                    <Field label="WebUI 监听地址" htmlFor={`${idPrefix}-webui-host`} hint="改动需重启 QQ 进程后生效">
+                      <Input id={`${idPrefix}-webui-host`} className="font-mono" value={cfg.webui.host} onChange={(e) => setWeb("host", e.target.value)} />
+                    </Field>
+                    <Field label="WebUI 端口" htmlFor={`${idPrefix}-webui-port`} hint="1 - 65535，改动需重启 QQ 生效；容器部署需同步更新端口映射与探针">
+                      <Input
+                        id={`${idPrefix}-webui-port`}
+                        className="font-mono"
+                        type="number"
+                        min={1}
+                        max={65535}
+                        value={Number.isFinite(cfg.webui.port) ? cfg.webui.port : ""}
+                        onChange={(e) => setWeb("port", e.target.value === "" ? Number.NaN : Number(e.target.value))}
+                      />
+                    </Field>
+                  </div>
+                  {Number.isInteger(cfg.webui.port) && cfg.webui.port !== 6099 ? (
+                    <div className="flex items-start gap-2 rounded-2xl border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-[11px] font-bold text-amber-800">
+                      <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" />
+                      <span>
+                        容器部署提示：若使用 Docker / K8s，修改默认端口 6099 后请同步更新容器端口映射（compose.yml / Service）以及 K8s 探针与 NetworkPolicy 放行端口。
+                      </span>
+                    </div>
+                  ) : null}
+                </>
               ) : null}
               {cfg?.webui.passwordInitialized ? <ChangePasswordInline onRequireRelogin={onRequireRelogin} /> : null}
               <form onSubmit={(e) => void handleSaveBaseUrl(e)}>
-                <Field label="后端地址（仅本浏览器）" htmlFor={`${idPrefix}-base-url`} hint="留空默认与当前页面同源；切换不同主机时会先退出当前会话">
+                <Field label="后端地址（仅本浏览器）" htmlFor={`${idPrefix}-base-url`} hint="留空默认与当前页面同源；切换前会先探测连通性与跨域权限，跨源需目标后端配置 webui.cors_allowed_origins">
                   <div className="flex gap-2 min-w-0">
                     <Input
                       id={`${idPrefix}-base-url`}
@@ -522,6 +548,11 @@ export function Settings({
                     </Button>
                   </div>
                 </Field>
+                {baseIsCrossOrigin ? (
+                  <p className="mt-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] font-bold text-amber-800">
+                    跨源提示：WebUI 后端默认仅允许同源请求。请确认目标后端 <code className="font-mono">config.json</code> 的 <code className="font-mono">webui.cors_allowed_origins</code> 包含 <code className="font-mono">{window.location.origin}</code>，或使用同源反向代理。
+                  </p>
+                ) : null}
               </form>
             </div>
           </Card>

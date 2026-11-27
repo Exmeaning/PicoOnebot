@@ -54,22 +54,38 @@ restart_write_ready() {
         rm -f "$_tmp" 2>/dev/null || true
         return 1
     fi
-    chmod 0644 "$_tmp" 2>/dev/null || {
-        rm -f "$_tmp" 2>/dev/null || true
-        return 1
-    }
     if [ -L "$restart_ready" ] || [ -d "$restart_ready" ]; then
         log "WARN: 拒绝覆盖异常目标 $restart_ready"
         rm -f "$_tmp" 2>/dev/null || true
         return 1
     fi
-    mv -f "$_tmp" "$restart_ready" 2>/dev/null || {
-        rm -f "$_tmp" 2>/dev/null || true
-        return 1
-    }
+    # 优先使用 mv -T -f 拒绝目标为目录的替换竞态；若精简 toybox 不支持 -T，先再次确认非目录/符号链接后回退
+    if ! mv -T -f "$_tmp" "$restart_ready" 2>/dev/null; then
+        if [ -L "$restart_ready" ] || [ -d "$restart_ready" ] || ! mv -f "$_tmp" "$restart_ready" 2>/dev/null; then
+            rm -f "$_tmp" 2>/dev/null || true
+            return 1
+        fi
+    fi
 }
 
 restart_tick() {
+    restart_now="$(date +%s)"
+    # 时钟回拨时重置冷却记录，避免永久锁死重启
+    if [ "$restart_last" -gt 0 ] && [ "$restart_now" -lt "$restart_last" ]; then
+        restart_last=0
+    fi
+    # 冷却期内不发布 ready 标记（并移除旧标记），与 Android 侧新进程内存冷却保持一致，
+    # 避免容器刚重启后 30s 内 WebUI 返回 202 Accepted 却被宿主机静默丢弃。
+    if [ "$restart_last" -gt 0 ] && [ $((restart_now - restart_last)) -lt 30 ]; then
+        if [ -L "$restart_ready" ] || [ -f "$restart_ready" ]; then
+            rm -f "$restart_ready" 2>/dev/null || true
+        fi
+        if [ -L "$restart_request" ] || [ -f "$restart_request" ]; then
+            rm -f "$restart_request" 2>/dev/null || true
+            log "忽略冷却期内的 QQ 重启请求"
+        fi
+        return 0
+    fi
     restart_write_ready || return 0
     if [ -L "$restart_request" ]; then
         log "WARN: 忽略符号链接重启请求 $restart_request"
@@ -84,13 +100,16 @@ restart_tick() {
     esac
     [ "${#requested_at}" -eq 10 ] || return 0
     case "$requested_at" in 0*) return 0 ;; esac
-    restart_now="$(date +%s)"
     restart_age=$((restart_now - requested_at))
-    if [ "$restart_age" -lt 0 ] || [ "$restart_age" -gt 60 ] || [ $((restart_now - restart_last)) -lt 30 ]; then
-        log "忽略过期或过于频繁的 QQ 重启请求"
+    if [ "$restart_age" -lt 0 ] || [ "$restart_age" -gt 60 ]; then
+        log "忽略过期的 QQ 重启请求"
         return 0
     fi
     restart_last="$restart_now"
+    # 重启期间移除 ready 标记，防止新进程启动瞬间在冷却期内接收重复请求
+    if [ -L "$restart_ready" ] || [ -f "$restart_ready" ]; then
+        rm -f "$restart_ready" 2>/dev/null || true
+    fi
     log "WebUI 请求重启 QQ（保留容器与应用数据）"
     sleep 3
     if am force-stop com.tencent.qqlite; then

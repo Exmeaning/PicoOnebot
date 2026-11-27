@@ -288,7 +288,8 @@ function Root() {
         return;
       }
       if (e.isComposing || e.repeat || e.defaultPrevented) return;
-      if (document.querySelector('[role="dialog"][aria-modal="true"]')) {
+      const openDialog = document.querySelector<HTMLElement>('[role="dialog"][aria-modal="true"]');
+      if (openDialog && openDialog.getClientRects().length > 0) {
         clearG();
         return;
       }

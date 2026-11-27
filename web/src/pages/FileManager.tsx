@@ -16,7 +16,7 @@ import {
   Search,
 } from "lucide-react";
 import { Badge, Button, Card, CardHeader, Empty, Input, PageHeader, useToast } from "../components/ui";
-import { ApiError, api, getErrorMessage } from "../lib/api";
+import { ApiError, api, getErrorMessage, isAbortError } from "../lib/api";
 import { copyText } from "../lib/clipboard";
 import { fmtApplied, fmtDateTime } from "../lib/format";
 import type { FileDocument, FileEntry, FileListing } from "../lib/types";
@@ -39,6 +39,8 @@ export function FileManager({ onDirtyChange }: { onDirtyChange?: (dirty: boolean
   const mountedRef = useRef(true);
   const requestId = useRef(0);
   const directoryRequestId = useRef(0);
+  const dirAbortRef = useRef<AbortController | null>(null);
+  const fileAbortRef = useRef<AbortController | null>(null);
   const savingRef = useRef(false);
 
   const [listing, setListing] = useState<FileListing | null>(null);
@@ -58,6 +60,8 @@ export function FileManager({ onDirtyChange }: { onDirtyChange?: (dirty: boolean
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      dirAbortRef.current?.abort();
+      fileAbortRef.current?.abort();
     };
   }, []);
 
@@ -65,16 +69,19 @@ export function FileManager({ onDirtyChange }: { onDirtyChange?: (dirty: boolean
 
   const loadDirectory = useCallback(
     async (path: string) => {
+      dirAbortRef.current?.abort();
+      const controller = new AbortController();
+      dirAbortRef.current = controller;
       const id = ++directoryRequestId.current;
       setLoadingDirectory(true);
       setDirectoryError(null);
       try {
-        const next = await api.files(path);
-        if (mountedRef.current && directoryRequestId.current === id) {
+        const next = await api.files(path, controller.signal);
+        if (mountedRef.current && directoryRequestId.current === id && !controller.signal.aborted) {
           setListing(next);
         }
       } catch (error) {
-        if (!mountedRef.current || directoryRequestId.current !== id) return;
+        if (isAbortError(error) || !mountedRef.current || directoryRequestId.current !== id) return;
         const msg = getErrorMessage(error, "读取目录失败");
         setDirectoryError(msg);
         if (!(error instanceof ApiError && (error.status === 401 || error.status === 428))) {
@@ -115,7 +122,9 @@ export function FileManager({ onDirtyChange }: { onDirtyChange?: (dirty: boolean
 
   const openDirectory = async (path: string) => {
     if (!canLeaveEditor()) return;
+    fileAbortRef.current?.abort();
     requestId.current += 1;
+    setLoadingFile(false);
     setSelected(null);
     setDocument(null);
     setFileError(null);
@@ -128,6 +137,9 @@ export function FileManager({ onDirtyChange }: { onDirtyChange?: (dirty: boolean
 
   const loadFile = useCallback(
     async (entry: FileEntry) => {
+      fileAbortRef.current?.abort();
+      const controller = new AbortController();
+      fileAbortRef.current = controller;
       const id = ++requestId.current;
       setSelected(entry);
       setDocument(null);
@@ -135,8 +147,8 @@ export function FileManager({ onDirtyChange }: { onDirtyChange?: (dirty: boolean
       setSaveConflict(false);
       setLoadingFile(true);
       try {
-        const next = await api.file(entry.path);
-        if (!mountedRef.current || requestId.current !== id) return;
+        const next = await api.file(entry.path, controller.signal);
+        if (!mountedRef.current || requestId.current !== id || controller.signal.aborted) return;
         setDocument(next);
         setContent(next.content);
         setSavedContent(next.content);
@@ -146,7 +158,7 @@ export function FileManager({ onDirtyChange }: { onDirtyChange?: (dirty: boolean
             : current
         );
       } catch (error) {
-        if (!mountedRef.current || requestId.current !== id) return;
+        if (isAbortError(error) || !mountedRef.current || requestId.current !== id) return;
         const msg = getErrorMessage(error, "读取文件失败");
         setFileError(msg);
         if (!(error instanceof ApiError && (error.status === 401 || error.status === 428))) {
@@ -169,7 +181,9 @@ export function FileManager({ onDirtyChange }: { onDirtyChange?: (dirty: boolean
     if (selected?.path === entry.path && !fileError) return;
     if (!canLeaveEditor()) return;
     if (!entry.editable) {
+      fileAbortRef.current?.abort();
       requestId.current += 1;
+      setLoadingFile(false);
       setSelected(entry);
       setDocument(null);
       setFileError(null);
