@@ -1,6 +1,6 @@
 plugins {
     `java-gradle-plugin`
-    id("org.jetbrains.kotlin.jvm") version "2.1.10" apply true
+    id("org.jetbrains.kotlin.jvm") version "2.4.21" apply true
 }
 java {
     sourceCompatibility = JavaVersion.VERSION_11
