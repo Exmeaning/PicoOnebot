@@ -23,7 +23,7 @@ dependencies {
     // noinspection UseTomlInstead
     implementation("com.android.tools.smali:smali:3.0.9")
     // noinspection UseTomlInstead
-    implementation("com.android.tools.smali:smali-baksmali:3.0.9")
+    implementation("com.android.tools.smali:smali-baksmali:3.0.10")
     // noinspection UseTomlInstead
     implementation("com.huanli233:multidexlib2:3.0.9.r4")
     implementation(fileTree("./libs") {
