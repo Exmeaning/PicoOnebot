@@ -19,7 +19,7 @@ dependencies {
     compileOnly(gradleApi())
     implementation(kotlin("stdlib"))
     // noinspection UseTomlInstead
-    implementation("com.android.tools.smali:smali-dexlib2:3.0.9")
+    implementation("com.android.tools.smali:smali-dexlib2:3.0.10")
     // noinspection UseTomlInstead
     implementation("com.android.tools.smali:smali:3.0.9")
     // noinspection UseTomlInstead
