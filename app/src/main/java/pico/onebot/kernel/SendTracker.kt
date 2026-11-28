@@ -12,7 +12,7 @@ import java.util.concurrent.ConcurrentHashMap
 object SendTracker {
 
     private const val FAILURE_CAP = 256
-    private const val FAILURE_TTL_MS = 60_000L
+    private const val FAILURE_TTL_NS = 60_000_000_000L
 
     private val waiting = ConcurrentHashMap<Long, Promise<MsgRecord>>()
 
@@ -33,6 +33,22 @@ object SendTracker {
 
     fun pending(): Int = waiting.size
 
+    /** 会话丢失/切号时释放全部在途发送等待并清空旧账号失败记录。 */
+    fun reset() {
+        val pendingList = ArrayList<Promise<MsgRecord>>()
+        val it = waiting.entries.iterator()
+        while (it.hasNext()) {
+            val e = it.next()
+            if (waiting.remove(e.key, e.value)) {
+                pendingList.add(e.value)
+            }
+        }
+        synchronized(failuresLock) {
+            failures.clear()
+        }
+        for (p in pendingList) p.resolve(null)
+    }
+
     // ---------------- 真实发送失败 ----------------
 
     /**
@@ -48,28 +64,44 @@ object SendTracker {
         val msg: String
     ) {
         val at: Long = System.currentTimeMillis()
+        internal val atNs: Long = System.nanoTime()
     }
 
     /**
-     * 按 `msgId` 索引。**不能用会话做键**:同一会话上连续两次发送时,后一次会把
-     * 前一次的失败覆盖掉,而调用方拿到的是自己那条 msgId 的结果。
+     * 按 `msgId` 索引,以插入序保存(最旧在前),避免哈希序淘汰误删刚写入的失败记录。
      */
-    private val failures = ConcurrentHashMap<Long, SendFailure>()
+    private val failuresLock = Any()
+    private val failures = LinkedHashMap<Long, SendFailure>()
 
     fun onSendError(msgId: Long, chatType: Int, peerUid: String, code: Int, msg: String) {
+        if (msgId == 0L) return
         val f = SendFailure(msgId, chatType, peerUid, code, msg)
-        failures[msgId] = f
-        // 失败可能晚于调用方的等待窗口到达(或调用方早已超时返回),没人取走的记录
-        // 必须自己过期,否则这张表只增不减。
-        if (failures.size > FAILURE_CAP) {
-            val now = System.currentTimeMillis()
-            failures.entries.removeAll { now - it.value.at > FAILURE_TTL_MS }
-            if (failures.size > FAILURE_CAP) failures.keys.take(failures.size - FAILURE_CAP).forEach { failures.remove(it) }
+        val nowNs = f.atNs
+        synchronized(failuresLock) {
+            failures.remove(msgId)
+            failures[msgId] = f
+            if (failures.size > FAILURE_CAP) {
+                val ttlIt = failures.entries.iterator()
+                while (ttlIt.hasNext()) {
+                    val e = ttlIt.next()
+                    if (e.key != msgId && (nowNs - e.value.atNs).coerceAtLeast(0L) > FAILURE_TTL_NS) {
+                        ttlIt.remove()
+                    }
+                }
+                val evictIt = failures.entries.iterator()
+                while (failures.size > FAILURE_CAP && evictIt.hasNext()) {
+                    val e = evictIt.next()
+                    if (e.key != msgId) evictIt.remove()
+                }
+            }
         }
         // 正在等这条 msgId 落库的调用方不该再干等到超时
         waiting.remove(msgId)?.resolve(null)
     }
 
     /** 取走这条 msgId 的异步投递失败(取走即清)。 */
-    fun takeFailure(msgId: Long): SendFailure? = if (msgId == 0L) null else failures.remove(msgId)
+    fun takeFailure(msgId: Long): SendFailure? {
+        if (msgId == 0L) return null
+        return synchronized(failuresLock) { failures.remove(msgId) }
+    }
 }

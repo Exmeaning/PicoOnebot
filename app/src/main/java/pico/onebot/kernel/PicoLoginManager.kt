@@ -16,33 +16,59 @@ import com.tencent.qqnt.account.login.ui.QrLoginFragment
 import org.json.JSONObject
 import pico.onebot.core.PicoLog
 import java.lang.ref.WeakReference
+import java.net.URI
 import java.util.Collections
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 object PicoLoginManager {
 
-    @Volatile
-    var latestQrUrl: String? = null
-        private set
+    data class QrSnapshot(
+        val generation: Long = 0L,
+        val url: String? = null,
+        val bytes: ByteArray? = null,
+        val receivedAtWallMs: Long = 0L,
+        val receivedAtNs: Long = 0L,
+        val scanned: Boolean = false,
+        val expired: Boolean = false,
+        val decoding: Boolean = false
+    )
+
+    private val qrLock = ReentrantLock()
+    private val qrChanged = qrLock.newCondition()
+    private var qrGeneration: Long = 0L
+    private var qrOwnerRef: WeakReference<QrLoginFragment>? = null
 
     @Volatile
-    var latestQrBytes: ByteArray? = null
-        private set
+    private var qrSnapshot: QrSnapshot = QrSnapshot()
 
-    @Volatile
-    var latestQrTime: Long = 0L
-        private set
+    private val decodeExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "pico-qr-decode").apply { isDaemon = true }
+    }
 
-    @Volatile
-    var isExpired: Boolean = false
-        private set
+    /** 原子快照访问入口,避免并发分步读取 url / bytes / time 产生撕裂。 */
+    fun currentQrSnapshot(): QrSnapshot = qrSnapshot
+
+    val latestQrUrl: String?
+        get() = qrSnapshot.url
+
+    val latestQrBytes: ByteArray?
+        get() = qrSnapshot.bytes
+
+    val latestQrTime: Long
+        get() = qrSnapshot.receivedAtWallMs
+
+    val isExpired: Boolean
+        get() = qrSnapshot.expired
 
     @Volatile
     var autoSwitchAccount: Boolean = false
 
     /** 手机已扫码、等待确认(QrLoginFragment 的 qr_scanned_tips 回调);收到新码时复位。 */
-    @Volatile
-    var isScanned: Boolean = false
-        private set
+    val isScanned: Boolean
+        get() = qrSnapshot.scanned
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -136,47 +162,121 @@ object PicoLoginManager {
 
     fun onQrReceived(frag: QrLoginFragment, picBuf: ByteArray) {
         qrFragmentRef = WeakReference(frag)
-        latestQrBytes = picBuf
-        latestQrTime = System.currentTimeMillis()
-        // URL 是异步解码出来的。**先把旧值清掉**:否则解码失败时 latestQrTime
-        // 已经更新、latestQrUrl 还挂着上一张码,getOrRefreshQr 的等待条件
-        // (latestQrTime>oldTime && url 非空)会被满足,把过期 URL 当成新码返回,
-        // 而 info() 还会报 expired=false。
-        latestQrUrl = null
-        isScanned = false
-        isExpired = false
+        val bytesCopy = picBuf.copyOf()
+        val gen: Long = qrLock.withLock {
+            val nextGen = ++qrGeneration
+            val nowWall = maxOf(System.currentTimeMillis(), qrSnapshot.receivedAtWallMs + 1L)
+            qrOwnerRef = WeakReference(frag)
+            qrSnapshot = QrSnapshot(
+                generation = nextGen,
+                url = null,
+                bytes = bytesCopy,
+                receivedAtWallMs = nowWall,
+                receivedAtNs = System.nanoTime(),
+                scanned = false,
+                expired = false,
+                decoding = true
+            )
+            qrChanged.signalAll()
+            nextGen
+        }
 
-        Thread({
-            try {
-                val url = decodeQrFromBytes(picBuf)
-                if (!url.isNullOrEmpty()) {
-                    latestQrUrl = url
-                    PicoLog.i("PicoLoginManager: Decoded QR URL successfully: $url")
-                } else {
-                    PicoLog.w("PicoLoginManager: QR bytes received (${picBuf.size}B) but ZXing decode returned null")
+        try {
+            decodeExecutor.execute {
+                var decodedUrl: String? = null
+                try {
+                    if (qrSnapshot.generation != gen) return@execute
+                    decodedUrl = decodeQrFromBytes(bytesCopy)
+                } catch (t: Throwable) {
+                    PicoLog.e("PicoLoginManager: decodeQrFromBytes error", t)
+                } finally {
+                    val committed = qrLock.withLock {
+                        if (qrSnapshot.generation == gen) {
+                            qrSnapshot = qrSnapshot.copy(
+                                url = decodedUrl?.takeIf { it.isNotEmpty() } ?: qrSnapshot.url,
+                                decoding = false
+                            )
+                            qrChanged.signalAll()
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    if (committed) {
+                        val finalUrl = decodedUrl
+                        if (!finalUrl.isNullOrEmpty()) {
+                            PicoLog.i("PicoLoginManager: Decoded QR URL successfully (${redactQrUrl(finalUrl)})")
+                        } else {
+                            PicoLog.w("PicoLoginManager: QR bytes received (${bytesCopy.size}B) but ZXing decode returned null")
+                        }
+                    }
                 }
-            } catch (t: Throwable) {
-                PicoLog.e("PicoLoginManager: decodeQrFromBytes error", t)
             }
-        }, "pico-qr-decode").start()
+        } catch (t: Throwable) {
+            qrLock.withLock {
+                if (qrSnapshot.generation == gen) {
+                    qrSnapshot = qrSnapshot.copy(decoding = false)
+                    qrChanged.signalAll()
+                }
+            }
+            PicoLog.e("PicoLoginManager: failed to schedule QR decode", t)
+        }
+    }
+
+    private fun isCurrentQrFragmentLocked(frag: QrLoginFragment?): Boolean {
+        if (frag == null) return true
+        val active = qrFragmentRef?.get()
+        if (active != null && active !== frag) return false
+        val owner = qrOwnerRef?.get()
+        if (owner != null && owner !== frag) return false
+        return true
     }
 
     fun onQrScanned(frag: QrLoginFragment? = null) {
-        PicoLog.i("PicoLoginManager: QR scanned, waiting for confirm on phone")
-        isScanned = true
+        val updated = qrLock.withLock {
+            if (!isCurrentQrFragmentLocked(frag)) return@withLock false
+            val cur = qrSnapshot
+            if (cur.receivedAtWallMs > 0L) {
+                qrSnapshot = cur.copy(scanned = true)
+                qrChanged.signalAll()
+                true
+            } else {
+                false
+            }
+        }
+        if (updated) {
+            PicoLog.i("PicoLoginManager: QR scanned, waiting for confirm on phone")
+        } else if (frag != null) {
+            PicoLog.d("PicoLoginManager: ignored onQrScanned from stale fragment $frag")
+        }
     }
 
     fun onQrExpired(frag: QrLoginFragment? = null) {
-        PicoLog.i("PicoLoginManager: QR code expired callback received")
-        isExpired = true
+        val updated = qrLock.withLock {
+            if (!isCurrentQrFragmentLocked(frag)) return@withLock false
+            val cur = qrSnapshot
+            if (cur.receivedAtWallMs > 0L) {
+                qrSnapshot = cur.copy(expired = true)
+                qrChanged.signalAll()
+                true
+            } else {
+                false
+            }
+        }
+        if (updated) {
+            PicoLog.i("PicoLoginManager: QR code expired callback received")
+        } else if (frag != null) {
+            PicoLog.d("PicoLoginManager: ignored onQrExpired from stale fragment $frag")
+        }
     }
 
     fun clearQr() {
-        latestQrUrl = null
-        latestQrBytes = null
-        latestQrTime = 0L
-        isScanned = false
-        isExpired = false
+        qrLock.withLock {
+            qrGeneration++
+            qrOwnerRef = null
+            qrSnapshot = QrSnapshot(generation = qrGeneration)
+            qrChanged.signalAll()
+        }
     }
 
     /**
@@ -224,39 +324,70 @@ object PicoLoginManager {
     }
 
     /**
-     * 获取或刷新二维码。若已过期或为空，尝试刷新并等待至多 timeoutMs。
+     * 获取或刷新二维码。若已过期或为空，尝试刷新并等待至多 timeoutMs；
+     * 若新二维码正在异步 ZXing 解码，先等待解码完成而不贸然刷新作废。
      */
     fun getOrRefreshQr(timeoutMs: Long = 3000): String? {
-        val now = System.currentTimeMillis()
-        val ageSec = if (latestQrTime > 0) ((now - latestQrTime) / 1000).toInt() else 9999
-        val needsRefresh = latestQrUrl == null || isExpired || ageSec > 80
+        val deadlineNs = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs.coerceAtLeast(0L))
+        var snap = qrSnapshot
+        if (snap.decoding && !snap.expired && snapshotAgeSec(snap) in 0..80) {
+            snap = waitForDecode(snap.generation, deadlineNs)
+        }
+        val ageSec = snapshotAgeSec(snap)
+        val needsRefresh = (snap.url.isNullOrEmpty() && !snap.decoding) || snap.expired || ageSec < 0 || ageSec > 80
 
         if (needsRefresh) {
-            PicoLog.i("PicoLoginManager: QR needs refresh (url=${latestQrUrl != null}, expired=$isExpired, age=${ageSec}s)")
-            val oldTime = latestQrTime
+            PicoLog.i("PicoLoginManager: QR needs refresh (url=${snap.url != null}, expired=${snap.expired}, age=${ageSec}s)")
+            val beforeGen = snap.generation
             if (refreshQr()) {
-                val start = System.currentTimeMillis()
-                while (System.currentTimeMillis() - start < timeoutMs) {
-                    if (latestQrTime > oldTime && !isExpired && !latestQrUrl.isNullOrEmpty()) {
-                        return latestQrUrl
-                    }
-                    try {
-                        Thread.sleep(100)
-                    } catch (_: InterruptedException) {
-                        break
+                qrLock.withLock {
+                    while (true) {
+                        val cur = qrSnapshot
+                        if (cur.generation > beforeGen && !cur.expired && !cur.url.isNullOrEmpty()) {
+                            return cur.url
+                        }
+                        if (cur.generation > beforeGen && !cur.decoding && cur.bytes != null && cur.url.isNullOrEmpty()) {
+                            break
+                        }
+                        val remNs = deadlineNs - System.nanoTime()
+                        if (remNs <= 0L) break
+                        try {
+                            qrChanged.awaitNanos(remNs)
+                        } catch (_: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                            break
+                        }
                     }
                 }
             }
         }
-        return latestQrUrl
+        return qrSnapshot.url
+    }
+
+    private fun waitForDecode(gen: Long, deadlineNs: Long): QrSnapshot {
+        qrLock.withLock {
+            while (true) {
+                val cur = qrSnapshot
+                if (!cur.decoding || cur.generation != gen || cur.expired) return cur
+                val remNs = deadlineNs - System.nanoTime()
+                if (remNs <= 0L) return cur
+                try {
+                    qrChanged.awaitNanos(remNs)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return qrSnapshot
+                }
+            }
+        }
     }
 
     fun decodeQrFromBytes(picBuf: ByteArray): String? {
+        var bitmap: Bitmap? = null
         return try {
             val options = BitmapFactory.Options().apply {
                 inPreferredConfig = Bitmap.Config.RGB_565
             }
-            val bitmap = BitmapFactory.decodeByteArray(picBuf, 0, picBuf.size, options) ?: return null
+            bitmap = BitmapFactory.decodeByteArray(picBuf, 0, picBuf.size, options) ?: return null
             val w = bitmap.width
             val h = bitmap.height
             val pixels = IntArray(w * h)
@@ -270,20 +401,35 @@ object PicoLoginManager {
         } catch (t: Throwable) {
             PicoLog.w("PicoLoginManager: decodeQrFromBytes failed: ${t.message}")
             null
+        } finally {
+            try {
+                bitmap?.recycle()
+            } catch (_: Throwable) {
+            }
         }
     }
 
     fun info(): JSONObject {
-        val now = System.currentTimeMillis()
-        val ageSec = if (latestQrTime > 0) ((now - latestQrTime) / 1000).toInt() else -1
-        val expired = isExpired || (ageSec > 85)
+        val snap = qrSnapshot
+        val ageSec = snapshotAgeSec(snap)
+        val expired = snap.expired || (ageSec > 85)
         return JSONObject()
-            .put("url", latestQrUrl ?: "")
+            .put("url", snap.url ?: "")
             .put("expired", expired)
             .put("age_seconds", ageSec)
-            .put("has_qr", !latestQrUrl.isNullOrEmpty())
-            .put("scanned", isScanned)
+            .put("has_qr", !snap.url.isNullOrEmpty())
+            .put("scanned", snap.scanned)
             .put("has_fragment", qrFragmentRef?.get() != null)
             .put("has_state_fragment", hasLoginEntry)
+    }
+
+    private fun snapshotAgeSec(snap: QrSnapshot): Int {
+        if (snap.receivedAtWallMs <= 0L) return -1
+        return ((System.nanoTime() - snap.receivedAtNs).coerceAtLeast(0L) / 1_000_000_000L).toInt()
+    }
+
+    private fun redactQrUrl(url: String): String {
+        val host = try { URI(url).host } catch (_: Throwable) { null }
+        return if (!host.isNullOrEmpty()) "host=$host, len=${url.length}" else "len=${url.length}"
     }
 }

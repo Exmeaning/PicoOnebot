@@ -4,6 +4,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import pico.onebot.PicoBoot
 import pico.onebot.core.Config
+import pico.onebot.core.ContainerRestart
 import pico.onebot.core.Counters
 import pico.onebot.core.PicoLog
 import pico.onebot.event.EventBus
@@ -18,9 +19,12 @@ import pico.onebot.kernel.UinUidStore
 import pico.onebot.msg.MsgIdStore
 import pico.onebot.net.Transport
 import pico.onebot.proto.Ob
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** 不依赖登录就能回答的动作 —— M1 的验收面。 */
 object SystemActions {
+
+    private val delayedRestartPending = AtomicBoolean(false)
 
     fun register() {
         ActionRouter.register("get_version_info") {
@@ -60,7 +64,7 @@ object SystemActions {
         // 无头运维:主动退出账号并返回登录扫码界面
         ActionRouter.register("_pico_logout") { logout() }
         ActionRouter.register("logout") { logout() }
-        ActionRouter.register("set_restart") { logout() }
+        ActionRouter.register("set_restart") { params -> setRestart(params) }
 
         // 二维码与登录运维: 获取当前登录二维码或刷新
         // 引导面板(设计 §3.2):在最近的 MainActivity 上立刻弹出 / 收起;登录后默认只自动弹一次,这里可随时再叫出来
@@ -81,6 +85,7 @@ object SystemActions {
             Ob.ok(JSONObject().put("refreshed", refreshed))
         }
         ActionRouter.register("_pico_sync_msg") {
+            if (!KernelGate.ready) return@register Ob.notReady("_pico_sync_msg")
             val (ok, detail) = MsgWatchdog.triggerSyncNow("action:_pico_sync_msg")
             if (ok) {
                 Ob.ok(
@@ -90,10 +95,18 @@ object SystemActions {
                         .put("last_sync_at", Counters.lastSyncAt())
                 )
             } else {
-                Ob.failed(Ob.RC_KERNEL_ERROR, "触发消息同步失败: $detail")
+                val rc = when {
+                    detail.startsWith("kernel not ready") || detail.startsWith("msgService unavailable") -> Ob.RC_NOT_READY
+                    detail.startsWith("sync cooldown") || detail.startsWith("timeout") -> Ob.RC_TIMEOUT
+                    else -> Ob.RC_KERNEL_ERROR
+                }
+                Ob.failed(rc, "触发消息同步失败: $detail")
             }
         }
     }
+
+    private const val QR_TTL_SEC = 85
+    private const val QR_REFRESH_WAIT_NS = 3_000_000_000L
 
     private fun getQr(params: JSONObject): JSONObject {
         if (KernelGate.state == KernelGate.State.ONLINE) {
@@ -106,16 +119,101 @@ object SystemActions {
         }
         val forceRefresh = params.optBoolean("refresh", false)
         if (forceRefresh) {
-            PicoLoginManager.refreshQr()
-        }
-        val url = PicoLoginManager.getOrRefreshQr(if (forceRefresh) 3000 else 1000)
-        val info = PicoLoginManager.info()
-        if (url != null) {
-            info.put("status", "ok")
+            val beforeGen = PicoLoginManager.currentQrSnapshot().generation
+            if (PicoLoginManager.refreshQr()) {
+                val deadlineNs = System.nanoTime() + QR_REFRESH_WAIT_NS
+                while ((deadlineNs - System.nanoTime()) > 0L) {
+                    val cur = PicoLoginManager.currentQrSnapshot()
+                    if (cur.generation > beforeGen && !cur.expired && !cur.url.isNullOrEmpty()) {
+                        break
+                    }
+                    try {
+                        Thread.sleep(50)
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        break
+                    }
+                }
+            }
         } else {
-            info.put("status", "waiting_qr")
+            PicoLoginManager.getOrRefreshQr(1000)
         }
+        val snap = PicoLoginManager.currentQrSnapshot()
+        val ageSec = if (snap.receivedAtWallMs <= 0L) {
+            -1
+        } else {
+            ((System.nanoTime() - snap.receivedAtNs).coerceAtLeast(0L) / 1_000_000_000L).toInt()
+        }
+        val expired = snap.expired || (ageSec > QR_TTL_SEC)
+        val hasQr = !snap.url.isNullOrEmpty()
+        val status = when {
+            !hasQr -> "waiting_qr"
+            expired -> "expired"
+            else -> "ok"
+        }
+        val info = JSONObject()
+            .put("url", snap.url ?: "")
+            .put("expired", expired)
+            .put("age_seconds", ageSec)
+            .put("has_qr", hasQr)
+            .put("scanned", snap.scanned)
+            .put("has_fragment", PicoLoginManager.qrFragmentRef?.get() != null)
+            .put("has_state_fragment", PicoLoginManager.hasLoginEntry)
+            .put("status", status)
         return Ob.ok(info)
+    }
+
+    private fun setRestart(params: JSONObject): JSONObject {
+        if (!ContainerRestart.available()) {
+            return Ob.failed(
+                Ob.RC_UNSUPPORTED,
+                "set_restart 仅支持已启用重启守护服务的 PicoOnebot 容器环境(不会执行破坏性登出;如需退出账号请显式调用 logout / _pico_logout)"
+            )
+        }
+        val delayMs = if (params.isNull("delay")) 0L else params.optLong("delay", 0L).coerceIn(0L, 60_000L)
+        if (delayMs > 0L) {
+            if (!delayedRestartPending.compareAndSet(false, true)) {
+                return Ob.failed(Ob.RC_TIMEOUT, "QQ 延迟重启请求已在队列中,请勿重复提交")
+            }
+            PicoLog.i("set_restart requested by action (delay=${delayMs}ms)")
+            try {
+                Thread({
+                    try {
+                        Thread.sleep(delayMs)
+                        if (!ContainerRestart.request()) {
+                            PicoLog.w("delayed set_restart skipped: restart request already pending or cooling down")
+                        }
+                    } catch (t: Throwable) {
+                        PicoLog.w("delayed set_restart failed: " + t.message)
+                    } finally {
+                        delayedRestartPending.set(false)
+                    }
+                }, "pico-set-restart").apply { isDaemon = true }.start()
+            } catch (t: Throwable) {
+                delayedRestartPending.set(false)
+                PicoLog.e("delayed set_restart thread start failed", t)
+                return Ob.failed(Ob.RC_KERNEL_ERROR, "无法调度延迟重启任务: " + (t.message ?: t.javaClass.simpleName))
+            }
+            return Ob.ok(
+                JSONObject()
+                    .put("message", "QQ restart scheduled")
+                    .put("delay", delayMs)
+            )
+        }
+        if (delayedRestartPending.get()) {
+            return Ob.failed(Ob.RC_TIMEOUT, "QQ 延迟重启请求已在队列中,请稍后再试")
+        }
+        PicoLog.i("set_restart requested by action")
+        return try {
+            if (!ContainerRestart.request()) {
+                Ob.failed(Ob.RC_TIMEOUT, "QQ 重启请求正在处理或处于冷却期,请稍后再试")
+            } else {
+                Ob.ok(JSONObject().put("message", "QQ restart requested"))
+            }
+        } catch (t: Throwable) {
+            PicoLog.e("set_restart failed", t)
+            Ob.failed(Ob.RC_KERNEL_ERROR, "无法提交 QQ 重启请求: " + (t.message ?: t.javaClass.simpleName))
+        }
     }
 
     private fun logout(): JSONObject {

@@ -3,23 +3,23 @@
 #
 # 解决三件事:
 #   1. 宿主重启后要人手工拉  → up / systemd 单元
-#   2. 无 GUI 看不到登录二维码 → qr(截屏后在终端重绘二维码)
+#   2. 无 GUI 看不到登录二维码 → qr(通过 WebUI API 获取并在终端重绘二维码)
 #   3. 跑着跑着静默失效      → watch(按已知故障模式分级恢复)
 #
 # "静默失效"不是抽象风险,是这个项目实测踩过三次的坑:
 #   · Waydroid 没有窗口时会冻结整个容器(Container: FROZEN),QQ 看着在线但一条消息都收不到;
 #   · adb install -r 之后旧 :MSF 进程以 PPID=1 存活,所有 SSO 请求 30s 超时;
 #   · 被踢下线后协议端状态变 LOGGED_OUT,但进程还活着,从外面看毫无异常。
-# 这三种都不会让进程退出,所以**只看进程在不在是不够的**,必须查协议端自己报的状态。
+# 这三种都不会让进程退出,所以**只看进程在不在是不够的**,必须查协议端/WebUI 自己报的状态。
 #
 # 用法:
-#   linux/picoctl.sh up        拉起 session + 容器 + QQ,等到协议端应答
-#   linux/picoctl.sh install <apk>  卸旧装新 + 重启容器 + Hook 完成首次引导
-#   linux/picoctl.sh qr        在终端里显示登录二维码
-#   linux/picoctl.sh status    一屏看清各层状态
-#   linux/picoctl.sh doctor    只做体检,退出码非 0 表示有问题
-#   linux/picoctl.sh watch     保活循环(systemd 用这个)
-#   linux/picoctl.sh restart   重启整个容器(僵尸 :MSF 的唯一解)
+#   scripts/picoctl.sh up        拉起 session + 容器 + QQ,等到服务就绪
+#   scripts/picoctl.sh install <apk>  卸旧装新 + 重启容器 + Hook 完成首次引导
+#   scripts/picoctl.sh qr        在终端里显示登录二维码
+#   scripts/picoctl.sh status    一屏看清各层状态
+#   scripts/picoctl.sh doctor    只做体检,退出码非 0 表示有问题
+#   scripts/picoctl.sh watch     保活循环(systemd 用这个)
+#   scripts/picoctl.sh restart   重启整个容器(僵尸 :MSF 的唯一解)
 #
 # 可调环境变量:
 #   PICO_BACKEND=waydroid|adb    PICO_PKG=com.tencent.qqlite
@@ -49,6 +49,29 @@ case "$BACKEND" in
   *) log "PICO_BACKEND 只支持 waydroid 或 adb(当前: $BACKEND)"; exit 2 ;;
 esac
 
+# 通过 curl -K - 从 stdin 传递 Authorization 头，避免 Token 暴露在进程命令行或 URL 中
+curl_auth() {
+  local token="$1"; shift
+  # 过滤 CR/LF，防止 token 注入 curl -K 额外配置指令
+  token="${token//$'\r'/}"
+  token="${token//$'\n'/}"
+  if [ -n "$token" ]; then
+    local esc="${token//\\/\\\\}"
+    esc="${esc//\"/\\\"}"
+    printf 'header = "Authorization: Bearer %s"\n' "$esc" | curl -K - "$@"
+  else
+    curl "$@"
+  fi
+}
+
+# 仅将合法的 3 位 HTTP 状态码 ([1-5][0-9][0-9]) 视为可达，排除 curl 失败产出的 000 或空字符串
+is_valid_http_code() {
+  case "${1:-}" in
+    [1-5][0-9][0-9]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # ---------------------------------------------------------------- 底层探测
 
 # Waydroid 的 IP 每次 session 起来都可能变,写死会在重启后莫名其妙连不上
@@ -74,28 +97,82 @@ serial() {
 adbx() {
   local s; s="$(serial)"
   [ -z "$s" ] && return 1
-  $ADB -s "$s" "$@" 2>/dev/null
+  "$ADB" -s "$s" "$@" 2>/dev/null
 }
 
 wd_field() { waydroid status 2>/dev/null | tr -d '\000\r' | sed -n "s/^$1:[[:space:]]*//p" | head -1; }
 
 session_running() {
-  if [ "$BACKEND" = "adb" ]; then adbx get-state 2>/dev/null | grep -q '^device$';
+  if [ "$BACKEND" = "adb" ]; then adbx get-state 2>/dev/null | tr -d '\r' | grep -q '^device$';
   else [ "$(wd_field Session)" = "RUNNING" ]; fi
 }
 container_running() {
   if [ "$BACKEND" = "adb" ]; then session_running;
   else [ "$(wd_field Container)" = "RUNNING" ]; fi
 }
-app_running()      { [ -n "$(adbx shell pidof "$PKG")" ]; }
+app_running() { [ -n "$(adbx shell pidof "$PKG" | tr -d '\r\n ')" ]; }
 
-# 协议端自报状态:INIT / TRANSPORT_UP / SESSION_READY / LOGGED_IN / ONLINE / LOGGED_OUT
+# 检查 WebUI 端口 (6099) 是否存活（不依赖 OneBot 3001 是否已配置）
+webui_ready() {
+  local ip code; ip="$(android_ip)"; [ -z "$ip" ] && return 1
+  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "http://$ip:$WEBUI_PORT/" 2>/dev/null || true)"
+  is_valid_http_code "$code"
+}
+
+# 通过 WebUI /api/status 探测状态（适配 v2 默认无 3001 监听或仅反向 WS 模式）
+# 输出: ONLINE / WAITING_LOGIN / NEEDS_INIT / WEBUI_UP / (PICO_STATE_DETAILED=1 时 401 输出 WEBUI_AUTH_REJECTED) / (空=不可达)
+webui_state() {
+  local ip tmp code body; ip="$(android_ip)"; [ -z "$ip" ] && return 1
+  tmp="$(mktemp)"
+  code="$(curl_auth "$WEBUI_TOKEN" -sS -o "$tmp" -w '%{http_code}' --max-time 8 "http://$ip:$WEBUI_PORT/api/status" 2>/dev/null || true)"
+  body="$(cat "$tmp" 2>/dev/null || true)"
+  rm -f "$tmp"
+  case "$code" in
+    200)
+      if printf '%s' "$body" | grep -q '"online"[[:space:]]*:[[:space:]]*true'; then
+        echo "ONLINE"
+      else
+        echo "WAITING_LOGIN"
+      fi
+      ;;
+    428) echo "NEEDS_INIT" ;;
+    401)
+      if [ "${PICO_STATE_DETAILED:-0}" = "1" ]; then
+        echo "WEBUI_AUTH_REJECTED"
+      else
+        echo "WEBUI_UP"
+      fi
+      ;;
+    [1-5][0-9][0-9]) echo "WEBUI_UP" ;;
+    *) return 1 ;;
+  esac
+}
+
+# 协议端自报状态:
+#   OneBot HTTP 可达时返回: INIT / TRANSPORT_UP / SESSION_READY / LOGGED_IN / ONLINE / LOGGED_OUT
+#   v2 默认无 3001 监听时回退 WebUI 6099 + app_running: ONLINE / WAITING_LOGIN / NEEDS_INIT / WEBUI_UP
 pico_state() {
-  local ip url; ip="$(android_ip)"; [ -z "$ip" ] && return 1
-  url="http://$ip:$PORT/_pico_diagnostics"
-  [ -n "$TOKEN" ] && url="$url?access_token=$TOKEN"
-  curl -fsS --max-time 8 "$url" 2>/dev/null \
-    | grep -o '"state":"[A-Z_]*"' | head -1 | cut -d'"' -f4
+  local ip st; ip="$(android_ip)"; [ -z "$ip" ] && return 1
+  st="$(curl_auth "$TOKEN" -fsS --max-time 8 "http://$ip:$PORT/_pico_diagnostics" 2>/dev/null \
+    | grep -o '"state":"[A-Z_]*"' | head -1 | cut -d'"' -f4)"
+  if [ -n "$st" ]; then
+    echo "$st"
+    return 0
+  fi
+  if app_running; then
+    if [ "${PICO_WEBUI_SKIP_AUTH:-0}" != "1" ]; then
+      st="$(webui_state 2>/dev/null || true)"
+      if [ -n "$st" ]; then
+        echo "$st"
+        return 0
+      fi
+    fi
+    if webui_ready; then
+      echo "WEBUI_UP"
+      return 0
+    fi
+  fi
+  return 1
 }
 
 # 僵尸 :MSF 的两个判据,除了重启容器没有别的解法:
@@ -104,7 +181,7 @@ pico_state() {
 # 后者偶尔会漏报(PPID 正常但仍然僵),所以两个都查。
 msf_timeouts() { adbx shell logcat -d -t 800 2>/dev/null | tr -d '\000\r' | grep -ac 'MsfService timeout' || true; }
 msf_orphan() {
-  adbx shell "ps -A -o PPID,NAME | grep ':MSF'" 2>/dev/null |
+  adbx shell "ps -A -o PPID,NAME | grep ':MSF'" 2>/dev/null | tr -d '\r' |
     awk '{ if ($1 + 0 == 1) found = 1 } END { exit found ? 0 : 1 }'
 }
 
@@ -198,7 +275,7 @@ adb_connect() {
   local s; s="$(serial)"; [ -z "$s" ] && return 1
   local i=0
   while [ $i -lt 30 ]; do
-    $ADB connect "$s" >/dev/null 2>&1 || true
+    "$ADB" connect "$s" >/dev/null 2>&1 || true
     adbx shell true >/dev/null 2>&1 && return 0
     sleep 2; i=$((i + 1))
   done
@@ -224,19 +301,27 @@ cmd_up() {
   app_running || app_launch
   local i=0 st
   while [ $i -lt 40 ]; do
-    st="$(pico_state)"
+    st="$(pico_state || true)"
     case "$st" in
-      ONLINE)       log "PicoOneBot ONLINE"; show_access; return 0 ;;
-      LOGGED_OUT|"")  ;;
-      *)            log "协议端状态 $st,等待登录完成" ;;
+      ONLINE)
+        log "PicoOneBot ONLINE"; show_access; return 0 ;;
+      NEEDS_INIT)
+        log "WebUI(:$WEBUI_PORT) 已就绪，请打开控制台修改初始密码后再扫码登录"
+        show_access; return 0 ;;
+      WEBUI_UP)
+        log "$PKG 运行中且 WebUI(:$WEBUI_PORT) 就绪"
+        show_access; return 0 ;;
+      LOGGED_OUT|WAITING_LOGIN|"") ;;
+      *)
+        log "协议端状态 $st,等待登录完成" ;;
     esac
-    if [ "$st" = "LOGGED_OUT" ] || { [ -n "$st" ] && [ "$st" != "ONLINE" ] && [ $i -gt 10 ]; }; then
+    if [ "$st" = "LOGGED_OUT" ] || [ "$st" = "WAITING_LOGIN" ] || { [ -n "$st" ] && [ "$st" != "ONLINE" ] && [ $i -gt 10 ]; }; then
       log "还没登录 —— 跑 '$0 qr' 扫码"
       show_access; return 2
     fi
     sleep 3; i=$((i + 1))
   done
-  log "协议端在 ${PORT} 上没有应答"
+  log "协议端(${PORT})与 WebUI(${WEBUI_PORT}) 均无应答"
   return 1
 }
 
@@ -262,21 +347,21 @@ cmd_install() {
   [ -f "$apk" ] || { log "找不到 $apk"; return 1; }
   session_running && container_running || session_start >/dev/null 2>&1
   adb_connect || { log "adb 连不上 $(serial)"; return 1; }
-  if adbx shell pm list packages | grep -q "^package:$PKG$"; then
+  if adbx shell pm list packages | tr -d '\r' | grep -q "^package:$PKG$"; then
     log "卸载已装的 $PKG(会清数据,之后需要重新扫码)"
     adbx uninstall "$PKG" >/dev/null || true
   fi
   log "安装 $apk"
-  local out; out="$($ADB -s "$(serial)" install "$apk" 2>&1 | tr -d '\r')"
+  local out; out="$("$ADB" -s "$(serial)" install "$apk" 2>&1 | tr -d '\r')"
   echo "$out" | grep -q "Success" || { log "安装失败:"; echo "$out" | grep -v Incremental; return 1; }
   adbx shell pm grant "$PKG" android.permission.POST_NOTIFICATIONS >/dev/null 2>&1 || true
-  adbx shell sh -c "mkdir -p /sdcard/pico-onebot && printf '%s\\n' pico-auto-accept-privacy-v1 > /sdcard/pico-onebot/auto-accept-privacy && printf '%s\\n' pico-auto-accept-privacy-v1 > /data/local/tmp/pico-auto-accept-privacy && chmod 0644 /data/local/tmp/pico-auto-accept-privacy" >/dev/null 2>&1 || true
+  adbx shell "printf '%s\n' pico-auto-accept-privacy-v1 > /data/local/tmp/pico-auto-accept-privacy && chmod 0644 /data/local/tmp/pico-auto-accept-privacy" >/dev/null 2>&1 || true
   cmd_restart
   # QIMEI 在首次进程启动时早于隐私页初始化。Hook 点击真实“同意”按钮后，
   # 等日志确认授权已经由 QQ 自己落盘，再重启一次主进程和 :MSF。
   local i=0
   while [ $i -lt 30 ]; do
-    adbx shell logcat -d -s PicoOB:I '*:S' 2>/dev/null | grep -q 'Privacy agreement accepted by deployment hook' && break
+    adbx shell logcat -d -s PicoOB:I '*:S' 2>/dev/null | tr -d '\r' | grep -q 'Privacy agreement accepted by deployment hook' && break
     sleep 1; i=$((i + 1))
   done
   if [ $i -lt 30 ]; then
@@ -290,13 +375,13 @@ cmd_install() {
 }
 
 cmd_qr() {
-  app_running || { log "$PKG 没在跑,先拉起来"; cmd_up >/dev/null 2>&1; }
+  app_running || { log "$PKG 没在跑,先拉起来"; cmd_up >/dev/null 2>&1 || true; }
   local py; py="$(command -v python3 || command -v python)"
   [ -z "$py" ] && { log "需要 python3 才能渲染二维码"; return 1; }
   local ip; ip="$(android_ip)"
   local api_opts=()
   [ -n "$ip" ] && api_opts=(--api "http://$ip:$WEBUI_PORT")
-  "$py" "$HERE/picoqr.py" "${api_opts[@]}" "$@"
+  PICO_WEBUI_TOKEN="$WEBUI_TOKEN" "$py" "$HERE/picoqr.py" "${api_opts[@]}" "$@"
 }
 
 cmd_status() {
@@ -309,6 +394,7 @@ cmd_status() {
   fi
   printf 'android ip       : %s\n' "$(android_ip)"
   printf 'app %-14s: %s\n' "$PKG" "$(app_running && echo RUNNING || echo DOWN)"
+  printf 'webui :%-10s: %s\n' "$WEBUI_PORT" "$(webui_ready && echo READY || echo DOWN)"
   printf 'pico state       : %s\n' "$(pico_state || echo UNREACHABLE)"
   printf 'MsfService timeout: %s (必须是 0)\n' "$(msf_timeouts)"
   printf ':MSF 孤儿进程     : %s\n' "$(msf_orphan && echo 'YES —— 僵尸,需要 restart' || echo no)"
@@ -322,12 +408,15 @@ cmd_doctor() {
   local n; n="$(msf_timeouts)"
   [ "${n:-0}" -gt 2 ] && { echo "NG  MsfService timeout x$n —— 僵尸 :MSF,必须重启容器"; bad=1; }
   msf_orphan && { echo "NG  :MSF 的 PPID=1 —— 僵尸进程,联网请求会全部超时"; bad=1; }
-  local st; st="$(pico_state)"
+  local st; st="$(pico_state || true)"
   case "$st" in
-    ONLINE) echo "OK  PicoOneBot ONLINE" ;;
-    "")     echo "NG  协议端无应答"; bad=1 ;;
-    LOGGED_OUT) echo "NG  已掉线,需要重新扫码($0 qr)"; bad=1 ;;
-    *)      echo "NG  协议端状态 $st"; bad=1 ;;
+    ONLINE)        echo "OK  PicoOneBot ONLINE" ;;
+    WEBUI_UP)      echo "OK  WebUI(:$WEBUI_PORT) 就绪且进程运行中 (如需检查登录态请设置 PICO_WEBUI_TOKEN 或 OneBot HTTP 监听)" ;;
+    NEEDS_INIT)    echo "OK  WebUI(:$WEBUI_PORT) 就绪 (等待首次修改控制台密码)" ;;
+    WAITING_LOGIN) echo "NG  等待扫码登录 ($0 qr)"; bad=1 ;;
+    "")            echo "NG  协议端与 WebUI(:$WEBUI_PORT) 均无应答"; bad=1 ;;
+    LOGGED_OUT)    echo "NG  已掉线,需要重新扫码($0 qr)"; bad=1 ;;
+    *)             echo "NG  协议端状态 $st"; bad=1 ;;
   esac
   return $bad
 }
@@ -336,27 +425,46 @@ cmd_doctor() {
 
 cmd_watch() {
   log "保活循环启动,间隔 ${INTERVAL}s"
-  local miss=0 last_restart=0 last_state=""
-  cmd_up >/dev/null 2>&1
+  local miss=0 last_restart=0 last_state="" webui_skip_auth=0
+  cmd_up >/dev/null 2>&1 || true
   while :; do
-    local st now; st="$(pico_state)"; now="$(date +%s)"
+    local st now; st="$(PICO_WEBUI_SKIP_AUTH="$webui_skip_auth" PICO_STATE_DETAILED=1 pico_state || true)"; now="$(date +%s)"
 
-    if [ "$st" = "ONLINE" ]; then
-      [ "$last_state" != "ONLINE" ] && log "ONLINE"
+    if [ "$st" = "WEBUI_AUTH_REJECTED" ]; then
+      # 仅在明确收到 401 鉴权拒绝时暂停携带密码探测，避免瞬时 429/5xx 永久锁存跳过鉴权
+      webui_skip_auth=1
+      st="WEBUI_UP"
+    elif [ "$st" = "ONLINE" ] || [ "$st" = "NEEDS_INIT" ] || [ "$st" = "WAITING_LOGIN" ]; then
+      webui_skip_auth=0
+    fi
+
+    if [ "$st" = "ONLINE" ] || [ "$st" = "WEBUI_UP" ]; then
+      if [ "$last_state" != "$st" ]; then
+        if [ "$st" = "ONLINE" ]; then
+          log "ONLINE"
+        else
+          log "$PKG 运行中且 WebUI(:$WEBUI_PORT) 就绪 (如需检测登录态请配置 PICO_WEBUI_TOKEN 或 OneBot HTTP 端口)"
+        fi
+      fi
       miss=0; last_state="$st"
       # 在线也可能是"假在线":僵尸 :MSF 下 isLogin 仍为 true,只有日志露馅
       local n; n="$(msf_timeouts)"
       if { [ "${n:-0}" -gt 2 ] || msf_orphan; } && [ $((now - last_restart)) -gt 600 ]; then
-        log "ONLINE 但 :MSF 已僵(timeout x${n:-0} / PPID=1)—— 假在线,重启容器"
-        cmd_restart; last_restart="$now"; miss=0
+        log "$st 但 :MSF 已僵(timeout x${n:-0} / PPID=1)—— 假在线,重启容器"
+        cmd_restart; last_restart="$now"; miss=0; webui_skip_auth=0
       fi
       sleep "$INTERVAL"; continue
     fi
 
-    if [ "$st" = "LOGGED_OUT" ]; then
-      # 掉线是要人扫码的,重启一百次也没用,只把话说清楚
-      [ "$last_state" != "LOGGED_OUT" ] && log "已掉线,等待重新扫码:$0 qr"
-      last_state="$st"; sleep "$INTERVAL"; continue
+    if [ "$st" = "NEEDS_INIT" ]; then
+      [ "$last_state" != "NEEDS_INIT" ] && log "WebUI(:$WEBUI_PORT) 已就绪，等待首次修改控制台密码"
+      miss=0; last_state="$st"; sleep "$INTERVAL"; continue
+    fi
+
+    if [ "$st" = "WAITING_LOGIN" ] || [ "$st" = "LOGGED_OUT" ]; then
+      # 掉线或未登录需要扫码,重启容器无济于事,只把状态说清楚
+      [ "$last_state" != "$st" ] && log "等待扫码登录 ($st):$0 qr"
+      miss=0; last_state="$st"; sleep "$INTERVAL"; continue
     fi
 
     case "$st" in
@@ -374,10 +482,10 @@ cmd_watch() {
 
     if ! session_running || ! container_running; then
       log "session/container 掉了,重新拉起"
-      cmd_up >/dev/null 2>&1; miss=0
+      cmd_up >/dev/null 2>&1 || true; miss=0; webui_skip_auth=0
     elif [ "$miss" -ge 6 ] && [ $((now - last_restart)) -gt 300 ]; then
       log "连续 $miss 次异常,升级到重启容器"
-      cmd_restart; last_restart="$now"; miss=0
+      cmd_restart; last_restart="$now"; miss=0; webui_skip_auth=0
     elif [ "$miss" -ge 3 ]; then
       log "尝试重新拉起 $PKG"
       app_running || app_launch
@@ -393,14 +501,16 @@ cmd_logout() {
     log "无法获取 Android IP"
     return 1
   fi
-  local url="http://$ip:$PORT/_pico_logout"
-  [ -n "$TOKEN" ] && url="$url?access_token=$TOKEN"
-  curl -fsS -X POST --max-time 8 "$url" >/dev/null 2>&1 || {
-    python3 "$HERE/../tools/obact.py" _pico_logout >/dev/null 2>&1 || {
-      log "调用 _pico_logout 失败(服务未就绪?)"
-      return 1
-    }
-  }
+  if curl_auth "$WEBUI_TOKEN" -fsS -X POST -H 'Content-Type: application/json' -d '{}' --max-time 8 \
+      "http://$ip:$WEBUI_PORT/api/account/logout" >/dev/null 2>&1; then
+    :
+  elif curl_auth "$TOKEN" -fsS -X POST -H 'Content-Type: application/json' -d '{}' --max-time 8 \
+      "http://$ip:$PORT/_pico_logout" >/dev/null 2>&1; then
+    :
+  else
+    log "退出登录失败: 请确认 WebUI(:$WEBUI_PORT) 已初始化并配置正确的 PICO_WEBUI_TOKEN，或 OneBot HTTP(:$PORT) 与 PICO_TOKEN 可用"
+    return 1
+  fi
   log "已触发退出登录，等待进入扫码页面..."
   sleep 4
   cmd_qr
@@ -411,16 +521,18 @@ cmd_login() {
   cmd_qr
 }
 
-case "${1:-status}" in
-  up)      shift; cmd_up "$@" ;;
-  install) shift; cmd_install "$@" ;;
-  qr)      shift; cmd_qr "$@" ;;
-  login)   shift; cmd_login "$@" ;;
-  logout)  shift; cmd_logout "$@" ;;
-  status)  cmd_status ;;
-  doctor)  cmd_doctor ;;
-  watch)   cmd_watch ;;
-  restart) cmd_restart ;;
-  stop)    session_stop ;;
-  *)       sed -n '2,30p' "$0"; exit 2 ;;
-esac
+if [ "${PICOCTL_SOURCE_ONLY:-0}" != "1" ]; then
+  case "${1:-status}" in
+    up)      shift; cmd_up "$@" ;;
+    install) shift; cmd_install "$@" ;;
+    qr)      shift; cmd_qr "$@" ;;
+    login)   shift; cmd_login "$@" ;;
+    logout)  shift; cmd_logout "$@" ;;
+    status)  cmd_status ;;
+    doctor)  cmd_doctor ;;
+    watch)   cmd_watch ;;
+    restart) cmd_restart ;;
+    stop)    session_stop ;;
+    *)       sed -n '2,30p' "$0"; exit 2 ;;
+  esac
+fi

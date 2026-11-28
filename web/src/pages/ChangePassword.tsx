@@ -1,24 +1,33 @@
-import { useState, type FormEvent } from "react";
-import { Eye, EyeOff, KeyRound, LockKeyhole, ShieldCheck } from "lucide-react";
+import { useId, useState, type FormEvent } from "react";
+import { ArrowLeft, Eye, EyeOff, KeyRound, LockKeyhole, ShieldCheck } from "lucide-react";
 import { Logo } from "../components/Logo";
 import { Button, Field, Input, useToast } from "../components/ui";
-import { api } from "../lib/api";
+import { ApiError, api, getErrorMessage, setToken } from "../lib/api";
 
 const MIN_PASSWORD_LENGTH = 8;
 
-export function ChangePassword({ onSuccess }: { onSuccess: () => void }) {
+export function ChangePassword({
+  onSuccess,
+  onCancel,
+}: {
+  onSuccess: () => void;
+  onCancel: () => void;
+}) {
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
   const [show, setShow] = useState(false);
   const [loading, setLoading] = useState(false);
+  const idPrefix = useId();
   const toast = useToast();
-  const candidate = password.trim();
-  const validationMessage =
-    candidate.length < MIN_PASSWORD_LENGTH
-      ? `控制台密码至少 ${MIN_PASSWORD_LENGTH} 位，当前为 ${candidate.length} 位`
-      : candidate === "picopico"
+
+  const hasEdgeWhitespace = password !== password.trim();
+  const validationMessage = hasEdgeWhitespace
+    ? "密码首尾不能包含空格"
+    : password.length < MIN_PASSWORD_LENGTH
+      ? `控制台密码至少 ${MIN_PASSWORD_LENGTH} 位，当前为 ${password.length} 位`
+      : password === "picopico"
         ? "不能继续使用初始密码 picopico"
-        : candidate !== confirm.trim()
+        : password !== confirm
           ? "两次输入的密码不一致"
           : "";
 
@@ -30,12 +39,17 @@ export function ChangePassword({ onSuccess }: { onSuccess: () => void }) {
     }
     setLoading(true);
     try {
-      const result = await api.initializeWebuiPassword(candidate);
+      const result = await api.initializeWebuiPassword(password);
       if (!result.ok) throw new Error(result.message || "修改失败");
+      if (result.token) setToken(result.token);
       toast.push("success", "控制台密码已更新");
       onSuccess();
     } catch (error) {
-      toast.push("error", (error as Error).message);
+      if (error instanceof ApiError && error.status === 401) {
+        // Central unauthorized handler resets back to Login and notifies the user.
+        return;
+      }
+      toast.push("error", getErrorMessage(error, "修改失败"));
     } finally {
       setLoading(false);
     }
@@ -57,15 +71,19 @@ export function ChangePassword({ onSuccess }: { onSuccess: () => void }) {
         <div className="mt-6 space-y-4">
           <Field
             label="新密码"
+            htmlFor={`${idPrefix}-new-password`}
             hint={
-              candidate.length > 0 && candidate.length < MIN_PASSWORD_LENGTH
-                ? `已输入 ${candidate.length} 位，还需 ${MIN_PASSWORD_LENGTH - candidate.length} 位`
-                : "至少 8 位，不能与初始密码相同"
+              hasEdgeWhitespace
+                ? "密码首尾不能包含空格"
+                : password.length > 0 && password.length < MIN_PASSWORD_LENGTH
+                  ? `已输入 ${password.length} 位，还需 ${MIN_PASSWORD_LENGTH - password.length} 位`
+                  : "至少 8 位，首尾不能含空格，且不能与初始密码相同"
             }
           >
             <div className="relative">
               <KeyRound className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-pico-muted" />
               <Input
+                id={`${idPrefix}-new-password`}
                 className="pl-10 pr-11"
                 type={show ? "text" : "password"}
                 value={password}
@@ -83,10 +101,11 @@ export function ChangePassword({ onSuccess }: { onSuccess: () => void }) {
               </button>
             </div>
           </Field>
-          <Field label="确认新密码" hint={confirm && confirm !== password ? "两次输入不一致" : undefined}>
+          <Field label="确认新密码" htmlFor={`${idPrefix}-confirm-password`} hint={confirm && confirm !== password ? "两次输入不一致" : undefined}>
             <div className="relative">
               <LockKeyhole className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-pico-muted" />
               <Input
+                id={`${idPrefix}-confirm-password`}
                 className="pl-10"
                 type={show ? "text" : "password"}
                 value={confirm}
@@ -97,6 +116,9 @@ export function ChangePassword({ onSuccess }: { onSuccess: () => void }) {
           </Field>
           <Button type="submit" size="lg" className="w-full" loading={loading}>
             保存并进入控制台
+          </Button>
+          <Button type="button" variant="ghost" className="w-full" onClick={onCancel} disabled={loading}>
+            <ArrowLeft className="h-4 w-4" /> 返回登录
           </Button>
         </div>
       </form>

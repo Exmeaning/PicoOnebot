@@ -4,7 +4,8 @@ import java.io.EOFException
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
-import java.util.Random
+import java.net.SocketTimeoutException
+import java.security.SecureRandom
 
 /**
  * RFC 6455 帧编解码。自带实现,不引第三方库 ——
@@ -20,6 +21,7 @@ object WsFrame {
     const val OP_PONG = 0xA
 
     private const val MAX_PAYLOAD = 32L * 1024 * 1024
+    private const val MAX_CONTROL_PAYLOAD = 125
 
     /**
      * 单条消息(分片累积后)的上限。`MAX_PAYLOAD` 只约束**单帧**,
@@ -27,25 +29,64 @@ object WsFrame {
      */
     const val MAX_MESSAGE = 32L * 1024 * 1024
 
-    private val rng = Random()
+    /** 单行 HTTP 请求行 / Header / Chunk 头的硬上限,防未鉴权无换行 OOM DoS。 */
+    const val MAX_LINE_BYTES = 8 * 1024
+
+    private val rng = SecureRandom()
 
     class Frame(val opcode: Int, val payload: ByteArray, val fin: Boolean)
+
+    class ProtocolException(val closeCode: Int, message: String) : IOException(message)
+
+    class LineTooLongException(message: String) : IOException(message)
+
+    private fun isValidOpcode(opcode: Int): Boolean = when (opcode) {
+        OP_CONT, OP_TEXT, OP_BIN, OP_CLOSE, OP_PING, OP_PONG -> true
+        else -> false
+    }
+
+    /** RFC 6455 §7.4.1 / IANA: 合法的线上传输 CLOSE 状态码(排除 1004/1005/1006/1015 等禁用码)。 */
+    fun isValidCloseCode(code: Int): Boolean = when (code) {
+        in 1000..1003 -> true
+        in 1007..1014 -> true
+        in 3000..4999 -> true
+        else -> false
+    }
 
     /**
      * @param requireMask 读到的帧是否**必须**带掩码位。
      *   服务端读客户端帧时必须为 true(RFC 6455 §5.1),否则不符合规范的对端
-     *   会被静默当成正常连接用下去;客户端读服务端帧时必须为 false。
+     *   会被静默当成正常连接用下去;客户端读服务端帧时必须为 false,且不得带掩码。
      */
     @Throws(IOException::class)
     fun read(ins: InputStream, requireMask: Boolean = false): Frame {
         val b0 = ins.read()
         if (b0 < 0) throw EOFException("stream closed")
         val b1 = readByte(ins)
+        if ((b0 and 0x70) != 0) {
+            throw ProtocolException(1002, "protocol error: non-zero RSV bits")
+        }
         val fin = (b0 and 0x80) != 0
         val opcode = b0 and 0x0F
+        if (!isValidOpcode(opcode)) {
+            throw ProtocolException(1002, "protocol error: reserved opcode $opcode")
+        }
+        val isControl = (opcode and 0x08) != 0
+        if (isControl && !fin) {
+            throw ProtocolException(1002, "protocol error: fragmented control frame")
+        }
         val masked = (b1 and 0x80) != 0
-        if (requireMask && !masked) throw IOException("protocol error: client frame without mask")
-        var len = (b1 and 0x7F).toLong()
+        if (requireMask && !masked) {
+            throw ProtocolException(1002, "protocol error: client frame without mask")
+        }
+        if (!requireMask && masked) {
+            throw ProtocolException(1002, "protocol error: server frame must not be masked")
+        }
+        val rawLen = b1 and 0x7F
+        if (isControl && rawLen > MAX_CONTROL_PAYLOAD) {
+            throw ProtocolException(1002, "protocol error: control frame payload too large")
+        }
+        var len = rawLen.toLong()
         if (len == 126L) {
             len = ((readByte(ins).toLong() shl 8) or readByte(ins).toLong())
         } else if (len == 127L) {
@@ -53,7 +94,11 @@ object WsFrame {
             for (i in 0 until 8) v = (v shl 8) or readByte(ins).toLong()
             len = v
         }
-        if (len < 0 || len > MAX_PAYLOAD) throw IOException("frame too large: $len")
+        if (len < 0) throw ProtocolException(1002, "protocol error: invalid frame length $len")
+        if (len > MAX_PAYLOAD) throw ProtocolException(1009, "frame too large: $len")
+        if (opcode == OP_CLOSE && len == 1L) {
+            throw ProtocolException(1002, "protocol error: close frame payload length 1")
+        }
         val mask = if (masked) ByteArray(4).also { readFully(ins, it) } else null
         val data = ByteArray(len.toInt())
         readFully(ins, data)
@@ -122,15 +167,55 @@ object WsFrame {
         }
     }
 
-    /** 读一行(以 \n 结束,去掉 \r);流结束返回 null。 */
+    /**
+     * 读一行(以 \r\n 或 \n 结束,拒绝行中裸 \r 并限制最大长度与可选单调截止时间);流结束返回 null。
+     * 若同时提供 [deadlineNanos] 与 [setSoTimeout],则在每次 `read()` 前按剩余截止时间动态收缩超时。
+     */
+    @JvmOverloads
     @Throws(IOException::class)
-    fun readLine(ins: InputStream): String? {
+    fun readLine(
+        ins: InputStream,
+        maxLen: Int = MAX_LINE_BYTES,
+        deadlineNanos: Long? = null,
+        setSoTimeout: ((Int) -> Unit)? = null
+    ): String? {
         val sb = StringBuilder()
+        var count = 0
+        var prevCr = false
+        var lastTimeoutMs = -1
         while (true) {
+            if (deadlineNanos != null) {
+                val remNanos = deadlineNanos - System.nanoTime()
+                if (remNanos <= 0L) {
+                    throw SocketTimeoutException("line read deadline exceeded")
+                }
+                if (setSoTimeout != null) {
+                    val remMs = ((remNanos + 999_999L) / 1_000_000L).coerceIn(1L, Int.MAX_VALUE.toLong()).toInt()
+                    if (remMs != lastTimeoutMs) {
+                        setSoTimeout(remMs)
+                        lastTimeoutMs = remMs
+                    }
+                }
+            }
             val b = ins.read()
-            if (b < 0) return if (sb.isEmpty()) null else sb.toString()
+            if (b < 0) {
+                if (prevCr) throw IOException("malformed line: truncated after CR")
+                return if (sb.isEmpty()) null else sb.toString()
+            }
+            if (prevCr) {
+                if (b == '\n'.code) break
+                throw IOException("malformed line: bare CR")
+            }
             if (b == '\n'.code) break
-            if (b != '\r'.code) sb.append(b.toChar())
+            if (b == '\r'.code) {
+                prevCr = true
+                continue
+            }
+            count++
+            if (count > maxLen) {
+                throw LineTooLongException("line exceeds $maxLen bytes")
+            }
+            sb.append(b.toChar())
         }
         return sb.toString()
     }

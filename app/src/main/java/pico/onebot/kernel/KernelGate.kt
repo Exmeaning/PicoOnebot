@@ -9,6 +9,11 @@ import com.tencent.qqnt.kernel.nativeinterface.IQQNTWrapperSession
 import pico.onebot.core.PicoLog
 import pico.onebot.event.MetaEvents
 import java.lang.reflect.Modifier
+import java.util.ArrayDeque
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * 与宿主耦合的唯一入口之一(另一个是 hook 包)。
@@ -20,6 +25,8 @@ import java.lang.reflect.Modifier
 object KernelGate {
 
     enum class State { INIT, TRANSPORT_UP, SESSION_READY, LOGGED_IN, ONLINE, LOGGED_OUT }
+
+    private const val LOGOUT_SUPPRESS_NS = 5_000_000_000L
 
     @Volatile
     var state: State = State.INIT
@@ -41,7 +48,8 @@ object KernelGate {
     var lastError: String = ""
         private set
 
-    private val watchWakeup = java.util.concurrent.Semaphore(0)
+    private val watchWakeup = Semaphore(0)
+    private val watchStarted = AtomicBoolean(false)
 
     @Volatile
     private var watchThread: Thread? = null
@@ -52,22 +60,37 @@ object KernelGate {
     @Volatile
     private var cachedSessionField: java.lang.reflect.Field? = null
 
+    @Volatile
+    private var cachedCandidateMethods: List<java.lang.reflect.Method> = emptyList()
+
+    @Volatile
+    private var cachedCandidateFields: List<java.lang.reflect.Field> = emptyList()
+
+    @Volatile
+    private var candidatesCached: Boolean = false
+
     /**
-     * 会话代数。每次 [onSessionLost] 自增,用于让正在执行的 [probe] 立刻作废。
-     *
-     * 没有它时的竞态:probe 在第 123 行通过检查后,内核线程的 onKickedOffLine
-     * 调 onSessionLost 清掉 listenerId 并置 LOGGED_OUT;probe 继续往下跑,
-     * 对已失效的 session 重新注册监听器并置 ONLINE。之后要等一个 5s 的
-     * ONLINE 轮询间隔才会发现,期间动作会打到已登出的会话上。
+     * 会话代数。每次 [onSessionLost] 在锁内自增,用于让正在执行的 [probe] 与监听器注册立刻作废。
      */
     @Volatile
     private var sessionEpoch: Long = 0
 
+    @Volatile
+    private var loggingOutCount: Int = 0
+
+    private var logoutSuppressUntilNs: Long = 0L
+    private var hasLogoutSuppress: Boolean = false
+    private var logoutSuppressedSession: IQQNTWrapperSession? = null
+
+    private val pendingTransitions = ArrayDeque<Pair<State, State>>()
+    private var drainingTransitions = false
+
     private const val KERNEL_SERVICE_UTIL = "com.tencent.qqnt.msg.KernelServiceUtil"
 
-    // ---------------- 状态机 ----------------
+    // ---------------- 状态机与清理钩子 ----------------
 
-    private val stateListeners = java.util.concurrent.CopyOnWriteArrayList<(State) -> Unit>()
+    private val stateListeners = CopyOnWriteArrayList<(State) -> Unit>()
+    private val sessionLostHooks = CopyOnWriteArrayList<() -> Unit>()
 
     /** 订阅状态机变化(引导面板等 UI 用);返回取消函数。回调线程不定,UI 自己 post。 */
     fun addStateListener(l: (State) -> Unit): () -> Unit {
@@ -75,11 +98,66 @@ object KernelGate {
         return { stateListeners.remove(l) }
     }
 
+    /** 注册会话丢失/切号时的清理回调(线程安全);返回取消函数。 */
+    fun registerSessionLostHook(cb: () -> Unit): () -> Unit {
+        sessionLostHooks.add(cb)
+        return { sessionLostHooks.remove(cb) }
+    }
+
+    fun currentEpoch(): Long = sessionEpoch
+
+    fun isEpochCurrent(epoch: Long): Boolean = synchronized(this) {
+        sessionEpoch == epoch && loggingOutCount == 0 && state != State.LOGGED_OUT
+    }
+
     fun setState(next: State) {
-        if (state == next) return
+        val changed = synchronized(this) { transitionLocked(next) }
+        if (changed) drainStateTransitions()
+    }
+
+    private fun transitionLocked(next: State): Boolean {
+        if (state == next) return false
         val from = state
         state = next
-        MetaEvents.stateChanged(from.name, next.name)
+        pendingTransitions.addLast(from to next)
+        return true
+    }
+
+    private fun drainStateTransitions() {
+        var cur: Pair<State, State>? = synchronized(this) {
+            if (drainingTransitions) return
+            val head = pendingTransitions.pollFirst() ?: return
+            drainingTransitions = true
+            head
+        }
+        try {
+            while (cur != null) {
+                notifyStateChanged(cur.first, cur.second)
+                cur = synchronized(this) {
+                    val next = pendingTransitions.pollFirst()
+                    if (next == null) drainingTransitions = false
+                    next
+                }
+            }
+        } catch (t: Throwable) {
+            synchronized(this) { drainingTransitions = false }
+            throw t
+        }
+    }
+
+    private fun notifyStateChanged(from: State, next: State) {
+        if (next == State.ONLINE) {
+            try {
+                PicoLoginManager.clearQr()
+            } catch (t: Throwable) {
+                PicoLog.w("PicoLoginManager.clearQr failed: " + t.message)
+            }
+        }
+        try {
+            MetaEvents.stateChanged(from.name, next.name)
+        } catch (t: Throwable) {
+            PicoLog.w("MetaEvents.stateChanged failed: " + t.message)
+        }
         for (l in stateListeners) {
             try {
                 l(next)
@@ -92,7 +170,13 @@ object KernelGate {
     val ready: Boolean get() = state == State.ONLINE || state == State.LOGGED_IN
 
     fun startWatch() {
-        Thread({ watchLoop() }, "pico-kernel-watch").apply { isDaemon = true }.start()
+        if (!watchStarted.compareAndSet(false, true)) return
+        try {
+            Thread({ watchLoop() }, "pico-kernel-watch").apply { isDaemon = true }.start()
+        } catch (t: Throwable) {
+            watchStarted.set(false)
+            throw t
+        }
     }
 
     private fun wakeWatch() {
@@ -121,8 +205,9 @@ object KernelGate {
             }
             prevState = cur
             try {
-                watchWakeup.tryAcquire(delay, java.util.concurrent.TimeUnit.MILLISECONDS)
+                watchWakeup.tryAcquire(delay, TimeUnit.MILLISECONDS)
             } catch (t: InterruptedException) {
+                Thread.currentThread().interrupt()
                 return
             }
         }
@@ -130,106 +215,237 @@ object KernelGate {
 
     /** 一次探测:会话 → 登录态 → 监听器注册。每步都可独立失败并在下一轮重试。 */
     private fun probe() {
-        val epochAtStart = sessionEpoch
-        val cached = sessionRef
+        val epochAtStart: Long
+        val cached: IQQNTWrapperSession?
+        val suppressActive: Boolean
+        val suppressUntil: Long
+        val suppressedSession: IQQNTWrapperSession?
+        synchronized(this) {
+            if (loggingOutCount > 0) return
+            epochAtStart = sessionEpoch
+            cached = sessionRef
+            suppressActive = hasLogoutSuppress
+            suppressUntil = logoutSuppressUntilNs
+            suppressedSession = logoutSuppressedSession
+        }
+
+        val isLoggedIn = loggedIn()
         val live = findSessionByReturnType()
-        if (live == null || !loggedIn()) {
-            if (state == State.ONLINE || state == State.LOGGED_IN || state == State.SESSION_READY ||
-                cached != null || listenerId != 0L
-            ) {
+
+        // api_logout 后等待宿主主线程 app.logout(true) 真正清除 isLogin,避免立刻重挂回旧会话
+        if (suppressActive) {
+            if (!isLoggedIn || live == null || (suppressedSession != null && live !== suppressedSession)) {
+                synchronized(this) {
+                    if (sessionEpoch == epochAtStart) {
+                        hasLogoutSuppress = false
+                        logoutSuppressUntilNs = 0L
+                        logoutSuppressedSession = null
+                    }
+                }
+            } else {
+                if ((suppressUntil - System.nanoTime()) > 0L) {
+                    return
+                }
+                synchronized(this) {
+                    if (sessionEpoch == epochAtStart) {
+                        hasLogoutSuppress = false
+                        logoutSuppressUntilNs = 0L
+                        logoutSuppressedSession = null
+                    }
+                }
+            }
+        }
+
+        if (live == null || !isLoggedIn) {
+            val shouldLose: Boolean
+            val shouldTransportUp: Boolean
+            synchronized(this) {
+                if (sessionEpoch != epochAtStart || loggingOutCount > 0) return
+                shouldLose = state == State.ONLINE || state == State.LOGGED_IN ||
+                    state == State.SESSION_READY || sessionRef != null || listenerId != 0L
+                shouldTransportUp = !shouldLose && state == State.INIT
+                if (shouldTransportUp) transitionLocked(State.TRANSPORT_UP)
+            }
+            if (shouldLose) {
                 onSessionLost(if (live == null) "no_session" else "not_logged_in")
-            } else if (state == State.INIT) {
-                setState(State.TRANSPORT_UP)
+            } else if (shouldTransportUp) {
+                drainStateTransitions()
             }
             return
         }
+
         if (cached != null && cached !== live) {
             onSessionLost("session_replaced")
+            // 下一轮探测在新 epoch 上接管 live
+            return
         }
-        // 会话在本轮探测期间被作废(被踢下线 / 换号替换):上面拿到的 live 快照
-        // 已经过期,不能再写 sessionRef,更不能把状态从 LOGGED_OUT 推回
-        // SESSION_READY / LOGGED_IN —— 那会出现一段假 ONLINE 窗口,动作打到
-        // 已登出的会话上,直到下一轮 200ms 轮询才纠正回来。
-        if (sessionEpoch != epochAtStart) return
-        if (sessionRef !== live) sessionRef = live
 
-        if (state == State.INIT || state == State.TRANSPORT_UP || state == State.LOGGED_OUT) {
-            setState(State.SESSION_READY)
+        val transitionedToReady = synchronized(this) {
+            if (sessionEpoch != epochAtStart || loggingOutCount > 0) return
+            if (sessionRef !== live) sessionRef = live
+            if (state == State.INIT || state == State.TRANSPORT_UP || state == State.LOGGED_OUT) {
+                transitionLocked(State.SESSION_READY)
+            } else {
+                false
+            }
         }
+        if (transitionedToReady) drainStateTransitions()
 
         val uin = readSelfUin()
-        // 读 uin 期间同样可能被踢:先校验再写缓存,避免把失效会话的 uin 留在缓存里
-        if (sessionEpoch != epochAtStart) return
-        if (uin <= 0) return
-        selfUinCache = uin
-        if (state == State.SESSION_READY) setState(State.LOGGED_IN)
+        if (uin <= 0L) return
+        val uid = readSelfUid()
 
-        if (listenerId == 0L) {
-            val msg = msgService() ?: return
+        val accountChanged = synchronized(this) {
+            if (sessionEpoch != epochAtStart || loggingOutCount > 0 || sessionRef !== live) return
+            (selfUinCache > 0L && selfUinCache != uin) ||
+                (selfUidCache.isNotEmpty() && uid.isNotEmpty() && selfUidCache != uid)
+        }
+        if (accountChanged) {
+            onSessionLost("account_changed")
+            return
+        }
+        // 在进入 State.LOGGED_IN (ready=true) 之前先完成账号消息库切换，防止并发 send_msg 写入被 clearMemoryLocked 抹除
+        pico.onebot.msg.MsgIdStore.switchAccount(uin, epochAtStart)
+
+        val needRegisterListener: Boolean
+        val transitionedAfterLogin: Boolean
+        synchronized(this) {
+            if (sessionEpoch != epochAtStart || loggingOutCount > 0 || sessionRef !== live) return
+            if ((selfUinCache > 0L && selfUinCache != uin) ||
+                (selfUidCache.isNotEmpty() && uid.isNotEmpty() && selfUidCache != uid)
+            ) {
+                return
+            }
+            selfUinCache = uin
+            if (uid.isNotEmpty()) selfUidCache = uid
+            var changed = false
+            if (state == State.SESSION_READY) {
+                changed = transitionLocked(State.LOGGED_IN) || changed
+            }
+            needRegisterListener = (listenerId == 0L)
+            if (!needRegisterListener && state == State.LOGGED_IN) {
+                changed = transitionLocked(State.ONLINE) || changed
+            }
+            transitionedAfterLogin = changed
+        }
+        if (transitionedAfterLogin) drainStateTransitions()
+
+        if (needRegisterListener) {
+            val msg = safe { live.msgService } ?: return
             val id = MsgListenerProxy.register(msg)
             if (id != 0L) {
-                // 注册期间可能已经被踢下线:此时 sessionRef 已被 onSessionLost 清空,
-                // 这颗监听器属于失效会话,必须立刻摘掉,也不能置 ONLINE。
-                if (sessionEpoch != epochAtStart || sessionRef == null) {
+                val committed = synchronized(this) {
+                    if (sessionEpoch != epochAtStart || loggingOutCount > 0 || sessionRef !== live || listenerId != 0L) {
+                        false
+                    } else {
+                        listenerId = id
+                        transitionLocked(State.ONLINE)
+                        true
+                    }
+                }
+                if (!committed) {
                     PicoLog.w("probe: session lost during listener registration (id=$id), discarding")
-                    // 与 onSessionLost 里同一调用形式:摘掉这颗已属失效会话的监听器
                     runCatching { live.msgService?.removeKernelMsgListener(id) }
                         .onFailure { PicoLog.d("discard listener($id) ignored: ${it.message}") }
                     return
                 }
-                listenerId = id
                 PicoLog.i("kernel msg listener registered, id=$id")
-                setState(State.ONLINE)
+                drainStateTransitions()
             }
-        } else if (state == State.LOGGED_IN && sessionEpoch == epochAtStart) {
-            setState(State.ONLINE)
         }
 
-        // 名册监听器单独注册:它失败不该拖垮消息通路,所以放在消息监听器之后、且各自幂等
-        if (state == State.ONLINE && !ContactListeners.registered) ContactListeners.register()
+        // 名册监听器单独注册:它失败不该拖垮消息通路,传入 session 与 epoch 做代际守护
+        val shouldRegisterContacts = synchronized(this) {
+            sessionEpoch == epochAtStart && loggingOutCount == 0 && state == State.ONLINE && !ContactListeners.registered
+        }
+        if (shouldRegisterContacts) {
+            ContactListeners.register(live, epochAtStart)
+        }
     }
 
     /** 被踢/会话失效时回落,下一轮探测会重新注册监听器。 */
     fun onSessionLost(reason: String) {
         val oldId: Long
         val oldSession: IQQNTWrapperSession?
+        val transitioned: Boolean
         synchronized(this) {
-            if (listenerId == 0L && sessionRef == null && state == State.LOGGED_OUT) return
+            if (listenerId == 0L && sessionRef == null && state == State.LOGGED_OUT && reason != "api_logout") return
+            loggingOutCount++
             oldId = listenerId
             oldSession = sessionRef
             listenerId = 0
             sessionRef = null
             selfUinCache = 0
             selfUidCache = ""
-            // 让正在进行中的 probe 作废(见 sessionEpoch 的注释)
+            // 让正在进行中的 probe 与监听器注册立刻作废
             sessionEpoch++
+            if (reason == "api_logout") {
+                hasLogoutSuppress = true
+                logoutSuppressUntilNs = System.nanoTime() + LOGOUT_SUPPRESS_NS
+                if (oldSession != null) {
+                    logoutSuppressedSession = oldSession
+                }
+            }
+            transitioned = transitionLocked(State.LOGGED_OUT)
         }
-        PicoLog.w("session lost: $reason")
-        if (oldId != 0L && oldSession != null) {
-            runCatching { oldSession.msgService?.removeKernelMsgListener(oldId) }
-                .onFailure { PicoLog.d("removeKernelMsgListener($oldId) ignored: ${it.message}") }
+        var shouldWakeWatch = false
+        try {
+            PicoLog.w("session lost: $reason")
+            if (oldId != 0L && oldSession != null) {
+                runCatching { oldSession.msgService?.removeKernelMsgListener(oldId) }
+                    .onFailure { PicoLog.d("removeKernelMsgListener($oldId) ignored: ${it.message}") }
+            }
+            ContactListeners.reset(oldSession)
+            // 名册/昵称/消息管道/发送回执均是当前账号视角,切号必须统一清空
+            ContactStore.reset()
+            NickStore.reset()
+            UinUidStore.reset()
+            MsgPipeline.reset()
+            SendTracker.reset()
+            ReadReporter.reset()
+            MsgWatchdog.reset()
+            pico.onebot.msg.MsgIdStore.onSessionLost()
+            pico.onebot.media.MediaRefStore.reset()
+            pico.onebot.msg.ForwardStore.reset()
+            pico.onebot.media.MediaDownloader.reset()
+            pico.onebot.media.MediaFiles.clearServed()
+            PicoLoginManager.clearQr()
+            pico.onebot.net.Transport.clearReplay()
+            for (hook in sessionLostHooks) {
+                try {
+                    hook()
+                } catch (t: Throwable) {
+                    PicoLog.w("session lost hook failed: " + t.message)
+                }
+            }
+            if (transitioned) drainStateTransitions()
+        } finally {
+            synchronized(this) {
+                loggingOutCount = (loggingOutCount - 1).coerceAtLeast(0)
+                shouldWakeWatch = (loggingOutCount == 0)
+            }
         }
-        ContactListeners.reset()
-        // 名册是"当前账号的视角",不清就会在换号后把上一个人的群/好友返回给上游
-        ContactStore.reset()
-        ReadReporter.reset()
-        MsgWatchdog.reset()
-        setState(State.LOGGED_OUT)
-        wakeWatch()
+        if (shouldWakeWatch) wakeWatch()
     }
 
     // ---------------- 会话与服务 ----------------
 
     fun session(): IQQNTWrapperSession? {
+        if (loggingOutCount > 0 || state == State.LOGGED_OUT) return null
         sessionRef?.let { return it }
-        val found = findSessionByReturnType()
-        if (found != null) sessionRef = found
-        return found
+        if (!loggedIn()) return null
+        val epochAtStart = sessionEpoch
+        val found = findSessionByReturnType() ?: return null
+        synchronized(this) {
+            if (loggingOutCount > 0 || state == State.LOGGED_OUT || sessionEpoch != epochAtStart) return null
+            if (sessionRef == null) sessionRef = found
+            return sessionRef
+        }
     }
 
     /**
      * 会话解析结果的可读说明。登录前拿不到会话是**正常**的,但"为什么拿不到"
-     * 必须说得出来(类没了 / 没有这种 getter / getter 返回 null),否则 M2 排查就是瞎猜。
+     * 必须说得出来(类没了 / 没有这种 getter / getter 返回 null),否则排查就是瞎猜。
      */
     @Volatile
     var sessionProbe: String = "not-probed"
@@ -239,68 +455,155 @@ object KernelGate {
         cachedSessionMethod?.let { m ->
             try {
                 val v = m.invoke(null) as? IQQNTWrapperSession
-                if (v != null) {
-                    sessionProbe = "ok:method " + m.name + "()"
-                    return v
+                sessionProbe = if (v != null) {
+                    "ok:method " + m.name + "()"
+                } else {
+                    "getter-returned-null(" + m.name + "(),登录前属正常)"
                 }
-            } catch (t: Throwable) {
+                return v
+            } catch (_: Throwable) {
                 cachedSessionMethod = null
             }
         }
         cachedSessionField?.let { f ->
             try {
                 val v = f.get(null) as? IQQNTWrapperSession
-                if (v != null) {
-                    sessionProbe = "ok:field " + f.name
-                    return v
+                sessionProbe = if (v != null) {
+                    "ok:field " + f.name
+                } else {
+                    "getter-returned-null(" + f.name + ",登录前属正常)"
                 }
-            } catch (t: Throwable) {
+                return v
+            } catch (_: Throwable) {
                 cachedSessionField = null
+            }
+        }
+        if (candidatesCached) {
+            val methodsSnap = cachedCandidateMethods
+            val fieldsSnap = cachedCandidateFields
+            if (methodsSnap.isNotEmpty() || fieldsSnap.isNotEmpty()) {
+                var okInvocations = 0
+                var lastThrow: String? = null
+                for (m in methodsSnap) {
+                    try {
+                        val v = m.invoke(null) as? IQQNTWrapperSession
+                        okInvocations++
+                        if (v != null) {
+                            cachedSessionMethod = m
+                            sessionProbe = "ok:method " + m.name + "()"
+                            return v
+                        }
+                    } catch (t: Throwable) {
+                        lastThrow = m.name + "(): " + t.javaClass.simpleName + " " + t.message
+                    }
+                }
+                for (f in fieldsSnap) {
+                    try {
+                        val v = f.get(null) as? IQQNTWrapperSession
+                        okInvocations++
+                        if (v != null) {
+                            cachedSessionField = f
+                            sessionProbe = "ok:field " + f.name
+                            return v
+                        }
+                    } catch (t: Throwable) {
+                        lastThrow = f.name + ": " + t.javaClass.simpleName + " " + t.message
+                    }
+                }
+                if (okInvocations > 0) {
+                    sessionProbe = "getter-returned-null(已缓存候选 ${methodsSnap.size + fieldsSnap.size} 个,登录前属正常)"
+                    return null
+                }
+                if (lastThrow != null) {
+                    candidatesCached = false
+                    cachedCandidateMethods = emptyList()
+                    cachedCandidateFields = emptyList()
+                }
             }
         }
         val cls = try {
             Class.forName(KERNEL_SERVICE_UTIL)
-        } catch (t: Throwable) {
+        } catch (_: Throwable) {
             sessionProbe = "class-missing:$KERNEL_SERVICE_UTIL(base APK 变了?)"
             return null
         }
-        var candidates = 0
-        try {
-            for (m in cls.declaredMethods) {
-                if (!Modifier.isStatic(m.modifiers)) continue
-                if (m.parameterTypes.isNotEmpty()) continue
-                if (!IQQNTWrapperSession::class.java.isAssignableFrom(m.returnType)) continue
-                candidates++
-                m.isAccessible = true
-                val v = m.invoke(null)
-                if (v != null) {
-                    cachedSessionMethod = m
-                    sessionProbe = "ok:method " + m.name + "()"
-                    return v as IQQNTWrapperSession
-                }
-            }
-            // 兜底:有些版本把会话放在静态字段上
-            for (f in cls.declaredFields) {
-                if (!Modifier.isStatic(f.modifiers)) continue
-                if (!IQQNTWrapperSession::class.java.isAssignableFrom(f.type)) continue
-                candidates++
-                f.isAccessible = true
-                val v = f.get(null)
-                if (v != null) {
-                    cachedSessionField = f
-                    sessionProbe = "ok:field " + f.name
-                    return v as IQQNTWrapperSession
-                }
-            }
+        val discoveredMethods = ArrayList<java.lang.reflect.Method>()
+        val discoveredFields = ArrayList<java.lang.reflect.Field>()
+        var lastThrow: String? = null
+
+        val methods = try {
+            cls.declaredMethods
         } catch (t: Throwable) {
             lastError = "findSession: " + t.javaClass.simpleName + " " + t.message
             sessionProbe = "throw:" + lastError
             return null
         }
-        sessionProbe = if (candidates == 0) {
-            "no-static-getter-returning-IQQNTWrapperSession(共 " + cls.declaredMethods.size + " 个方法)"
-        } else {
-            "getter-returned-null(候选 $candidates 个,登录前属正常)"
+        for (m in methods) {
+            try {
+                if (!Modifier.isStatic(m.modifiers)) continue
+                if (m.parameterTypes.isNotEmpty()) continue
+                if (!IQQNTWrapperSession::class.java.isAssignableFrom(m.returnType)) continue
+                m.isAccessible = true
+                discoveredMethods.add(m)
+                val v = m.invoke(null) as? IQQNTWrapperSession
+                if (v != null) {
+                    cachedSessionMethod = m
+                    cachedCandidateMethods = ArrayList(discoveredMethods)
+                    candidatesCached = true
+                    sessionProbe = "ok:method " + m.name + "()"
+                    return v
+                }
+            } catch (t: Throwable) {
+                lastThrow = m.name + "(): " + t.javaClass.simpleName + " " + t.message
+            }
+        }
+
+        // 兜底:有些版本把会话放在静态字段上
+        val fields = try {
+            cls.declaredFields
+        } catch (_: Throwable) {
+            emptyArray()
+        }
+        for (f in fields) {
+            try {
+                if (!Modifier.isStatic(f.modifiers)) continue
+                if (!IQQNTWrapperSession::class.java.isAssignableFrom(f.type)) continue
+                f.isAccessible = true
+                discoveredFields.add(f)
+                val v = f.get(null) as? IQQNTWrapperSession
+                if (v != null) {
+                    cachedSessionField = f
+                    cachedCandidateMethods = ArrayList(discoveredMethods)
+                    cachedCandidateFields = ArrayList(discoveredFields)
+                    candidatesCached = true
+                    sessionProbe = "ok:field " + f.name
+                    return v
+                }
+            } catch (t: Throwable) {
+                lastThrow = f.name + ": " + t.javaClass.simpleName + " " + t.message
+            }
+        }
+
+        val candidates = discoveredMethods.size + discoveredFields.size
+        if (candidates > 0) {
+            cachedCandidateMethods = discoveredMethods
+            cachedCandidateFields = discoveredFields
+            candidatesCached = true
+            if (candidates == 1 && lastThrow == null) {
+                if (discoveredMethods.size == 1) cachedSessionMethod = discoveredMethods[0]
+                else if (discoveredFields.size == 1) cachedSessionField = discoveredFields[0]
+            }
+        }
+
+        sessionProbe = when {
+            candidates == 0 ->
+                "no-static-getter-returning-IQQNTWrapperSession(共 " + methods.size + " 个方法)"
+            lastThrow != null -> {
+                lastError = "findSession: $lastThrow"
+                "throw:$lastError"
+            }
+            else ->
+                "getter-returned-null(候选 $candidates 个,登录前属正常)"
         }
         return null
     }
@@ -321,17 +624,31 @@ object KernelGate {
     // ---------------- 自身身份 ----------------
 
     fun selfUin(): Long {
-        if (selfUinCache > 0) return selfUinCache
+        if (loggingOutCount > 0 || state == State.LOGGED_OUT) return 0L
+        val cached = selfUinCache
+        if (cached > 0L) return cached
+        val epochAtStart = sessionEpoch
         val v = readSelfUin()
-        if (v > 0) selfUinCache = v
-        return selfUinCache
+        if (v <= 0L) return 0L
+        synchronized(this) {
+            if (loggingOutCount > 0 || state == State.LOGGED_OUT || sessionEpoch != epochAtStart) return 0L
+            selfUinCache = v
+            return v
+        }
     }
 
     fun selfUid(): String {
-        if (selfUidCache.isNotEmpty()) return selfUidCache
+        if (loggingOutCount > 0 || state == State.LOGGED_OUT) return ""
+        val cached = selfUidCache
+        if (cached.isNotEmpty()) return cached
+        val epochAtStart = sessionEpoch
         val v = readSelfUid()
-        if (v.isNotEmpty()) selfUidCache = v
-        return selfUidCache
+        if (v.isEmpty()) return ""
+        synchronized(this) {
+            if (loggingOutCount > 0 || state == State.LOGGED_OUT || sessionEpoch != epochAtStart) return ""
+            selfUidCache = v
+            return v
+        }
     }
 
     /** 走 mqq 的 AppRuntime;未登录时返回 0(这是正常态,不是错误)。 */

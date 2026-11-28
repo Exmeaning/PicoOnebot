@@ -2,6 +2,8 @@ package pico.onebot.core
 
 import android.util.Log
 import org.json.JSONObject
+import java.io.PrintWriter
+import java.io.StringWriter
 import java.text.SimpleDateFormat
 import java.util.ArrayDeque
 import java.util.Date
@@ -34,7 +36,13 @@ object PicoLog {
     private val fmt = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US)
     private val listeners = CopyOnWriteArrayList<(Entry) -> Unit>()
 
-    private val SECRET_KEYS = arrayOf("access_token", "a2", "d2", "d2key", "authorization", "token")
+    private val URL_USERINFO_REGEX = Regex("(?i)\\b(https?|wss?)://([^/\\s@]+)@")
+    private val KV_SECRET_REGEX = Regex(
+        "(?i)(?<![A-Za-z0-9_])(\"?" +
+            "(?:access_token|authorization|password|secret|token|qrsig|a2|d2|d2key|p_skey|skey|pt4_token)" +
+            "\"?\\s*[=:]\\s*\"?)(?:(Bearer|Basic)\\s+)?([^\"'&,\\s}\\]]+)"
+    )
+    private val AUTH_SCHEME_REGEX = Regex("(?i)\\b(Bearer|Basic)\\s+([^\"'&,\\s}\\]]+)")
 
     fun d(msg: String) = write("debug", msg, null)
     fun i(msg: String) = write("info", msg, null)
@@ -42,7 +50,13 @@ object PicoLog {
     fun e(msg: String, t: Throwable? = null) = write("error", msg, t)
 
     private fun write(level: String, msg: String, t: Throwable?) {
-        val safe = mask(msg) + if (t != null) " | " + t.javaClass.simpleName + ": " + t.message else ""
+        val maskedMsg = mask(msg)
+        val safe = if (t != null) {
+            val maskedErr = mask(t.message ?: "")
+            "$maskedMsg | ${t.javaClass.simpleName}: $maskedErr"
+        } else {
+            maskedMsg
+        }
         val entry = Entry(seq.incrementAndGet(), System.currentTimeMillis(), level, TAG, safe)
         synchronized(ring) {
             while (ring.size >= RING_CAP) ring.pollFirst()
@@ -52,11 +66,17 @@ object PicoLog {
             try { l(entry) } catch (ignored: Throwable) {}
         }
         when (level) {
-            "error" -> if (t != null) Log.e(TAG, mask(msg), t) else Log.e(TAG, mask(msg))
-            "warn" -> if (t != null) Log.w(TAG, mask(msg), t) else Log.w(TAG, mask(msg))
-            "debug" -> Log.d(TAG, mask(msg))
-            else -> Log.i(TAG, mask(msg))
+            "error" -> if (t != null) Log.e(TAG, "$maskedMsg\n${formatThrowable(t)}") else Log.e(TAG, maskedMsg)
+            "warn" -> if (t != null) Log.w(TAG, "$maskedMsg\n${formatThrowable(t)}") else Log.w(TAG, maskedMsg)
+            "debug" -> Log.d(TAG, maskedMsg)
+            else -> Log.i(TAG, maskedMsg)
         }
+    }
+
+    private fun formatThrowable(t: Throwable): String {
+        val sw = StringWriter()
+        t.printStackTrace(PrintWriter(sw))
+        return mask(sw.toString().trimEnd())
     }
 
     /** 最近 [limit] 行格式化文本,旧的在前(旧接口用)。 */
@@ -88,13 +108,16 @@ object PicoLog {
         "error" -> "E"; "warn" -> "W"; "debug" -> "D"; else -> "I"
     }
 
-    /** 把 "key=xxx" / "\"key\":\"xxx\"" 里的值打码,只留前 4 位。 */
+    /** 预编译正则统一打码 URL userinfo、Bearer/Basic 凭据以及常见敏感键值。 */
     private fun mask(s: String): String {
-        var out = s
-        for (k in SECRET_KEYS) {
-            out = Regex("(?i)(\"?" + k + "\"?\\s*[=:]\\s*\"?)([^\"&,\\s}]{5,})")
-                .replace(out) { m -> m.groupValues[1] + m.groupValues[2].substring(0, 4) + "***" }
+        if (s.isEmpty()) return s
+        var out = URL_USERINFO_REGEX.replace(s) { m -> "${m.groupValues[1]}://***@" }
+        out = KV_SECRET_REGEX.replace(out) { m ->
+            val prefix = m.groupValues[1]
+            val scheme = m.groupValues[2]
+            if (scheme.isNotEmpty()) "$prefix$scheme ***" else "$prefix***"
         }
+        out = AUTH_SCHEME_REGEX.replace(out) { m -> "${m.groupValues[1]} ***" }
         return out
     }
 }

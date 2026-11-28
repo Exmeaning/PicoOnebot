@@ -11,18 +11,23 @@ services:
     shm_size: "1gb"
     stop_grace_period: 30s
     ports:
-      - "${PICO_WEBUI_PORT:-6099}:6099"
-      - "${PICO_ONEBOT_PORT:-3001}:3001"
+      # 安全建议：在公网或不受信任宿主机上强烈建议设置 PICO_BIND_ADDR=127.0.0.1，
+      # 并通过反向代理 (HTTPS/TLS) 或内网隧道访问；首次启动后请立即修改默认密码 (picopico)。
+      - "${PICO_BIND_ADDR:-0.0.0.0}:${PICO_WEBUI_PORT:-6099}:6099"
+      - "${PICO_BIND_ADDR:-0.0.0.0}:${PICO_ONEBOT_PORT:-3001}:3001"
+      # ADB 端口无认证，仅绑定宿主机回环地址，切勿暴露至公网
       - "127.0.0.1:${PICO_ADB_PORT:-5555}:5555"
     volumes:
       - android-data:/data
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
-      # 将 /dev/kmsg 转发至容器 stdout (1: 核心日志, all: 全量, 0: 关闭)
-      PICO_LOG_KMSG: "${PICO_LOG_KMSG:-1}"
+      # 将 /dev/kmsg 转发至容器 stdout (0: 默认关闭, 1: 核心日志, all: 全量)
+      PICO_LOG_KMSG: "${PICO_LOG_KMSG:-0}"
       # Binder 校验失败时是否直接退出容器 (1: 退出, 0: 仅告警并继续)
       PICO_BINDER_STRICT: "${PICO_BINDER_STRICT:-0}"
+      # 是否启用容器内 Redroid adbd (1: 默认启用且仅映射 127.0.0.1:5555, 0: 彻底禁用)
+      PICO_ENABLE_ADB: "${PICO_ENABLE_ADB:-1}"
 
     # ── Binder 设备配置 ───────────────────────────────────────────────────────
     # 默认使用 binderfs 模式（无需映射宿主机 binder 设备）。

@@ -29,10 +29,17 @@ object NetUtil {
         }
     }
 
-    /** WebUI 的可访问地址:配置里绑的是通配地址就换成局域网 IP。 */
+    /** WebUI 的可访问地址:配置里绑的是通配地址就换成局域网 IP,并对 IPv6 主机加方括号。 */
     fun webuiUrl(): String {
-        val host = Config.webuiHost
-        val shown = if (host == "0.0.0.0" || host == "::" || host.isEmpty()) (lanIp() ?: "127.0.0.1") else host
-        return "http://" + shown + ":" + Config.webuiPort + "/"
+        val raw = Config.webuiHost.trim().removePrefix("[").removeSuffix("]")
+        val isWildcard = raw.isEmpty() ||
+            raw == "0.0.0.0" ||
+            raw == "::" ||
+            raw == "::0" ||
+            raw == "0:0:0:0:0:0:0:0" ||
+            raw == "0000:0000:0000:0000:0000:0000:0000:0000"
+        val shown = if (isWildcard) (lanIp() ?: "127.0.0.1") else raw
+        val formatted = if (shown.contains(':') && !shown.startsWith("[")) "[$shown]" else shown
+        return "http://$formatted:${Config.webuiPort}/"
     }
 }

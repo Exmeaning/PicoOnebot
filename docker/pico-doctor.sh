@@ -4,6 +4,8 @@
 # 用法:
 #   docker exec <容器名> /system/bin/sh /system/bin/pico-doctor.sh
 
+export PATH="${PATH:-/system/bin:/system/xbin}:/system/bin/pico-bb"
+
 hr() { echo; echo "===== $* ====="; }
 
 echo "PicoOnebot 容器诊断报告  $(date)"
@@ -11,9 +13,9 @@ echo "PicoOnebot 容器诊断报告  $(date)"
 hr "1. Binder 设备节点与权限"
 for n in /dev/binder /dev/hwbinder /dev/vndbinder; do
     if [ -e "$n" ]; then
-        printf '%-18s mode=%s owner=%s:%s target=%s\n' \
+        printf '%-18s mode=%s owner=%s target=%s\n' \
             "$n" "$(stat -L -c %a "$n" 2>/dev/null)" \
-            "$(stat -L -c %U "$n" 2>/dev/null)" "$(stat -L -c %G "$n" 2>/dev/null)" \
+            "$(stat -L -c '%U:%G' "$n" 2>/dev/null)" \
             "$(readlink -f "$n" 2>/dev/null)"
     else
         printf '%-18s 缺失\n' "$n"
@@ -47,6 +49,8 @@ hr "4. PicoOnebot 应用状态"
 if pm path com.tencent.qqlite >/dev/null 2>&1; then
     pm path com.tencent.qqlite
     echo "版本: $(dumpsys package com.tencent.qqlite 2>/dev/null | grep -m1 versionName | tr -d ' ')"
+    echo "已安装 APK SHA-256: $(cat /data/pico/installed-apk.sha256 2>/dev/null || echo 未记录)"
+    [ -f /opt/pico-onebot/PicoOnebot.apk ] && echo "镜像内 APK SHA-256: $(sha256sum /opt/pico-onebot/PicoOnebot.apk 2>/dev/null | awk '{print $1}')"
     echo "进程: $(pidof com.tencent.qqlite >/dev/null 2>&1 && echo 运行中 || echo 未运行)"
 else
     echo "❌ com.tencent.qqlite 未安装"
@@ -54,9 +58,13 @@ else
 fi
 
 hr "5. 端口监听（6099=0x17D3 WebUI / 3001=0x0BB9 OneBot）"
-awk 'NR>1 && $4=="0A" {print "listen", $2}' /proc/net/tcp /proc/net/tcp6 2>/dev/null | sort -u
-grep -qi ':17D3 ' /proc/net/tcp /proc/net/tcp6 2>/dev/null \
-    && echo "✅ 6099 端口处于监听状态" || echo "❌ 6099 端口未监听"
+(cat /proc/net/tcp /proc/net/tcp6 2>/dev/null || true) | awk '$4 == "0A" {print "listen", $2}' | sort -u
+if (cat /proc/net/tcp /proc/net/tcp6 2>/dev/null || true) \
+    | awk '$4 == "0A" && $2 ~ /:17[Dd]3$/ { found = 1; exit 0 } END { exit(found ? 0 : 1) }'; then
+    echo "✅ 6099 端口处于监听状态"
+else
+    echo "❌ 6099 端口未监听"
+fi
 
 hr "6. pico-boot 日志（末 40 行）"
 tail -n 40 /data/pico/pico-boot.log 2>/dev/null || echo "（暂无日志）"

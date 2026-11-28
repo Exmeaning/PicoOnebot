@@ -43,6 +43,12 @@ export function greeting() {
   return "晚上好";
 }
 
+export function fmtVersion(version?: string | null): string {
+  const trimmed = version?.trim();
+  if (!trimmed) return "--";
+  return trimmed.startsWith("v") ? trimmed : `v${trimmed}`;
+}
+
 /**
  * 把后端回报的「实际做了什么」翻成一句提示语。
  *

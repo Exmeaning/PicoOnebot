@@ -4,11 +4,43 @@ plugins {
     id("momoi.plugin.apkmixin") apply true
 }
 
+fun escapeJavaString(value: String): String = buildString(value.length) {
+    for (ch in value) {
+        when (ch) {
+            '\\' -> append("\\\\")
+            '"' -> append("\\\"")
+            '\n' -> append("\\n")
+            '\r' -> append("\\r")
+            '\t' -> append("\\t")
+            else -> append(ch)
+        }
+    }
+}
+
 // 版本号唯一来源:gradle.properties 的 picoVersion(CI 打 tag 时用 -PpicoVersion=... 覆盖)
-val picoVersion: String = (project.findProperty("picoVersion") as String?) ?: "0.0.0-dev"
-val picoGitSha: String = runCatching {
+val picoVersionRegex = Regex("^v?[0-9]+\\.[0-9]+(\\.[0-9]+)?([-.][0-9A-Za-z]+)*$")
+val picoVersionRaw: String = ((project.findProperty("picoVersion") as String?) ?: "0.0.0-dev").trim()
+require(picoVersionRegex.matches(picoVersionRaw)) {
+    "Invalid picoVersion '$picoVersionRaw': must match SemVer format (e.g. 0.20, 1.2.3, 1.2.3-rc.1)"
+}
+val picoVersion: String = picoVersionRaw.removePrefix("v")
+
+val picoGitShaRaw: String = runCatching {
     providers.exec { commandLine("git", "rev-parse", "--short", "HEAD") }.standardOutput.asText.get().trim()
 }.getOrDefault("unknown")
+val picoGitSha: String = if (Regex("^[0-9a-fA-F]{7,40}$").matches(picoGitShaRaw)) picoGitShaRaw else "unknown"
+
+// 可选签名密钥覆盖：优先读取 Gradle 属性 (-PPICO_SIGN_KEY/-PpicoSignKey)，其次读取环境变量 PICO_SIGN_KEY / PICO_SIGN_CERT。
+// 未配置时保留默认 testkey.pk8 以兼容既有用户的原地 APK 升级。
+val signKeyPath: String? = ((project.findProperty("picoSignKey") as String?)
+    ?: (project.findProperty("PICO_SIGN_KEY") as String?)
+    ?: System.getenv("PICO_SIGN_KEY"))?.trim()?.takeIf { it.isNotEmpty() }
+val signCertPath: String? = ((project.findProperty("picoSignCert") as String?)
+    ?: (project.findProperty("PICO_SIGN_CERT") as String?)
+    ?: System.getenv("PICO_SIGN_CERT"))?.trim()?.takeIf { it.isNotEmpty() }
+require((signKeyPath == null) == (signCertPath == null)) {
+    "Both PICO_SIGN_KEY and PICO_SIGN_CERT must be provided together (or neither to use default testkey)."
+}
 
 android {
     // namespace 只影响 BuildConfig / R 的包名;真正的 applicationId 必须等于宿主包名
@@ -18,12 +50,12 @@ android {
     defaultConfig {
         applicationId = "com.tencent.qqlite"
         minSdk = 21
-        targetSdk = 35
+        targetSdk = 34
         versionCode = 1
         versionName = picoVersion
 
-        buildConfigField("String", "PICO_VERSION", "\"$picoVersion\"")
-        buildConfigField("String", "PICO_GIT_SHA", "\"$picoGitSha\"")
+        buildConfigField("String", "PICO_VERSION", "\"${escapeJavaString(picoVersion)}\"")
+        buildConfigField("String", "PICO_GIT_SHA", "\"${escapeJavaString(picoGitSha)}\"")
         buildConfigField("String", "PICO_REPO", "\"https://github.com/Exmeaning/PicoOnebot\"")
     }
 
@@ -55,6 +87,7 @@ dependencies {
     compileOnly(libs.androidx.appcompat)
     compileOnly(libs.androidx.fragment)
     compileOnly(libs.androidx.core)
+    testImplementation(libs.junit)
 }
 
 apkMixin {
@@ -73,8 +106,8 @@ apkMixin {
     extraFiles["res/cRs.png"] = file("mixin/pico_icon_144.png")
 
     signing {
-        keyFile = file("mixin/testkey.pk8")
-        certFile = file("mixin/testkey.x509.pem")
+        keyFile = signKeyPath?.let { file(it) } ?: file("mixin/testkey.pk8")
+        certFile = signCertPath?.let { file(it) } ?: file("mixin/testkey.x509.pem")
     }
 
     output {

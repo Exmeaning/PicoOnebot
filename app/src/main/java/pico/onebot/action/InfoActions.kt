@@ -1,5 +1,6 @@
 package pico.onebot.action
 
+import com.tencent.qqnt.kernel.nativeinterface.GroupDetailInfo
 import com.tencent.qqnt.kernel.nativeinterface.GroupMemberListResult
 import com.tencent.qqnt.kernel.nativeinterface.IGroupMemberListCallback
 import com.tencent.qqnt.kernel.nativeinterface.IDetailInfoByUinCallback
@@ -16,6 +17,12 @@ import pico.onebot.kernel.KernelGate
 import pico.onebot.kernel.NickStore
 import pico.onebot.kernel.UinUidStore
 import pico.onebot.proto.Ob
+import java.util.Locale
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.ThreadFactory
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * 名册查询类动作。**这一组是上游框架的启动自检面** —— 多数插件一上来就调
@@ -30,6 +37,20 @@ object InfoActions {
 
     private const val SEX_MALE = 1
     private const val SEX_FEMALE = 2
+
+    private data class KernelResult<T>(val code: Int, val msg: String, val payload: T?)
+
+    private val detailThreadSeq = AtomicInteger()
+    private val detailExecutor = ThreadPoolExecutor(
+        2,
+        4,
+        60L,
+        TimeUnit.SECONDS,
+        ArrayBlockingQueue(32),
+        ThreadFactory { r ->
+            Thread(r, "pico-grp-detail-" + detailThreadSeq.incrementAndGet()).apply { isDaemon = true }
+        }
+    ).apply { allowCoreThreadTimeOut(true) }
 
     fun register() {
         ActionRouter.register("get_friend_list") { p -> friendList(p) }
@@ -77,12 +98,26 @@ object InfoActions {
         val code = p.optLong("group_id", 0)
         if (code <= 0) return bad("group_id 缺失或非法")
         val noCache = p.optBoolean("no_cache", false)
-        val simple = ContactStore.group(code, noCache)
-        val detail = ContactStore.groupDetail(code, noCache)
+        val budgetMs = Config.kernelTimeoutMs
+        val startNs = System.nanoTime()
+
+        // no_cache=false 时只走已有群列表快照(未加载过才拉一次),避免查询不存在的群号时强刷全量群列表再串行等 detail 叠出 2x 超时
+        val simple = if (noCache) {
+            ContactStore.group(code, true)
+        } else {
+            ContactStore.groups(false).firstOrNull { it.groupCode == code }
+        }
+        val elapsedMs = ((System.nanoTime() - startNs) / 1_000_000L).coerceAtLeast(0L)
+        val remainMs = (budgetMs - elapsedMs).coerceAtLeast(0L)
+        val detail = fetchGroupDetailBounded(code, noCache, elapsedMs, remainMs)
+
         if (simple == null && detail == null) {
-            return Ob.failed(
-                Ob.RC_BAD_PARAM, "群 $code 不在本账号的群列表里"
-            )
+            val totalElapsedMs = ((System.nanoTime() - startNs) / 1_000_000L).coerceAtLeast(0L)
+            return if (totalElapsedMs >= budgetMs) {
+                Ob.failed(Ob.RC_TIMEOUT, "拉取群 $code 资料超时")
+            } else {
+                Ob.failed(Ob.RC_BAD_PARAM, "群 $code 不在本账号的群列表里")
+            }
         }
         val o = if (simple != null) groupJson(simple) else JSONObject().put("group_id", code)
         if (detail != null) {
@@ -96,6 +131,29 @@ object InfoActions {
                 .put("shut_up_me_timestamp", detail.shutUpMeTimestamp)
         }
         return Ob.ok(o)
+    }
+
+    private fun fetchGroupDetailBounded(
+        code: Long,
+        noCache: Boolean,
+        elapsedMs: Long,
+        remainMs: Long
+    ): GroupDetailInfo? {
+        if (remainMs <= 0L) return null
+        if (elapsedMs < 500L) return ContactStore.groupDetail(code, noCache)
+        val promise = Promise<GroupDetailInfo>()
+        return try {
+            detailExecutor.execute {
+                try {
+                    promise.resolve(ContactStore.groupDetail(code, noCache))
+                } catch (_: Throwable) {
+                    promise.resolve(null)
+                }
+            }
+            promise.await(remainMs)
+        } catch (_: Throwable) {
+            null
+        }
     }
 
     private fun groupJson(g: com.tencent.qqnt.kernel.nativeinterface.GroupSimpleInfo): JSONObject =
@@ -116,20 +174,18 @@ object InfoActions {
         val code = p.optLong("group_id", 0)
         if (code <= 0) return bad("group_id 缺失或非法")
 
-        val promise = Promise<GroupMemberListResult>()
-        val err = arrayOf(0, "")
+        val promise = Promise<KernelResult<GroupMemberListResult>>()
         try {
             svc.getAllMemberList(code, p.optBoolean("no_cache", false), IGroupMemberListCallback { c, m, r ->
-                err[0] = c
-                err[1] = m ?: ""
-                promise.resolve(r)
+                promise.resolve(KernelResult(c, m ?: "", r))
             })
         } catch (t: Throwable) {
             return kernelError("getAllMemberList 调用失败: " + t.javaClass.simpleName)
         }
-        val result = promise.await(Config.kernelTimeoutMs)
+        val res = promise.await(Config.kernelTimeoutMs)
             ?: return Ob.failed(Ob.RC_TIMEOUT, "拉取群成员超时")
-        if (err[0] != 0) return kernelError("内核拒绝: code=" + err[0] + " " + err[1])
+        if (res.code != 0) return kernelError("内核拒绝: code=" + res.code + " " + res.msg)
+        val result = res.payload ?: return kernelError("内核返回空群成员列表")
 
         val infos = result.infos ?: HashMap()
         val arr = JSONArray()
@@ -151,19 +207,22 @@ object InfoActions {
         val uid = UinUidStore.uid(uin)
         if (uid.isEmpty()) return bad("拿不到 $uin 的 uid(该号可能不在本账号的可见范围内)")
 
-        val promise = Promise<GroupMemberListResult>()
+        val promise = Promise<KernelResult<GroupMemberListResult>>()
         try {
             svc.getMemberInfoForMqq(
                 code, arrayListOf(uid), p.optBoolean("no_cache", false),
-                IGroupMemberListCallback { _, _, r -> promise.resolve(r) }
+                IGroupMemberListCallback { c, m, r ->
+                    promise.resolve(KernelResult(c, m ?: "", r))
+                }
             )
         } catch (t: Throwable) {
             return kernelError("getMemberInfoForMqq 调用失败: " + t.javaClass.simpleName)
         }
-        val m = promise.await(Config.kernelTimeoutMs)?.infos?.get(uid)
-            ?: return Ob.failed(
-                Ob.RC_BAD_PARAM, "群 $code 里没有 $uin,或内核未返回"
-            )
+        val res = promise.await(Config.kernelTimeoutMs)
+            ?: return Ob.failed(Ob.RC_TIMEOUT, "拉取群成员资料超时")
+        if (res.code != 0) return kernelError("内核拒绝: code=" + res.code + " " + res.msg)
+        val m = res.payload?.infos?.get(uid)
+            ?: return Ob.failed(Ob.RC_BAD_PARAM, "群 $code 里没有 $uin")
         return Ob.ok(memberJson(code, m))
     }
 
@@ -195,7 +254,7 @@ object InfoActions {
     }
 
     /** MemberRole 是枚举,取值只可能是 OWNER/ADMIN/MEMBER/STRANGER/UNSPECIFIED。 */
-    private fun role(r: Any?): String = when (r?.toString()?.uppercase()) {
+    private fun role(r: Any?): String = when (r?.toString()?.uppercase(Locale.ROOT)) {
         "OWNER" -> "owner"
         "ADMIN" -> "admin"
         else -> "member"
@@ -225,17 +284,19 @@ object InfoActions {
         }
 
         // 缓存没有就按 uin 直接问服务器 —— 这条路不需要事先知道 uid
-        val promise = Promise<ProfileDetailInfo>()
+        val promise = Promise<KernelResult<ProfileDetailInfo>>()
         try {
             profile.getUserDetailInfoByUin(uin, IDetailInfoByUinCallback { code, msg, info ->
                 if (code != 0) PicoLog.d("getUserDetailInfoByUin code=$code $msg")
-                promise.resolve(info)
+                promise.resolve(KernelResult(code, msg ?: "", info))
             })
         } catch (t: Throwable) {
             return kernelError("getUserDetailInfoByUin 调用失败: " + t.javaClass.simpleName)
         }
-        val d = promise.await(Config.kernelTimeoutMs)
+        val res = promise.await(Config.kernelTimeoutMs)
             ?: return Ob.failed(Ob.RC_TIMEOUT, "拉取用户资料超时")
+        if (res.code != 0) return kernelError("内核拒绝: code=" + res.code + " " + res.msg)
+        val d = res.payload ?: return Ob.failed(Ob.RC_BAD_PARAM, "内核未返回 $uin 的用户资料")
         if (!d.uid.isNullOrEmpty()) UinUidStore.feed(d.uid, if (d.uin > 0) d.uin else uin)
         NickStore.feed(d.uid, if (!d.remark.isNullOrEmpty()) d.remark else d.nick)
         return Ob.ok(detailJson(uin, d))

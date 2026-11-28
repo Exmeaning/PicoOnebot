@@ -1,11 +1,11 @@
 {
-  "name": "react-vite-tailwind",
+  "name": "pico-onebot-webui",
   "private": true,
   "version": "0.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
+    "build": "tsc --noEmit && tsc -p tsconfig.node.json --noEmit && vite build",
     "preview": "vite preview"
   },
   "dependencies": {

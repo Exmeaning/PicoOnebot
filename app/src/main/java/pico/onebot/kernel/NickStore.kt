@@ -1,6 +1,7 @@
 package pico.onebot.kernel
 
 import org.json.JSONObject
+import pico.onebot.core.PicoLog
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -16,7 +17,7 @@ import java.util.concurrent.atomic.AtomicLong
 object NickStore {
 
     private const val CAP = 2000
-    private const val NEGATIVE_TTL_MS = 30_000L
+    private const val NEGATIVE_TTL_NS = 30_000_000_000L
     private const val NEGATIVE_CAP = 2000
 
     private val cache = object : LinkedHashMap<String, String>(256, 0.75f, true) {
@@ -28,16 +29,26 @@ object NickStore {
     private val hits = AtomicLong()
     private val misses = AtomicLong()
 
+    /** 会话丢失/切号时清空账号级备注与昵称缓存,防止跨号串备注。 */
+    fun reset() {
+        synchronized(cache) {
+            cache.clear()
+            negCache.clear()
+        }
+        PicoLog.d("nick store reset")
+    }
+
     fun of(uid: String?): String {
         if (uid.isNullOrEmpty()) return ""
-        val now = System.currentTimeMillis()
+        val nowNs = System.nanoTime()
+        val epoch = KernelGate.currentEpoch()
         synchronized(cache) {
             cache[uid]?.let {
                 hits.incrementAndGet()
                 return it
             }
-            negCache[uid]?.let { failedAt ->
-                if (now - failedAt < NEGATIVE_TTL_MS) {
+            negCache[uid]?.let { failedAtNs ->
+                if ((nowNs - failedAtNs).coerceAtLeast(0L) < NEGATIVE_TTL_NS) {
                     misses.incrementAndGet()
                     return ""
                 }
@@ -47,25 +58,29 @@ object NickStore {
         val found = lookup(uid)
         if (found.isEmpty()) {
             misses.incrementAndGet()
-            synchronized(cache) { negCache[uid] = System.currentTimeMillis() }
+            synchronized(cache) {
+                if (KernelGate.isEpochCurrent(epoch)) {
+                    negCache[uid] = System.nanoTime()
+                }
+            }
             return ""
         }
         synchronized(cache) {
-            negCache.remove(uid)
-            cache[uid] = found
+            if (KernelGate.isEpochCurrent(epoch)) {
+                negCache.remove(uid)
+                cache[uid] = found
+            }
         }
         return found
     }
 
     /**
      * 权威来源写入(好友列表、备注/昵称变更回调、群成员信息):**覆盖旧值**。
-     *
-     * 早期实现是"已有值就 return",于是 `onNickUpdated` / `onBuddyRemarkUpdated`
-     * 这类明确的名字变更被静默丢弃,用户在 QQ 里改名后机器人一直叫旧名字。
      */
-    fun feed(uid: String?, name: String?) {
+    fun feed(uid: String?, name: String?, expectedEpoch: Long? = null) {
         if (uid.isNullOrEmpty() || name.isNullOrEmpty()) return
         synchronized(cache) {
+            if (expectedEpoch != null && !KernelGate.isEpochCurrent(expectedEpoch)) return
             negCache.remove(uid)
             cache[uid] = name
         }
@@ -73,13 +88,11 @@ object NickStore {
 
     /**
      * 弱来源写入(逐条消息里的 sendMemberName 等):只在没值时补齐。
-     *
-     * 群名片会和好友备注打架 —— 一条群消息里的卡片名不该覆盖备注。真正的
-     * 变更交给 [feed] 那条路径。
      */
-    fun feedIfAbsent(uid: String?, name: String?) {
+    fun feedIfAbsent(uid: String?, name: String?, expectedEpoch: Long? = null) {
         if (uid.isNullOrEmpty() || name.isNullOrEmpty()) return
         synchronized(cache) {
+            if (expectedEpoch != null && !KernelGate.isEpochCurrent(expectedEpoch)) return
             negCache.remove(uid)
             if (cache.containsKey(uid)) return
             cache[uid] = name

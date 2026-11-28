@@ -20,6 +20,18 @@ export interface BotStatus {
   protocol: string;
   msgSent: number;
   msgRecv: number;
+  /** 最近一次收到消息的毫秒时间戳（0 表示尚无记录）。 */
+  lastRecvAt?: number;
+  /** 距离上次收到消息的静默时长（毫秒）。 */
+  silenceMs?: number;
+  /** v0.19 已读上报成功次数。 */
+  readReportsSent?: number;
+  /** v0.19 已读上报失败次数。 */
+  readReportsFailed?: number;
+  /** v0.19 Watchdog 触发的主动同步次数。 */
+  syncTriggered?: number;
+  /** 最近一次触发主动同步的毫秒时间戳（0 表示未触发）。 */
+  lastSyncAt?: number;
   memoryMb: number;
   cpu: number;
   friends: number;
@@ -29,6 +41,7 @@ export interface BotStatus {
   webuiUrl?: string;
   lanIp?: string;
   canRestartQq?: boolean;
+  recoveryMode?: boolean;
 }
 
 export interface WsServer {
@@ -97,6 +110,34 @@ export interface GeneralConfig {
   messageFormat: MessageFormat;
   /** 是否把 Bot 自身发送的消息也作为事件推送。进程级。 */
   reportSelfMessage: boolean;
+  /** v0.19 自动已读上报开关。 */
+  autoMarkRead?: boolean;
+  /** v0.19 单会话累积多少条未读后触发批量已读上报。 */
+  readReportBatch?: number;
+  /** v0.19 自动已读上报周期（秒）。 */
+  readReportIntervalSec?: number;
+  /** v0.19 两次已读上报之间的最小间隔（毫秒）。 */
+  readReportMinGapMs?: number;
+  /** v0.19 每分钟最多发送的已读上报次数。 */
+  readReportMaxPerMin?: number;
+  /** v0.19 静默多久后触发主动同步（秒，0 为关闭）。 */
+  silenceSyncThresholdSec?: number;
+  /** v0.19 单轮静默期间最多触发主动同步次数。 */
+  silenceSyncMaxAttempts?: number;
+  /** 反向 WS 最小重连退避（毫秒）。 */
+  reverse_reconnect_min_ms?: number;
+  /** 反向 WS 最大重连退避（毫秒）。 */
+  reverse_reconnect_max_ms?: number;
+  /** HTTP 上报请求超时（毫秒）。 */
+  post_timeout_ms?: number;
+  /** HTTP 上报队列容量。 */
+  post_queue_size?: number;
+  /** 全局事件队列容量（改动需重启生效）。 */
+  event_queue_size?: number;
+  /** 内核探测初始延迟（毫秒）。 */
+  kernel_probe_delay_ms?: number;
+  /** WebUI 静态资源目录（须位于 dataDir/webui 内）。 */
+  webui_dir?: string;
 }
 
 export interface WebuiConfig {
@@ -115,6 +156,7 @@ export interface LoginResult {
   ok: boolean;
   token: string;
   mustChangePassword?: boolean;
+  recoveryMode?: boolean;
 }
 
 export interface FileEntry {
@@ -166,6 +208,8 @@ export interface SaveFileResult {
   restartRequired: boolean;
   warnings?: string[];
   applied?: AppliedResult;
+  reloginRequired?: boolean;
+  recoveryCleared?: boolean;
 }
 
 export interface ConnectionInfo {

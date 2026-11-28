@@ -32,13 +32,27 @@ object MsgActions {
     private const val CHAT_PRIVATE = 1
     private const val CHAT_GROUP = 2
 
+    private data class OpResult(val code: Int, val msg: String)
+    private data class MsgListResult(val code: Int, val msg: String, val records: ArrayList<MsgRecord>?)
+
     // 取值器而非值:WebUI 改发送速率后立刻生效,不必重启
     private val limiter by lazy { RateLimiter { Config.sendRatePerSec } }
 
     fun register() {
         ActionRouter.register("send_msg") { p ->
-            val type = p.optString("message_type", if (p.has("group_id")) "group" else "private")
-            if (type == "group") sendGroup(p) else sendPrivate(p)
+            val rawType = MsgCodec.optNonNullString(p, "message_type").trim()
+            val type = if (rawType.isNotEmpty()) {
+                rawType
+            } else if (optLongParam(p, "group_id") > 0L) {
+                "group"
+            } else {
+                "private"
+            }
+            when (type) {
+                "group" -> sendGroup(p)
+                "private" -> sendPrivate(p)
+                else -> Ob.failed(Ob.RC_BAD_PARAM, "非法 message_type: $type (仅支持 group / private)")
+            }
         }
         ActionRouter.register("send_group_msg") { p -> sendGroup(p) }
         ActionRouter.register("send_private_msg") { p -> sendPrivate(p) }
@@ -48,16 +62,26 @@ object MsgActions {
         ActionRouter.register("mark_msg_as_read") { p -> markMsgAsRead(p) }
     }
 
+    private fun optLongParam(p: JSONObject, key: String): Long {
+        if (p.isNull(key)) return 0L
+        return MsgCodec.optNonNullString(p, key).trim().toLongOrNull() ?: p.optLong(key, 0L)
+    }
+
+    private fun optIntParam(p: JSONObject, key: String): Int {
+        if (p.isNull(key)) return 0
+        return MsgCodec.optNonNullString(p, key).trim().toIntOrNull() ?: p.optInt(key, 0)
+    }
+
     // ---------------- 发送 ----------------
 
     private fun sendGroup(p: JSONObject): JSONObject {
-        val groupId = p.optLong("group_id", 0)
+        val groupId = optLongParam(p, "group_id")
         if (groupId <= 0) return Ob.failed(Ob.RC_BAD_PARAM, "group_id 缺失或非法")
         return send(Contact(CHAT_GROUP, groupId.toString(), ""), CHAT_GROUP, p)
     }
 
     private fun sendPrivate(p: JSONObject): JSONObject {
-        val userId = p.optLong("user_id", 0)
+        val userId = optLongParam(p, "user_id")
         if (userId <= 0) return Ob.failed(Ob.RC_BAD_PARAM, "user_id 缺失或非法")
         if (!KernelGate.ready) return Ob.notReady("send_private_msg")
         // 私聊的 peerUid 要的是 uid 字符串,不是 QQ 号
@@ -72,7 +96,7 @@ object MsgActions {
         if (!KernelGate.ready) return Ob.notReady("send_msg")
         val msgService = KernelGate.msgService() ?: return Ob.notReady("send_msg(msgService)")
 
-        val raw = p.opt("message")
+        val raw = if (p.isNull("message")) null else p.opt("message")
         val elements: ArrayList<MsgElement> = try {
             // auto_escape=true 时整条当纯文本,不解析 CQ 码
             val segments = if (p.optBoolean("auto_escape", false) && raw is String) {
@@ -83,11 +107,15 @@ object MsgActions {
                 MsgCodec.normalize(raw)
             }
             MsgCodec.toElements(segments)
+        } catch (t: MsgCodec.BadSegmentParam) {
+            return Ob.failed(Ob.RC_BAD_PARAM, t.message ?: "消息段参数非法")
         } catch (t: MsgCodec.UnsupportedSegment) {
             return Ob.failed(Ob.RC_UNSUPPORTED, "消息段暂不支持: " + t.type)
         } catch (t: pico.onebot.media.MediaFiles.ResolveError) {
             // 取不到源文件是调用方的问题(路径/URL/base64),要说清楚是哪一步失败
             return Ob.failed(Ob.RC_BAD_PARAM, "媒体来源无法读取: " + t.message)
+        } catch (t: pico.onebot.media.MediaDownloader.DownloadError) {
+            return Ob.failed(Ob.RC_KERNEL_ERROR, "媒体下载失败: " + t.message)
         } catch (t: pico.onebot.media.MediaBuilder.BuildError) {
             return Ob.failed(Ob.RC_KERNEL_ERROR, "媒体元素构造失败: " + t.message)
         } catch (t: Throwable) {
@@ -111,52 +139,48 @@ object MsgActions {
         }
 
         val recordPromise = SendTracker.expect(msgId)
-        val result = Promise<IntArray>()
-        val errMsg = arrayOf("")
-
+        val result = Promise<OpResult>()
+        val record: MsgRecord?
         try {
-            msgService.sendMsg(
-                msgId,
-                contact,
-                elements,
-                HashMap<Int, MsgAttributeInfo>(),
-                IOperateCallback { code, msg ->
-                    errMsg[0] = msg ?: ""
-                    result.resolve(intArrayOf(code))
-                }
-            )
-        } catch (t: Throwable) {
-            SendTracker.forget(msgId)
-            return Ob.failed(Ob.RC_KERNEL_ERROR, "sendMsg 抛出: " + t.javaClass.simpleName + " " + t.message)
-        }
+            try {
+                msgService.sendMsg(
+                    msgId,
+                    contact,
+                    elements,
+                    HashMap<Int, MsgAttributeInfo>(),
+                    IOperateCallback { code, msg ->
+                        result.resolve(OpResult(code, msg ?: ""))
+                    }
+                )
+            } catch (t: Throwable) {
+                return Ob.failed(Ob.RC_KERNEL_ERROR, "sendMsg 抛出: " + t.javaClass.simpleName + " " + t.message)
+            }
 
-        val code = result.await(Config.kernelTimeoutMs)
-        if (code == null) {
-            SendTracker.forget(msgId)
-            return Ob.failed(Ob.RC_TIMEOUT, "sendMsg 回执超时(msgId=$msgId)")
-        }
-        if (code[0] != 0) {
-            SendTracker.forget(msgId)
-            // 刚登录/刚重启时 BDH(富媒体上传通道)的 host 列表还没下发,发图必然失败
-            // (内核日志:`Bdh host list is empty No IP use`)。这是**瞬态**的,但不能自动重试 ——
-            // 失败时本地其实已经落了一条记录,重发会变成两条。
-            val hint = if (errMsg[0].contains("rich media")) {
-                "(富媒体上传通道未就绪,常见于刚登录/刚重启后的头一两分钟,稍后重发即可)"
-            } else ""
-            return Ob.failed(Ob.RC_KERNEL_ERROR, "内核拒绝发送 code=" + code[0] + " " + errMsg[0] + hint)
-        }
+            val op = result.await(Config.kernelTimeoutMs)
+                ?: return Ob.failed(Ob.RC_TIMEOUT, "sendMsg 回执超时(msgId=$msgId)")
+            if (op.code != 0) {
+                // 刚登录/刚重启时 BDH(富媒体上传通道)的 host 列表还没下发,发图必然失败
+                // (内核日志:`Bdh host list is empty No IP use`)。这是**瞬态**的,但不能自动重试 ——
+                // 失败时本地其实已经落了一条记录,重发会变成两条。
+                val hint = if (op.msg.contains("rich media")) {
+                    "(富媒体上传通道未就绪,常见于刚登录/刚重启后的头一两分钟,稍后重发即可)"
+                } else ""
+                return Ob.failed(Ob.RC_KERNEL_ERROR, "内核拒绝发送 code=" + op.code + " " + op.msg + hint)
+            }
 
-        // 落库记录用来拿 msgSeq;拿不到也不算失败(消息已被内核接受)
-        val record: MsgRecord? = recordPromise.await(5000)
-        // 但**异步投递失败**必须在这里结账:onSendMsgError 会把 recordPromise 用 null 完成,
-        // 与"超时"不可区分。只看回调就回 ok,等于向上游谎报发送成功。
-        val failure = SendTracker.takeFailure(msgId)
-        SendTracker.forget(msgId)
-        if (failure != null) {
-            return Ob.failed(
-                Ob.RC_KERNEL_ERROR,
-                "内核受理后投递失败 code=" + failure.code + " " + failure.msg
-            )
+            // 落库记录用来拿 msgSeq;拿不到也不算失败(消息已被内核接受)
+            record = recordPromise.await(5000)
+            // 但**异步投递失败**必须在这里结账:onSendMsgError 会把 recordPromise 用 null 完成,
+            // 与"超时"不可区分。只看回调就回 ok,等于向上游谎报发送成功。
+            val failure = SendTracker.takeFailure(msgId)
+            if (failure != null) {
+                return Ob.failed(
+                    Ob.RC_KERNEL_ERROR,
+                    "内核受理后投递失败 code=" + failure.code + " " + failure.msg
+                )
+            }
+        } finally {
+            SendTracker.forget(msgId)
         }
         val entry = MsgIdStore.assign(
             msgId,
@@ -176,24 +200,26 @@ object MsgActions {
     private fun deleteMsg(p: JSONObject): JSONObject {
         if (!KernelGate.ready) return Ob.notReady("delete_msg")
         val msgService = KernelGate.msgService() ?: return Ob.notReady("delete_msg(msgService)")
-        val messageId = p.optInt("message_id", 0)
+        val messageId = optIntParam(p, "message_id")
         val entry = MsgIdStore.byMessageId(messageId)
             ?: return Ob.failed(Ob.RC_BAD_PARAM, "未知 message_id: $messageId")
 
-        val result = Promise<IntArray>()
-        val errMsg = arrayOf("")
-        msgService.recallMsg(
-            Contact(entry.chatType, entry.peerUid, ""),
-            arrayListOf(entry.msgId),
-            IOperateCallback { code, msg ->
-                errMsg[0] = msg ?: ""
-                result.resolve(intArrayOf(code))
-            }
-        )
-        val code = result.await(Config.kernelTimeoutMs)
+        val result = Promise<OpResult>()
+        try {
+            msgService.recallMsg(
+                Contact(entry.chatType, entry.peerUid, ""),
+                arrayListOf(entry.msgId),
+                IOperateCallback { code, msg ->
+                    result.resolve(OpResult(code, msg ?: ""))
+                }
+            )
+        } catch (t: Throwable) {
+            return Ob.failed(Ob.RC_KERNEL_ERROR, "recallMsg 调用失败: " + t.javaClass.simpleName)
+        }
+        val op = result.await(Config.kernelTimeoutMs)
             ?: return Ob.failed(Ob.RC_TIMEOUT, "recallMsg 超时")
-        return if (code[0] == 0) Ob.ok()
-        else Ob.failed(Ob.RC_KERNEL_ERROR, "撤回失败 code=" + code[0] + " " + errMsg[0])
+        return if (op.code == 0) Ob.ok()
+        else Ob.failed(Ob.RC_KERNEL_ERROR, "撤回失败 code=" + op.code + " " + op.msg)
     }
 
     /**
@@ -208,9 +234,11 @@ object MsgActions {
         val chatType: Int
         val peerUid: String
         val msgId: Long
-        val resId = p.optString("id", "").ifEmpty { p.optString("res_id", "") }
-        if (p.has("message_id")) {
-            val entry = MsgIdStore.byMessageId(p.optInt("message_id"))
+        val resId = MsgCodec.optNonNullString(p, "id").trim()
+            .ifEmpty { MsgCodec.optNonNullString(p, "res_id").trim() }
+        val hasMessageId = !p.isNull("message_id") && MsgCodec.optNonNullString(p, "message_id").trim().isNotEmpty()
+        if (hasMessageId) {
+            val entry = MsgIdStore.byMessageId(optIntParam(p, "message_id"))
                 ?: return Ob.failed(Ob.RC_BAD_PARAM, "未知 message_id")
             chatType = entry.chatType
             peerUid = entry.peerUid
@@ -225,12 +253,12 @@ object MsgActions {
             return Ob.failed(Ob.RC_BAD_PARAM, "需要 id(转发 resId)或 message_id")
         }
 
-        val promise = Promise<Array<Any?>>()
+        val promise = Promise<MsgListResult>()
         try {
             msgService.getMultiMsg(
                 Contact(chatType, peerUid, ""), msgId, msgId,
                 IGetMultiMsgCallback { code, msg, records ->
-                    promise.resolve(arrayOf(code, msg, records))
+                    promise.resolve(MsgListResult(code, msg ?: "", records))
                 }
             )
         } catch (t: Throwable) {
@@ -239,13 +267,11 @@ object MsgActions {
 
         val r = promise.await(Config.kernelTimeoutMs)
             ?: return Ob.failed(Ob.RC_TIMEOUT, "内核拉取合并转发超时")
-        val code = r[0] as? Int ?: -1
-        if (code != 0) {
-            return Ob.failed(Ob.RC_KERNEL_ERROR, "内核拒绝: code=" + code + " " + (r[1] ?: ""))
+        if (r.code != 0) {
+            return Ob.failed(Ob.RC_KERNEL_ERROR, "内核拒绝: code=" + r.code + " " + r.msg)
         }
 
-        @Suppress("UNCHECKED_CAST")
-        val records = r[2] as? ArrayList<MsgRecord> ?: ArrayList()
+        val records = r.records ?: ArrayList()
         val nodes = JSONArray()
         for (rec in records) {
             // 内层记录的会话字段经常是空的 —— 直接拿它去 downloadRichMedia 就定位不到,
@@ -281,29 +307,40 @@ object MsgActions {
     private fun getMsg(p: JSONObject): JSONObject {
         if (!KernelGate.ready) return Ob.notReady("get_msg")
         val msgService = KernelGate.msgService() ?: return Ob.notReady("get_msg(msgService)")
-        val messageId = p.optInt("message_id", 0)
+        val messageId = optIntParam(p, "message_id")
         val entry = MsgIdStore.byMessageId(messageId)
             ?: return Ob.failed(Ob.RC_BAD_PARAM, "未知 message_id: $messageId")
 
-        val result = Promise<ArrayList<MsgRecord>>()
-        msgService.getMsgsByMsgId(
-            Contact(entry.chatType, entry.peerUid, ""),
-            arrayListOf(entry.msgId),
-            IMsgOperateCallback { _, _, records -> result.resolve(records) }
-        )
-        val records = result.await(Config.kernelTimeoutMs)
+        val result = Promise<MsgListResult>()
+        try {
+            msgService.getMsgsByMsgId(
+                Contact(entry.chatType, entry.peerUid, ""),
+                arrayListOf(entry.msgId),
+                IMsgOperateCallback { code, msg, records ->
+                    result.resolve(MsgListResult(code, msg ?: "", records))
+                }
+            )
+        } catch (t: Throwable) {
+            return Ob.failed(Ob.RC_KERNEL_ERROR, "getMsgsByMsgId 调用失败: " + t.javaClass.simpleName)
+        }
+        val res = result.await(Config.kernelTimeoutMs)
             ?: return Ob.failed(Ob.RC_TIMEOUT, "getMsgsByMsgId 超时")
-        val rec = records.firstOrNull()
+        if (res.code != 0) {
+            return Ob.failed(Ob.RC_KERNEL_ERROR, "内核拒绝: code=" + res.code + " " + res.msg)
+        }
+        val rec = res.records?.firstOrNull()
             ?: return Ob.failed(Ob.RC_KERNEL_ERROR, "内核没有返回该消息")
-        return Ob.ok(MsgCodec.toMessageBody(rec))
+        val body = MsgCodec.toMessageBody(rec)
+            ?: return Ob.failed(Ob.RC_KERNEL_ERROR, "该消息无法解码为 OneBot 格式")
+        return Ob.ok(body)
     }
 
     /** 主动上报指定会话已读(发送 SsoReadedReport 推进服务端 read_msg_seq)。 */
     private fun markMsgAsRead(p: JSONObject): JSONObject {
         if (!KernelGate.ready) return Ob.notReady("mark_msg_as_read")
-        val groupId = p.optString("group_id", "").trim().toLongOrNull() ?: p.optLong("group_id", 0L)
-        val userId = p.optString("user_id", "").trim().toLongOrNull() ?: p.optLong("user_id", 0L)
-        val messageId = p.optString("message_id", "").trim().toIntOrNull() ?: p.optInt("message_id", 0)
+        val groupId = optLongParam(p, "group_id")
+        val userId = optLongParam(p, "user_id")
+        val messageId = optIntParam(p, "message_id")
 
         val chatType: Int
         val peerUid: String
@@ -333,7 +370,13 @@ object MsgActions {
         return if (ok) {
             Ob.ok(JSONObject().put("chat_type", chatType).put("peer_uid", peerUid))
         } else {
-            Ob.failed(Ob.RC_KERNEL_ERROR, "已读上报失败: $detail")
+            val rc = when {
+                detail.startsWith("kernel not ready") || detail.startsWith("msgService unavailable") -> Ob.RC_NOT_READY
+                detail.startsWith("timeout") || detail.contains("rate limit") -> Ob.RC_TIMEOUT
+                detail.startsWith("unsupported ") || detail.startsWith("peerUid") -> Ob.RC_BAD_PARAM
+                else -> Ob.RC_KERNEL_ERROR
+            }
+            Ob.failed(rc, "已读上报失败: $detail")
         }
     }
 }

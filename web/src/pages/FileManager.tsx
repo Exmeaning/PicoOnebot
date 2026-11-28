@@ -16,7 +16,8 @@ import {
   Search,
 } from "lucide-react";
 import { Badge, Button, Card, CardHeader, Empty, Input, PageHeader, useToast } from "../components/ui";
-import { api } from "../lib/api";
+import { ApiError, api, getErrorMessage, isAbortError, setToken } from "../lib/api";
+import { copyText } from "../lib/clipboard";
 import { fmtApplied, fmtDateTime } from "../lib/format";
 import type { FileDocument, FileEntry, FileListing } from "../lib/types";
 import { cn } from "../utils/cn";
@@ -33,13 +34,30 @@ function fileIcon(entry: FileEntry) {
   return <FileText className="h-4 w-4" />;
 }
 
-export function FileManager() {
+export function FileManager({
+  onDirtyChange,
+  onRequireRelogin,
+  recoveryMode = false,
+}: {
+  onDirtyChange?: (dirty: boolean) => void;
+  onRequireRelogin?: (message: string) => void;
+  recoveryMode?: boolean;
+}) {
   const toast = useToast();
+  const mountedRef = useRef(true);
   const requestId = useRef(0);
   const directoryRequestId = useRef(0);
+  const dirAbortRef = useRef<AbortController | null>(null);
+  const fileAbortRef = useRef<AbortController | null>(null);
+  const savingRef = useRef(false);
+  const recoveryAutoOpenedRef = useRef(false);
+
   const [listing, setListing] = useState<FileListing | null>(null);
+  const [directoryError, setDirectoryError] = useState<string | null>(null);
   const [selected, setSelected] = useState<FileEntry | null>(null);
   const [document, setDocument] = useState<FileDocument | null>(null);
+  const [fileError, setFileError] = useState<string | null>(null);
+  const [saveConflict, setSaveConflict] = useState(false);
   const [content, setContent] = useState("");
   const [savedContent, setSavedContent] = useState("");
   const [filter, setFilter] = useState("");
@@ -47,76 +65,152 @@ export function FileManager() {
   const [loadingFile, setLoadingFile] = useState(false);
   const [saving, setSaving] = useState(false);
 
-  const dirty = document !== null && content !== savedContent;
-
-  const loadDirectory = useCallback(async (path: string) => {
-    const id = ++directoryRequestId.current;
-    setLoadingDirectory(true);
-    try {
-      const next = await api.files(path);
-      if (directoryRequestId.current === id) setListing(next);
-    } catch (error) {
-      if (directoryRequestId.current === id) toast.push("error", (error as Error).message);
-    } finally {
-      if (directoryRequestId.current === id) setLoadingDirectory(false);
-    }
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      dirAbortRef.current?.abort();
+      fileAbortRef.current?.abort();
+    };
   }, []);
+
+  const dirty = document !== null && content !== savedContent;
+  const isActiveConfigDoc = Boolean(document && listing?.activeConfig && document.path === listing.activeConfig.path);
+  const canSave = Boolean(document) && (dirty || (recoveryMode && isActiveConfigDoc));
+
+  const loadDirectory = useCallback(
+    async (path: string) => {
+      dirAbortRef.current?.abort();
+      const controller = new AbortController();
+      dirAbortRef.current = controller;
+      const id = ++directoryRequestId.current;
+      setLoadingDirectory(true);
+      setDirectoryError(null);
+      try {
+        const next = await api.files(path, controller.signal);
+        if (mountedRef.current && directoryRequestId.current === id && !controller.signal.aborted) {
+          setListing(next);
+        }
+      } catch (error) {
+        if (isAbortError(error) || !mountedRef.current || directoryRequestId.current !== id) return;
+        const msg = getErrorMessage(error, "读取目录失败");
+        setDirectoryError(msg);
+        if (!(error instanceof ApiError && (error.status === 401 || error.status === 428))) {
+          toast.push("error", msg);
+        }
+      } finally {
+        if (mountedRef.current && directoryRequestId.current === id) {
+          setLoadingDirectory(false);
+        }
+      }
+    },
+    [toast]
+  );
 
   useEffect(() => {
     void loadDirectory("");
   }, [loadDirectory]);
 
   useEffect(() => {
+    onDirtyChange?.(dirty);
+    return () => {
+      onDirtyChange?.(false);
+    };
+  }, [dirty, onDirtyChange]);
+
+  useEffect(() => {
+    if (onDirtyChange) return;
     const beforeUnload = (event: BeforeUnloadEvent) => {
       if (!dirty) return;
       event.preventDefault();
+      event.returnValue = "";
     };
     window.addEventListener("beforeunload", beforeUnload);
     return () => window.removeEventListener("beforeunload", beforeUnload);
-  }, [dirty]);
+  }, [dirty, onDirtyChange]);
 
   const canLeaveEditor = () => !dirty || confirm("当前文件有未保存的修改，确定放弃吗？");
 
   const openDirectory = async (path: string) => {
     if (!canLeaveEditor()) return;
+    fileAbortRef.current?.abort();
     requestId.current += 1;
+    setLoadingFile(false);
     setSelected(null);
     setDocument(null);
+    setFileError(null);
+    setSaveConflict(false);
     setContent("");
     setSavedContent("");
     setFilter("");
     await loadDirectory(path);
   };
 
-  const loadFile = useCallback(async (entry: FileEntry) => {
-    const id = ++requestId.current;
-    setSelected(entry);
-    setDocument(null);
-    setLoadingFile(true);
-    try {
-      const next = await api.file(entry.path);
-      if (requestId.current !== id) return;
-      setDocument(next);
-      setContent(next.content);
-      setSavedContent(next.content);
-    } catch (error) {
-      if (requestId.current === id) toast.push("error", (error as Error).message);
-    } finally {
-      if (requestId.current === id) setLoadingFile(false);
+  const loadFile = useCallback(
+    async (entry: FileEntry) => {
+      fileAbortRef.current?.abort();
+      const controller = new AbortController();
+      fileAbortRef.current = controller;
+      const id = ++requestId.current;
+      setSelected(entry);
+      setDocument(null);
+      setFileError(null);
+      setSaveConflict(false);
+      setLoadingFile(true);
+      try {
+        const next = await api.file(entry.path, controller.signal);
+        if (!mountedRef.current || requestId.current !== id || controller.signal.aborted) return;
+        setDocument(next);
+        setContent(next.content);
+        setSavedContent(next.content);
+        setSelected((current) =>
+          current && current.path === entry.path
+            ? { ...current, size: next.size, modifiedAt: next.modifiedAt }
+            : current
+        );
+      } catch (error) {
+        if (isAbortError(error) || !mountedRef.current || requestId.current !== id) return;
+        const msg = getErrorMessage(error, "读取文件失败");
+        setFileError(msg);
+        if (!(error instanceof ApiError && (error.status === 401 || error.status === 428))) {
+          toast.push("error", msg);
+        }
+      } finally {
+        if (mountedRef.current && requestId.current === id) {
+          setLoadingFile(false);
+        }
+      }
+    },
+    [toast]
+  );
+
+  useEffect(() => {
+    if (!recoveryMode) {
+      recoveryAutoOpenedRef.current = false;
+      return;
     }
-  }, [toast]);
+    const active = listing?.activeConfig;
+    if (active && active.editable && !recoveryAutoOpenedRef.current && !selected && !loadingFile) {
+      recoveryAutoOpenedRef.current = true;
+      void loadFile(active);
+    }
+  }, [recoveryMode, listing, selected, loadingFile, loadFile]);
 
   const openEntry = async (entry: FileEntry) => {
     if (entry.type === "directory") {
       await openDirectory(entry.path);
       return;
     }
-    if (selected?.path === entry.path) return;
+    if (selected?.path === entry.path && !fileError) return;
     if (!canLeaveEditor()) return;
     if (!entry.editable) {
+      fileAbortRef.current?.abort();
       requestId.current += 1;
+      setLoadingFile(false);
       setSelected(entry);
       setDocument(null);
+      setFileError(null);
+      setSaveConflict(false);
       setContent("");
       setSavedContent("");
       return;
@@ -124,29 +218,70 @@ export function FileManager() {
     await loadFile(entry);
   };
 
+  const reloadCurrentFile = async () => {
+    if (!selected || !selected.editable || loadingFile || savingRef.current) return;
+    if (!canLeaveEditor()) return;
+    await loadFile(selected);
+  };
+
   const save = useCallback(async () => {
-    if (!document || !dirty) return;
+    if (!document || !canSave || savingRef.current) return;
+    const saveReqId = requestId.current;
+    const targetDoc = document;
+    const savedSnapshot = content;
+    const activeConfigPath = listing?.activeConfig?.path;
+    const currentDirPath = listing?.path;
+
+    savingRef.current = true;
     setSaving(true);
+    setSaveConflict(false);
     try {
-      const result = await api.saveFile(document.path, content, document.modifiedAt);
-      const next = { ...document, content, size: result.size, modifiedAt: result.modifiedAt };
+      const result = await api.saveFile(targetDoc.path, savedSnapshot, targetDoc.modifiedAt);
+      if (!mountedRef.current || requestId.current !== saveReqId) return;
+      const next = { ...targetDoc, content: savedSnapshot, size: result.size, modifiedAt: result.modifiedAt };
       setDocument(next);
-      setSavedContent(content);
-      setSelected((current) => current ? { ...current, size: result.size, modifiedAt: result.modifiedAt } : current);
+      setSavedContent(savedSnapshot);
+      setSelected((current) =>
+        current && current.path === targetDoc.path
+          ? { ...current, size: result.size, modifiedAt: result.modifiedAt }
+          : current
+      );
+      // 恢复模式下修复并保存 config.json 后，后端会立即吊销恢复会话：直接提示成功并干净退回登录页，
+      // 避免继续用失效令牌调用 loadDirectory() 触发误导性的 401 红错。
+      if (result.reloginRequired || result.recoveryCleared) {
+        onDirtyChange?.(false);
+        const reloginMsg = result.restartRequired
+          ? "配置已修复（部分设置需重启 QQ 生效），请重新登录"
+          : "配置已修复，请重新登录";
+        if (onRequireRelogin) {
+          onRequireRelogin(reloginMsg);
+        } else {
+          setToken("");
+          toast.push("success", reloginMsg);
+        }
+        return;
+      }
       // 只有改到正在生效的配置文件才谈得上"应用"；别的文件就是写盘,别替它宣布生效。
-      if (listing?.activeConfig?.path === document.path) {
+      if (activeConfigPath === targetDoc.path) {
         const applied = fmtApplied(result);
         toast.push(applied.tone, "文件已保存。" + applied.message);
       } else {
         toast.push("success", "文件已保存");
       }
-      if (listing) void loadDirectory(listing.path);
+      if (currentDirPath !== undefined) void loadDirectory(currentDirPath);
     } catch (error) {
-      toast.push("error", (error as Error).message);
+      if (!mountedRef.current || requestId.current !== saveReqId) return;
+      if (error instanceof ApiError && error.status === 409) {
+        setSaveConflict(true);
+      }
+      if (!(error instanceof ApiError && (error.status === 401 || error.status === 428))) {
+        toast.push("error", getErrorMessage(error, "保存失败"));
+      }
     } finally {
-      setSaving(false);
+      savingRef.current = false;
+      if (mountedRef.current) setSaving(false);
     }
-  }, [content, dirty, document, listing, loadDirectory, toast]);
+  }, [canSave, content, document, listing, loadDirectory, onDirtyChange, onRequireRelogin, toast]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -175,8 +310,13 @@ export function FileManager() {
     try {
       setContent(JSON.stringify(JSON.parse(content), null, 2) + "\n");
     } catch (error) {
-      toast.push("error", `JSON 格式错误: ${(error as Error).message}`);
+      toast.push("error", `JSON 格式错误: ${getErrorMessage(error, "无法解析 JSON")}`);
     }
+  };
+
+  const handleCopyContent = async () => {
+    const ok = await copyText(content);
+    toast.push(ok ? "info" : "error", ok ? "文件内容已复制" : "复制失败，请手动复制");
   };
 
   return (
@@ -185,8 +325,12 @@ export function FileManager() {
         title="文件管理"
         desc={listing ? listing.root : "PicoOnebot 数据目录"}
         action={
-          <Button variant="outline" onClick={() => listing && void loadDirectory(listing.path)} loading={loadingDirectory} disabled={!listing}>
-            <RefreshCw className="h-4 w-4" /> 刷新
+          <Button
+            variant="outline"
+            onClick={() => void loadDirectory(listing?.path ?? "")}
+            loading={loadingDirectory}
+          >
+            <RefreshCw className="h-4 w-4" /> 刷新目录
           </Button>
         }
       />
@@ -215,53 +359,68 @@ export function FileManager() {
             </div>
 
             <div className="min-h-[280px] flex-1 overflow-y-auto rounded-2xl border border-pico-line bg-white/45 p-1.5">
-              {listing?.activeConfig ? (
-                <button
-                  type="button"
-                  onClick={() => void openEntry(listing.activeConfig!)}
-                  className={cn(
-                    "pico-ring mb-1 flex w-full items-center gap-3 rounded-xl border border-pico-line px-3 py-3 text-left transition",
-                    selected?.path === listing.activeConfig.path ? "bg-pico-soft text-pico-deep" : "bg-white/70 text-pico-ink hover:bg-pico-softer"
-                  )}
-                >
-                  <FileCode2 className="h-4 w-4 shrink-0 text-pico-deep" />
-                  <span className="min-w-0 flex-1">
-                    <span className="block truncate text-xs font-extrabold">当前生效配置</span>
-                    <span className="mt-0.5 block truncate font-mono text-[10px] text-pico-muted">{listing.activeConfig.path}</span>
-                  </span>
-                  <Badge tone="amber" className="shrink-0">开发者</Badge>
-                </button>
-              ) : null}
-              {listing?.parent !== null && listing ? (
-                <button type="button" onClick={() => void openDirectory(listing.parent ?? "")} className="pico-ring flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm text-pico-muted hover:bg-pico-soft">
-                  <FolderOpen className="h-4 w-4" />
-                  <span className="font-bold">..</span>
-                </button>
-              ) : null}
-              {entries.map((entry) => (
-                <button
-                  key={entry.path}
-                  type="button"
-                  onClick={() => void openEntry(entry)}
-                  className={cn(
-                    "pico-ring flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left transition",
-                    selected?.path === entry.path ? "bg-pico-soft text-pico-deep" : "text-pico-ink hover:bg-pico-softer"
-                  )}
-                >
-                  <span className={cn("shrink-0", entry.type === "directory" ? "text-amber-500" : "text-pico-deep")}>{fileIcon(entry)}</span>
-                  <span className="min-w-0 flex-1">
-                    <span className="block truncate text-xs font-extrabold">{entry.name}</span>
-                    <span className="mt-0.5 block text-[10px] text-pico-muted">
-                      {entry.type === "directory" ? "目录" : formatSize(entry.size)}
-                    </span>
-                  </span>
-                  {entry.type === "file" && !entry.editable ? <Badge tone="gray" className="shrink-0">只读</Badge> : null}
-                  {entry.type === "directory" ? <ChevronRight className="h-3.5 w-3.5 shrink-0 text-pico-muted" /> : null}
-                </button>
-              ))}
-              {!loadingDirectory && entries.length === 0 ? (
-                <p className="px-3 py-8 text-center text-xs text-pico-muted">当前目录没有匹配项</p>
-              ) : null}
+              {directoryError && !listing ? (
+                <div className="flex h-full flex-col items-center justify-center gap-3 px-4 py-8 text-center">
+                  <AlertTriangle className="h-7 w-7 text-rose-500" />
+                  <p className="text-xs font-bold text-pico-ink">{directoryError}</p>
+                  <Button size="sm" variant="soft" onClick={() => void loadDirectory("")} loading={loadingDirectory}>
+                    <RefreshCw className="h-3.5 w-3.5" /> 重试
+                  </Button>
+                </div>
+              ) : (
+                <>
+                  {listing?.activeConfig ? (() => {
+                    const activeConfig = listing.activeConfig;
+                    return (
+                      <button
+                        type="button"
+                        onClick={() => void openEntry(activeConfig)}
+                        className={cn(
+                          "pico-ring mb-1 flex w-full items-center gap-3 rounded-xl border border-pico-line px-3 py-3 text-left transition",
+                          selected?.path === activeConfig.path ? "bg-pico-soft text-pico-deep" : "bg-white/70 text-pico-ink hover:bg-pico-softer"
+                        )}
+                      >
+                        <FileCode2 className="h-4 w-4 shrink-0 text-pico-deep" />
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-xs font-extrabold">当前生效配置</span>
+                          <span className="mt-0.5 block truncate font-mono text-[10px] text-pico-muted">{activeConfig.path}</span>
+                        </span>
+                        <Badge tone="amber" className="shrink-0">{recoveryMode ? "待修复" : "开发者"}</Badge>
+                      </button>
+                    );
+                  })() : null}
+                  {listing?.parent !== null && listing ? (
+                    <button type="button" onClick={() => void openDirectory(listing.parent ?? "")} className="pico-ring flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm text-pico-muted hover:bg-pico-soft">
+                      <FolderOpen className="h-4 w-4" />
+                      <span className="font-bold">..</span>
+                    </button>
+                  ) : null}
+                  {entries.map((entry) => (
+                    <button
+                      key={entry.path}
+                      type="button"
+                      onClick={() => void openEntry(entry)}
+                      className={cn(
+                        "pico-ring flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left transition",
+                        selected?.path === entry.path ? "bg-pico-soft text-pico-deep" : "text-pico-ink hover:bg-pico-softer"
+                      )}
+                    >
+                      <span className={cn("shrink-0", entry.type === "directory" ? "text-amber-500" : "text-pico-deep")}>{fileIcon(entry)}</span>
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate text-xs font-extrabold">{entry.name}</span>
+                        <span className="mt-0.5 block text-[10px] text-pico-muted">
+                          {entry.type === "directory" ? "目录" : formatSize(entry.size)}
+                        </span>
+                      </span>
+                      {entry.type === "file" && !entry.editable ? <Badge tone="gray" className="shrink-0">只读</Badge> : null}
+                      {entry.type === "directory" ? <ChevronRight className="h-3.5 w-3.5 shrink-0 text-pico-muted" /> : null}
+                    </button>
+                  ))}
+                  {!loadingDirectory && entries.length === 0 ? (
+                    <p className="px-3 py-8 text-center text-xs text-pico-muted">当前目录没有匹配项</p>
+                  ) : null}
+                </>
+              )}
             </div>
           </div>
         </Card>
@@ -269,41 +428,87 @@ export function FileManager() {
         <Card className="min-w-0 lg:h-[calc(100vh-12rem)] lg:min-h-[580px]">
           <CardHeader
             title={selected?.name ?? "编辑器"}
-            desc={document ? `${formatSize(document.size)} · ${fmtDateTime(document.modifiedAt)}` : selected ? `${formatSize(selected.size)} · ${fmtDateTime(selected.modifiedAt)}` : "未选择文件"}
+            desc={
+              document
+                ? `${formatSize(document.size)} · ${document.modifiedAt > 0 ? fmtDateTime(document.modifiedAt) : "尚未写入磁盘"}`
+                : selected
+                  ? `${formatSize(selected.size)} · ${selected.modifiedAt > 0 ? fmtDateTime(selected.modifiedAt) : "尚未写入磁盘"}`
+                  : "未选择文件"
+            }
             icon={<FileText className="h-4 w-4" />}
-            action={document ? (
-              <div className="flex shrink-0 items-center gap-1 sm:gap-2">
-                {dirty ? <Badge tone="amber">未保存</Badge> : <Badge tone="green">已保存</Badge>}
-                {document.name.toLowerCase().endsWith(".json") ? (
-                  <Button variant="ghost" size="icon" onClick={formatJson} title="格式化 JSON" aria-label="格式化 JSON">
-                    <Braces className="h-4 w-4" />
+            action={
+              document ? (
+                <div className="flex shrink-0 items-center gap-1 sm:gap-2">
+                  {dirty ? (
+                    <Badge tone="amber">未保存</Badge>
+                  ) : recoveryMode && isActiveConfigDoc ? (
+                    <Badge tone="amber">待修复</Badge>
+                  ) : (
+                    <Badge tone="green">已保存</Badge>
+                  )}
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    onClick={() => void reloadCurrentFile()}
+                    disabled={loadingFile || saving}
+                    title="重新加载文件"
+                    aria-label="重新加载文件"
+                  >
+                    <RefreshCw className="h-4 w-4" />
                   </Button>
-                ) : null}
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  onClick={() => {
-                    void navigator.clipboard?.writeText(content);
-                    toast.push("info", "文件内容已复制");
-                  }}
-                  title="复制内容"
-                  aria-label="复制内容"
-                >
-                  <Copy className="h-4 w-4" />
+                  {document.name.toLowerCase().endsWith(".json") ? (
+                    <Button variant="ghost" size="icon" onClick={formatJson} title="格式化 JSON" aria-label="格式化 JSON">
+                      <Braces className="h-4 w-4" />
+                    </Button>
+                  ) : null}
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    onClick={() => void handleCopyContent()}
+                    title="复制内容"
+                    aria-label="复制内容"
+                  >
+                    <Copy className="h-4 w-4" />
+                  </Button>
+                  <Button variant="ghost" size="icon" onClick={() => setContent(savedContent)} disabled={!dirty} title="撤销修改" aria-label="撤销修改">
+                    <RotateCcw className="h-4 w-4" />
+                  </Button>
+                  <Button onClick={() => void save()} loading={saving} disabled={!canSave || saving}>
+                    <Save className="h-4 w-4" /> 保存
+                  </Button>
+                </div>
+              ) : selected?.editable ? (
+                <Button variant="soft" size="sm" onClick={() => void reloadCurrentFile()} loading={loadingFile}>
+                  <RefreshCw className="h-3.5 w-3.5" /> 重新加载文件
                 </Button>
-                <Button variant="ghost" size="icon" onClick={() => setContent(savedContent)} disabled={!dirty} title="撤销修改" aria-label="撤销修改">
-                  <RotateCcw className="h-4 w-4" />
-                </Button>
-                <Button onClick={() => void save()} loading={saving} disabled={!dirty}>
-                  <Save className="h-4 w-4" /> 保存
+              ) : null
+            }
+          />
+
+          <div className="flex h-[520px] min-w-0 flex-col gap-3 p-4 pt-3 sm:p-6 sm:pt-4 lg:h-[calc(100%-5rem)]">
+            {saveConflict && document ? (
+              <div className="flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-2.5 text-xs text-amber-800">
+                <span className="flex items-center gap-2 font-bold">
+                  <AlertTriangle className="h-4 w-4 shrink-0 text-amber-500" />
+                  文件已被其他程序修改，请重新加载最新版本后再保存
+                </span>
+                <Button size="sm" variant="soft" onClick={() => void reloadCurrentFile()} loading={loadingFile}>
+                  <RefreshCw className="h-3.5 w-3.5" /> 重新加载文件
                 </Button>
               </div>
             ) : null}
-          />
 
-          <div className="h-[520px] min-w-0 p-4 pt-3 sm:p-6 sm:pt-4 lg:h-[calc(100%-5rem)]">
             {loadingFile ? (
-              <div className="h-full animate-pulse rounded-2xl bg-pico-softer" />
+              <div className="flex-1 animate-pulse rounded-2xl bg-pico-softer" />
+            ) : fileError && selected ? (
+              <div className="flex flex-1 flex-col items-center justify-center rounded-2xl border-2 border-dashed border-rose-200 bg-rose-50/40 px-6 text-center">
+                <AlertTriangle className="mb-3 h-8 w-8 text-rose-500" />
+                <p className="text-sm font-extrabold text-pico-ink">读取文件失败</p>
+                <p className="mt-1 max-w-md text-xs text-pico-muted">{fileError}</p>
+                <Button className="mt-4" size="sm" variant="soft" onClick={() => void loadFile(selected)}>
+                  <RefreshCw className="h-3.5 w-3.5" /> 重试加载
+                </Button>
+              </div>
             ) : document ? (
               <textarea
                 value={content}
@@ -311,10 +516,10 @@ export function FileManager() {
                 spellCheck={false}
                 wrap="off"
                 aria-label="文件内容"
-                className="pico-ring h-full w-full resize-none overflow-auto rounded-2xl border-2 border-pico-line bg-white/80 p-4 font-mono text-xs leading-relaxed text-pico-ink transition focus:border-pico/70"
+                className="pico-ring min-h-0 flex-1 w-full resize-none overflow-auto rounded-2xl border-2 border-pico-line bg-white/80 p-4 font-mono text-xs leading-relaxed text-pico-ink transition focus:border-pico/70"
               />
             ) : selected ? (
-              <div className="flex h-full flex-col items-center justify-center rounded-2xl border-2 border-dashed border-pico-line px-6 text-center">
+              <div className="flex flex-1 flex-col items-center justify-center rounded-2xl border-2 border-dashed border-pico-line px-6 text-center">
                 <AlertTriangle className="mb-3 h-8 w-8 text-amber-500" />
                 <p className="text-sm font-extrabold text-pico-ink">此文件不能在线编辑</p>
                 <p className="mt-1 text-xs text-pico-muted">仅支持不超过 1 MiB 的 UTF-8 文本文件</p>

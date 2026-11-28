@@ -14,6 +14,7 @@ import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewTreeObserver
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.ImageView
@@ -29,6 +30,7 @@ import pico.onebot.core.QrEncoder
 import pico.onebot.keepalive.KeepAliveSettings
 import pico.onebot.kernel.KernelGate
 import java.lang.ref.WeakReference
+import java.util.WeakHashMap
 
 /**
  * 登录后盖在 QQ 首页上的引导面板(设计 §3.2 方案 ①):状态 / 地址 / Token / 地址二维码 / 打开控制台。
@@ -47,11 +49,17 @@ object PicoPanel {
     private const val AMBER = 0xFFB45309.toInt()
     private const val AMBER_SOFT = 0xFFFEF3C7.toInt()
 
+    private val stateLock = Any()
+
     @Volatile
     private var shownInProcess = false
     private var rootRef: WeakReference<View>? = null
     private var unsubState: (() -> Unit)? = null
+    private var focusListener: ViewTreeObserver.OnWindowFocusChangeListener? = null
+    private var qrImageRef: WeakReference<ImageView>? = null
+    private var qrBitmapRef: Bitmap? = null
     private var lastActivity: WeakReference<Activity>? = null
+    private val scheduledShows = WeakHashMap<Activity, Pair<WeakReference<View>, Runnable>>()
 
     /**
      * 布局单位:把短边当 360 个单位来铺,而不是用系统 density。
@@ -62,11 +70,11 @@ object PicoPanel {
 
     /** 供 `_pico_show_panel` 动作 / 调试用:在最近一个 MainActivity 上立刻弹出(或收起)面板。 */
     fun showNow(): Boolean {
-        val act = lastActivity?.get() ?: return false
+        val act = synchronized(stateLock) { lastActivity?.get() } ?: return false
         if (act.isFinishing || act.isDestroyed) return false
         act.runOnUiThread {
             try {
-                show(act)
+                if (!act.isFinishing && !act.isDestroyed) show(act)
             } catch (t: Throwable) {
                 PicoLog.e("panel: showNow failed", t)
             }
@@ -75,11 +83,44 @@ object PicoPanel {
     }
 
     fun hideNow() {
-        val act = lastActivity?.get() ?: return
+        val act = synchronized(stateLock) { lastActivity?.get() } ?: return
         act.runOnUiThread { dismiss() }
     }
 
-    private var pendingUnsub: (() -> Unit)? = null
+    private class PendingWaiter(val activityRef: WeakReference<Activity>) {
+        var unsub: (() -> Unit)? = null
+        var cancelled: Boolean = false
+        var fired: Boolean = false
+    }
+
+    private var pendingWaiter: PendingWaiter? = null
+
+    /** 延迟在 MainActivity 上尝试弹面板,并在该 Activity 销毁时可精确取消回调避免泄漏。 */
+    fun scheduleMaybeShow(activity: Activity, delayMs: Long = 1500L) {
+        if (activity.isFinishing || activity.isDestroyed) return
+        val decor = activity.window?.decorView ?: return
+        val actRef = WeakReference(activity)
+        val task = Runnable {
+            val act = actRef.get() ?: return@Runnable
+            synchronized(stateLock) {
+                scheduledShows.remove(act)
+            }
+            try {
+                if (!act.isFinishing && !act.isDestroyed) {
+                    maybeShow(act)
+                }
+            } catch (t: Throwable) {
+                PicoLog.e("PicoPanel show failed", t)
+            }
+        }
+        val prev = synchronized(stateLock) {
+            scheduledShows.put(activity, WeakReference(decor) to task)
+        }
+        prev?.let { (oldDecorRef, oldTask) ->
+            oldDecorRef.get()?.removeCallbacks(oldTask)
+        }
+        decor.postDelayed(task, delayMs)
+    }
 
     /**
      * MainActivity 起来后调用，一个进程只自动弹一次。
@@ -88,66 +129,254 @@ object PicoPanel {
      * 立刻盖上去会把"登录"按钮和二维码遮住。所以:已 ONLINE 直接弹;否则挂状态监听,到 ONLINE 再弹。
      */
     fun maybeShow(activity: Activity) {
-        lastActivity = WeakReference(activity)
-        if (shownInProcess) return
-        if (KernelGate.state == KernelGate.State.ONLINE) {
-            shownInProcess = true
-            show(activity)
+        if (activity.isFinishing || activity.isDestroyed) return
+        val oldUnsub: (() -> Unit)?
+        val shouldShowNow: Boolean
+        synchronized(stateLock) {
+            lastActivity = WeakReference(activity)
+            if (shownInProcess) return
+            if (KernelGate.state == KernelGate.State.ONLINE) {
+                val prev = pendingWaiter
+                pendingWaiter = null
+                prev?.cancelled = true
+                oldUnsub = prev?.unsub
+                shouldShowNow = true
+            } else {
+                val cur = pendingWaiter
+                if (cur != null && !cur.cancelled && cur.activityRef.get() === activity) return
+                oldUnsub = null
+                shouldShowNow = false
+            }
+        }
+        oldUnsub?.invoke()
+        if (shouldShowNow) {
+            showOnUiThread(activity)
             return
         }
-        if (pendingUnsub != null) return
+
         PicoLog.d("panel: not online yet, will show after ONLINE")
-        val ref = WeakReference(activity)
-        var unsub: (() -> Unit)? = null
-        unsub = KernelGate.addStateListener { st ->
-            if (st != KernelGate.State.ONLINE) return@addStateListener
-            unsub?.invoke()
-            pendingUnsub = null
-            val act = ref.get() ?: return@addStateListener
-            act.runOnUiThread {
-                try {
-                    if (!act.isFinishing && !act.isDestroyed && !shownInProcess) {
-                        shownInProcess = true
-                        show(act)
+        // listener 仅捕获 WeakReference 包装的 waiter,绝不强引用 Activity
+        val waiter = PendingWaiter(WeakReference(activity))
+        val listener: (KernelGate.State) -> Unit = { st ->
+            if (st == KernelGate.State.ONLINE) {
+                var toCancel: (() -> Unit)? = null
+                val shouldDispatch = synchronized(stateLock) {
+                    if (waiter.cancelled || waiter.fired) {
+                        false
+                    } else {
+                        waiter.fired = true
+                        toCancel = waiter.unsub
+                        if (pendingWaiter === waiter) {
+                            pendingWaiter = null
+                        }
+                        !shownInProcess
                     }
-                } catch (t: Throwable) {
-                    PicoLog.e("panel: deferred show failed", t)
+                }
+                toCancel?.invoke()
+                if (shouldDispatch) {
+                    val act = waiter.activityRef.get()
+                    if (act != null && !act.isFinishing && !act.isDestroyed) {
+                        showOnUiThread(act)
+                    }
                 }
             }
         }
-        pendingUnsub = unsub
+        val registered = KernelGate.addStateListener(listener)
+        var cancelRegistered = false
+        var supersededUnsub: (() -> Unit)? = null
+        var showAfterRegister = false
+        synchronized(stateLock) {
+            waiter.unsub = registered
+            when {
+                waiter.fired || waiter.cancelled || shownInProcess || activity.isFinishing || activity.isDestroyed -> {
+                    waiter.cancelled = true
+                    cancelRegistered = true
+                }
+                KernelGate.state == KernelGate.State.ONLINE -> {
+                    // 复查 ONLINE 消除释放锁到 addStateListener 之间的 TOCTOU 竞态
+                    waiter.cancelled = true
+                    cancelRegistered = true
+                    val prev = pendingWaiter
+                    pendingWaiter = null
+                    prev?.cancelled = true
+                    supersededUnsub = prev?.unsub
+                    showAfterRegister = true
+                }
+                else -> {
+                    val prev = pendingWaiter
+                    if (prev != null && !prev.cancelled && prev.activityRef.get() === activity) {
+                        waiter.cancelled = true
+                        cancelRegistered = true
+                    } else {
+                        if (prev != null) {
+                            prev.cancelled = true
+                            supersededUnsub = prev.unsub
+                        }
+                        pendingWaiter = waiter
+                    }
+                }
+            }
+        }
+        if (cancelRegistered) registered()
+        supersededUnsub?.invoke()
+        if (showAfterRegister) showOnUiThread(activity)
     }
 
-    fun show(activity: Activity) {
+    private fun showOnUiThread(activity: Activity) {
+        activity.runOnUiThread {
+            try {
+                if (activity.isFinishing || activity.isDestroyed) return@runOnUiThread
+                if (synchronized(stateLock) { shownInProcess }) return@runOnUiThread
+                if (show(activity)) {
+                    synchronized(stateLock) { shownInProcess = true }
+                }
+            } catch (t: Throwable) {
+                PicoLog.e("panel: show failed", t)
+            }
+        }
+    }
+
+    private class BuiltPanel(
+        val root: View,
+        val qrImage: ImageView,
+        val qrBitmap: Bitmap?,
+        val statusView: TextView,
+        val onWindowFocus: () -> Unit
+    )
+
+    fun show(activity: Activity): Boolean {
+        if (activity.isFinishing || activity.isDestroyed) return false
         dismiss()
-        val root = build(activity)
-        activity.addContentView(
-            root,
-            FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
-        )
-        rootRef = WeakReference(root)
-        PicoLog.i("panel: shown on " + activity.javaClass.simpleName + ", url=" + NetUtil.webuiUrl())
+        var built: BuiltPanel? = null
+        var addedToWindow = false
+        var windowFocusListener: ViewTreeObserver.OnWindowFocusChangeListener? = null
+        var stateUnsub: (() -> Unit)? = null
+        try {
+            val panel = build(activity)
+            built = panel
+            activity.addContentView(
+                panel.root,
+                FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+            )
+            addedToWindow = true
+            val fl = ViewTreeObserver.OnWindowFocusChangeListener { hasFocus ->
+                if (hasFocus) panel.onWindowFocus()
+            }
+            panel.root.viewTreeObserver.addOnWindowFocusChangeListener(fl)
+            windowFocusListener = fl
+            // 状态行跟着状态机走(监听器回调在任意线程,post 回 UI 线程)
+            val statusRef = WeakReference(panel.statusView)
+            val unsub = KernelGate.addStateListener {
+                val t = statusRef.get() ?: return@addStateListener
+                t.post { t.text = statusText() }
+            }
+            stateUnsub = unsub
+            synchronized(stateLock) {
+                rootRef = WeakReference(panel.root)
+                qrImageRef = WeakReference(panel.qrImage)
+                qrBitmapRef = panel.qrBitmap
+                focusListener = fl
+                unsubState = unsub
+            }
+            PicoLog.i("panel: shown on " + activity.javaClass.simpleName + ", url=" + NetUtil.webuiUrl())
+            return true
+        } catch (t: Throwable) {
+            try {
+                stateUnsub?.invoke()
+            } catch (_: Throwable) {
+            }
+            built?.let { panel ->
+                if (windowFocusListener != null) {
+                    try {
+                        val vto = panel.root.viewTreeObserver
+                        if (vto.isAlive) vto.removeOnWindowFocusChangeListener(windowFocusListener)
+                    } catch (_: Throwable) {
+                    }
+                }
+                if (addedToWindow) {
+                    try {
+                        (panel.root.parent as? ViewGroup)?.removeView(panel.root)
+                    } catch (_: Throwable) {
+                    }
+                }
+                try {
+                    panel.qrImage.setImageDrawable(null)
+                    val bmp = panel.qrBitmap
+                    if (bmp != null && !bmp.isRecycled) bmp.recycle()
+                } catch (_: Throwable) {
+                }
+            }
+            throw t
+        }
     }
 
     fun dismiss() {
-        unsubState?.invoke()
-        unsubState = null
-        val v = rootRef?.get() ?: return
-        rootRef = null
-        (v.parent as? ViewGroup)?.removeView(v)
+        val unsub: (() -> Unit)?
+        val v: View?
+        val fl: ViewTreeObserver.OnWindowFocusChangeListener?
+        val qrIv: ImageView?
+        val qrBmp: Bitmap?
+        synchronized(stateLock) {
+            unsub = unsubState
+            unsubState = null
+            v = rootRef?.get()
+            rootRef = null
+            fl = focusListener
+            focusListener = null
+            qrIv = qrImageRef?.get()
+            qrImageRef = null
+            qrBmp = qrBitmapRef
+            qrBitmapRef = null
+        }
+        unsub?.invoke()
+        if (v != null && fl != null) {
+            try {
+                val vto = v.viewTreeObserver
+                if (vto.isAlive) vto.removeOnWindowFocusChangeListener(fl)
+            } catch (_: Throwable) {
+            }
+        }
+        if (v != null) {
+            (v.parent as? ViewGroup)?.removeView(v)
+        }
+        try {
+            qrIv?.setImageDrawable(null)
+            if (qrBmp != null && !qrBmp.isRecycled) qrBmp.recycle()
+        } catch (_: Throwable) {
+        }
     }
 
     fun onActivityDestroyed(activity: Activity) {
-        // 这个实例还没等到 ONLINE 就销毁了:撤掉挂着的监听,下一个 MainActivity 会重新挂
-        pendingUnsub?.invoke()
-        pendingUnsub = null
-        val v = rootRef?.get()
-        if (v != null && v.context === activity) dismiss()
+        val scheduled: Pair<WeakReference<View>, Runnable>?
+        val unsubForThisActivity: (() -> Unit)?
+        val shouldDismiss: Boolean
+        synchronized(stateLock) {
+            scheduled = scheduledShows.remove(activity)
+            val cur = pendingWaiter
+            val pendingOwner = cur?.activityRef?.get()
+            if (cur != null && (pendingOwner === activity || pendingOwner == null)) {
+                cur.cancelled = true
+                pendingWaiter = null
+                unsubForThisActivity = cur.unsub
+            } else {
+                unsubForThisActivity = null
+            }
+            if (lastActivity?.get() === activity) {
+                lastActivity = null
+            }
+            val v = rootRef?.get()
+            shouldDismiss = v != null && v.context === activity
+        }
+        scheduled?.let { (decorRef, task) ->
+            decorRef.get()?.removeCallbacks(task)
+        }
+        unsubForThisActivity?.invoke()
+        if (shouldDismiss) dismiss()
     }
 
     // ---------------- 构建 ----------------
 
-    private fun build(ctx: Activity): View {
+    private fun build(ctx: Activity): BuiltPanel {
         val dm = ctx.resources.displayMetrics
         unit = minOf(dm.widthPixels, dm.heightPixels) / 360f
         fun dp(v: Int) = (v * unit + 0.5f).toInt()
@@ -178,140 +407,150 @@ object PicoPanel {
         col.addView(status)
 
         // 控制台地址的二维码(自带编码器)
+        var builtBmp: Bitmap? = null
         val qr = ImageView(ctx).apply {
             scaleType = ImageView.ScaleType.FIT_CENTER
             background = pill(Color.WHITE, dp(16))
             setPadding(dp(8), dp(8), dp(8), dp(8))
             try {
-                setImageBitmap(qrBitmap(url, dp(150)))
+                builtBmp = qrBitmap(url, dp(150))
+                setImageBitmap(builtBmp)
             } catch (t: Throwable) {
                 PicoLog.w("panel: qr encode failed: " + t.message)
             }
         }
-        col.addView(qr, LinearLayout.LayoutParams(dp(166), dp(166)).apply { topMargin = dp(12) })
+        try {
+            col.addView(qr, LinearLayout.LayoutParams(dp(166), dp(166)).apply { topMargin = dp(12) })
 
-        col.addView(tv(ctx, url, 14f, INK, bold = true, mono = true).apply {
-            setPadding(0, dp(10), 0, 0)
-            gravity = Gravity.CENTER
-        })
-        col.addView(tv(ctx, "在电脑 / 手机浏览器打开上面的地址,或直接扫码", 11f, MUTED).apply { gravity = Gravity.CENTER })
+            col.addView(tv(ctx, url, 14f, INK, bold = true, mono = true).apply {
+                setPadding(0, dp(10), 0, 0)
+                gravity = Gravity.CENTER
+            })
+            col.addView(tv(ctx, "在电脑 / 手机浏览器打开上面的地址,或直接扫码", 11f, MUTED).apply { gravity = Gravity.CENTER })
 
-        // 初始密码只在尚未初始化时显示；设置后配置中只保留密码派生值。
-        val isDefault = !Config.webuiPasswordInitialized
-        val tokenBox = LinearLayout(ctx).apply {
-            orientation = LinearLayout.VERTICAL
-            background = pill(if (isDefault) AMBER_SOFT else PINK_SOFT, dp(14))
-            setPadding(dp(12), dp(8), dp(12), dp(8))
+            // 初始密码只在尚未初始化且非损坏恢复模式时显示；设置后配置中只保留密码派生值。
+            val isRecovery = Config.corruptRecoveryMode
+            val isDefault = !isRecovery && !Config.webuiPasswordInitialized
+            val tokenBox = LinearLayout(ctx).apply {
+                orientation = LinearLayout.VERTICAL
+                background = pill(if (isDefault || isRecovery) AMBER_SOFT else PINK_SOFT, dp(14))
+                setPadding(dp(12), dp(8), dp(12), dp(8))
+            }
+            when {
+                isRecovery -> {
+                    tokenBox.addView(tv(ctx, "配置损坏 · 本地恢复模式", 13f, AMBER, bold = true))
+                    tokenBox.addView(tv(ctx, "仅监听 127.0.0.1，请从本地日志获取恢复令牌", 11f, AMBER))
+                }
+                isDefault -> {
+                    tokenBox.addView(tv(ctx, "初始密码: " + Config.DEFAULT_WEBUI_PASSWORD, 13f, AMBER, bold = true, mono = true))
+                    tokenBox.addView(tv(ctx, "首次进入控制台时必须设置新密码", 11f, AMBER))
+                }
+                else -> {
+                    tokenBox.addView(tv(ctx, "控制台密码已设置", 13f, INK, bold = true))
+                    tokenBox.addView(tv(ctx, "配置文件不保存明文密码", 11f, MUTED))
+                }
+            }
+            col.addView(
+                tokenBox,
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(12) }
+            )
+
+            // 按钮
+            val row = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
+            row.addView(
+                button(ctx, "打开控制台", PINK, Color.WHITE, dp(14)) { openBrowser(ctx, url) },
+                LinearLayout.LayoutParams(0, dp(42), 1f).apply { rightMargin = dp(8) }
+            )
+            row.addView(
+                button(ctx, "复制地址", PINK_SOFT, PINK, dp(14)) { copy(ctx, url) },
+                LinearLayout.LayoutParams(0, dp(42), 1f)
+            )
+            col.addView(
+                row,
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(12) }
+            )
+
+            col.addView(tv(ctx, "保活设置", 14f, INK, bold = true).apply {
+                setPadding(0, dp(14), 0, dp(2))
+            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            col.addView(tv(ctx, "建议完成以下设置，减少系统在后台清理 PicoOnebot", 10f, MUTED).apply {
+                setPadding(0, 0, 0, dp(6))
+            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+            val backgroundItem = keepAliveItem(
+                ctx,
+                "锁定后台",
+                "在最近任务中下拉或长按应用卡片并锁定，同时允许后台运行和自启动。",
+                "需手动",
+                "后台设置"
+            ) {
+                Toast.makeText(ctx, "还需在最近任务中锁定 PicoOnebot 卡片", Toast.LENGTH_LONG).show()
+                KeepAliveSettings.openBackgroundSettings(ctx)
+            }
+            col.addView(
+                backgroundItem.first,
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            )
+
+            val accessibilityItem = keepAliveItem(
+                ctx,
+                "无障碍保活服务",
+                "在无障碍设置中开启“PicoOnebot 保活服务”。",
+                "检查中",
+                "去开启"
+            ) { KeepAliveSettings.openAccessibilitySettings(ctx) }
+            col.addView(
+                accessibilityItem.first,
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) }
+            )
+
+            val batteryItem = keepAliveItem(
+                ctx,
+                "忽略电池优化",
+                "允许 PicoOnebot 在息屏和待机时继续运行。",
+                "检查中",
+                "去允许"
+            ) { KeepAliveSettings.requestIgnoreBatteryOptimizations(ctx) }
+            col.addView(
+                batteryItem.first,
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) }
+            )
+
+            fun refreshKeepAliveState() {
+                val accessibilityEnabled = KeepAliveSettings.isAccessibilityEnabled(ctx)
+                accessibilityItem.second.text = if (accessibilityEnabled) "已开启" else "未开启"
+                accessibilityItem.second.setTextColor(if (accessibilityEnabled) PINK else AMBER)
+                val batteryAllowed = KeepAliveSettings.isIgnoringBatteryOptimizations(ctx)
+                batteryItem.second.text = if (batteryAllowed) "已允许" else "未允许"
+                batteryItem.second.setTextColor(if (batteryAllowed) PINK else AMBER)
+            }
+            refreshKeepAliveState()
+
+            col.addView(
+                button(ctx, "给 PICOPICO 点一个免费的小星星 ★", PINK_SOFT, PINK, dp(14)) {
+                    openBrowser(ctx, PicoBoot.REPO)
+                },
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(42)).apply { topMargin = dp(8) }
+            )
+            col.addView(
+                button(ctx, "进入 QQ", Color.WHITE, INK, dp(14)) { dismiss() }.apply {
+                    background = outline(Color.WHITE, PINK_SOFT, dp(14), dp(2))
+                },
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(42)).apply { topMargin = dp(8) }
+            )
+
+            scroll.addView(col, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            root.addView(scroll, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+            return BuiltPanel(root, qr, builtBmp, status, ::refreshKeepAliveState)
+        } catch (t: Throwable) {
+            try {
+                qr.setImageDrawable(null)
+                val bmp = builtBmp
+                if (bmp != null && !bmp.isRecycled) bmp.recycle()
+            } catch (_: Throwable) {
+            }
+            throw t
         }
-        if (isDefault) {
-            tokenBox.addView(tv(ctx, "初始密码: " + Config.DEFAULT_WEBUI_PASSWORD, 13f, AMBER, bold = true, mono = true))
-            tokenBox.addView(tv(ctx, "首次进入控制台时必须设置新密码", 11f, AMBER))
-        } else {
-            tokenBox.addView(tv(ctx, "控制台密码已设置", 13f, INK, bold = true))
-            tokenBox.addView(tv(ctx, "配置文件不保存明文密码", 11f, MUTED))
-        }
-        col.addView(
-            tokenBox,
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(12) }
-        )
-
-        // 按钮
-        val row = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
-        row.addView(
-            button(ctx, "打开控制台", PINK, Color.WHITE, dp(14)) { openBrowser(ctx, url) },
-            LinearLayout.LayoutParams(0, dp(42), 1f).apply { rightMargin = dp(8) }
-        )
-        row.addView(
-            button(ctx, "复制地址", PINK_SOFT, PINK, dp(14)) { copy(ctx, url) },
-            LinearLayout.LayoutParams(0, dp(42), 1f)
-        )
-        col.addView(
-            row,
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(12) }
-        )
-
-        col.addView(tv(ctx, "保活设置", 14f, INK, bold = true).apply {
-            setPadding(0, dp(14), 0, dp(2))
-        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        col.addView(tv(ctx, "建议完成以下设置，减少系统在后台清理 PicoOnebot", 10f, MUTED).apply {
-            setPadding(0, 0, 0, dp(6))
-        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-
-        val backgroundItem = keepAliveItem(
-            ctx,
-            "锁定后台",
-            "在最近任务中下拉或长按应用卡片并锁定，同时允许后台运行和自启动。",
-            "需手动",
-            "后台设置"
-        ) {
-            Toast.makeText(ctx, "还需在最近任务中锁定 PicoOnebot 卡片", Toast.LENGTH_LONG).show()
-            KeepAliveSettings.openBackgroundSettings(ctx)
-        }
-        col.addView(
-            backgroundItem.first,
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-        )
-
-        val accessibilityItem = keepAliveItem(
-            ctx,
-            "无障碍保活服务",
-            "在无障碍设置中开启“PicoOnebot 保活服务”。",
-            "检查中",
-            "去开启"
-        ) { KeepAliveSettings.openAccessibilitySettings(ctx) }
-        col.addView(
-            accessibilityItem.first,
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) }
-        )
-
-        val batteryItem = keepAliveItem(
-            ctx,
-            "忽略电池优化",
-            "允许 PicoOnebot 在息屏和待机时继续运行。",
-            "检查中",
-            "去允许"
-        ) { KeepAliveSettings.requestIgnoreBatteryOptimizations(ctx) }
-        col.addView(
-            batteryItem.first,
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) }
-        )
-
-        fun refreshKeepAliveState() {
-            val accessibilityEnabled = KeepAliveSettings.isAccessibilityEnabled(ctx)
-            accessibilityItem.second.text = if (accessibilityEnabled) "已开启" else "未开启"
-            accessibilityItem.second.setTextColor(if (accessibilityEnabled) PINK else AMBER)
-            val batteryAllowed = KeepAliveSettings.isIgnoringBatteryOptimizations(ctx)
-            batteryItem.second.text = if (batteryAllowed) "已允许" else "未允许"
-            batteryItem.second.setTextColor(if (batteryAllowed) PINK else AMBER)
-        }
-        refreshKeepAliveState()
-        root.viewTreeObserver.addOnWindowFocusChangeListener { hasFocus ->
-            if (hasFocus) refreshKeepAliveState()
-        }
-
-        col.addView(
-            button(ctx, "给 PICOPICO 点一个免费的小星星 ★", PINK_SOFT, PINK, dp(14)) {
-                openBrowser(ctx, PicoBoot.REPO)
-            },
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(42)).apply { topMargin = dp(8) }
-        )
-        col.addView(
-            button(ctx, "进入 QQ", Color.WHITE, INK, dp(14)) { dismiss() }.apply {
-                background = outline(Color.WHITE, PINK_SOFT, dp(14), dp(2))
-            },
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(42)).apply { topMargin = dp(8) }
-        )
-
-        scroll.addView(col, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        root.addView(scroll, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-
-        // 状态行跟着状态机走(监听器回调在任意线程,post 回 UI 线程)
-        val statusRef = WeakReference(status)
-        unsubState = KernelGate.addStateListener {
-            val t = statusRef.get() ?: return@addStateListener
-            t.post { t.text = statusText() }
-        }
-        return root
     }
 
     private fun statusText(): String = when (KernelGate.state) {

@@ -2,6 +2,7 @@ package pico.onebot.net
 
 import org.json.JSONArray
 import org.json.JSONObject
+import pico.onebot.PicoBoot
 import pico.onebot.action.ActionRouter
 import pico.onebot.action.SystemActions
 import pico.onebot.core.Config
@@ -16,7 +17,15 @@ import pico.onebot.proto.Ob
  */
 object AdminApi {
 
-    fun handle(subPath: String, query: Map<String, String>, body: ByteArray): JSONObject {
+    private fun isWriteMethod(method: String): Boolean =
+        method.equals("POST", ignoreCase = true) || method.equals("PUT", ignoreCase = true)
+
+    fun handle(
+        subPath: String,
+        query: Map<String, String>,
+        body: ByteArray,
+        method: String = "GET"
+    ): JSONObject {
         val path = subPath.trimEnd('/').ifEmpty { "/" }
         return when (path) {
             "/", "/status" -> Ob.ok(SystemActions.statusObject())
@@ -31,23 +40,29 @@ object AdminApi {
             }
 
             "/config" -> {
-                if (body.isEmpty()) {
+                if (method.equals("GET", ignoreCase = true)) {
                     Ob.ok(Config.redactedRaw())
+                } else if (!isWriteMethod(method)) {
+                    Ob.failed(Ob.RC_BAD_PARAM, "method not allowed: $method")
+                } else if (body.isEmpty()) {
+                    Ob.failed(Ob.RC_BAD_PARAM, "POST/PUT /api/pico/config 需要非空 JSON 请求体")
                 } else {
                     try {
                         val patch = JSONObject(String(body, Charsets.UTF_8))
                         patch.optJSONObject("webui")?.apply {
                             remove("token")
+                            remove("tokenIsDefault")
                             remove("passwordSalt")
                             remove("passwordHash")
                             remove("passwordInitialized")
                         }
-                        val network = patch.optJSONObject("network")
-                        val errors = if (network == null) emptyList() else Config.validateNetwork(network)
+                        val errors = WebApi.validateConfigPatch(patch, validateNetworkFallback = false)
                         if (errors.isNotEmpty()) {
                             return Ob.failed(Ob.RC_BAD_PARAM, errors.joinToString("；"))
                         }
-                        Config.applyAppConfig(patch)
+                        WebApi.withConfigWriteLock {
+                            Config.applyAppConfig(patch)
+                        }
                         PicoLog.i("config patched via admin api: " + patch.keys().asSequence().joinToString(","))
                         Ob.ok(JSONObject().put("restart_required", true))
                     } catch (t: Throwable) {
@@ -59,6 +74,9 @@ object AdminApi {
             "/selftest" -> Ob.ok(selftest())
 
             "/sync" -> {
+                if (!isWriteMethod(method)) {
+                    return Ob.failed(Ob.RC_BAD_PARAM, "method not allowed: $method (use POST)")
+                }
                 val (ok, detail) = MsgWatchdog.triggerSyncNow("admin_api")
                 if (ok) {
                     Ob.ok(
@@ -68,11 +86,19 @@ object AdminApi {
                             .put("last_sync_at", Counters.lastSyncAt())
                     )
                 } else {
-                    Ob.failed(Ob.RC_KERNEL_ERROR, "触发消息同步失败: $detail")
+                    val rc = when {
+                        detail.startsWith("kernel not ready") || detail.startsWith("msgService unavailable") -> Ob.RC_NOT_READY
+                        detail.startsWith("sync cooldown") || detail.startsWith("timeout") -> Ob.RC_TIMEOUT
+                        else -> Ob.RC_KERNEL_ERROR
+                    }
+                    Ob.failed(rc, "触发消息同步失败: $detail")
                 }
             }
 
             "/mark_read" -> {
+                if (!isWriteMethod(method)) {
+                    return Ob.failed(Ob.RC_BAD_PARAM, "method not allowed: $method (use POST)")
+                }
                 val params = try {
                     if (body.isNotEmpty()) JSONObject(String(body, Charsets.UTF_8))
                     else JSONObject().apply {
@@ -98,7 +124,37 @@ object AdminApi {
         val d = SystemActions.diagnostics()
         val kernel = d.optJSONObject("kernel") ?: JSONObject()
 
-        check("transport", Transport.count() >= 0, "connections=" + Transport.count())
+        var enabledListeners = 0
+        var runningListeners = 0
+        var failedListeners = 0
+        fun inspectListeners(arr: JSONArray) {
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                if (!o.optBoolean("enabled", true)) continue
+                enabledListeners++
+                val id = o.optString("id")
+                if (PicoBoot.listening(id)) {
+                    runningListeners++
+                } else {
+                    failedListeners++
+                }
+            }
+        }
+        inspectListeners(Config.wsServers())
+        inspectListeners(Config.httpServers())
+
+        val activeConns = Transport.count()
+        val eventConsumers = Transport.eventConsumerCount()
+        val reporters = HttpReporter.targetCount()
+        val transportReady = failedListeners == 0 && (runningListeners > 0 || activeConns > 0 || reporters > 0)
+        val transportDetail = buildString {
+            append("listeners=").append(runningListeners).append('/').append(enabledListeners)
+            append(" connections=").append(activeConns)
+            append(" event_consumers=").append(eventConsumers)
+            append(" reporters=").append(reporters)
+            if (failedListeners > 0) append(" bind_errors=").append(failedListeners)
+        }
+        check("transport", transportReady, transportDetail)
         check("session", kernel.optBoolean("session", false), "KernelServiceUtil 返回的会话对象")
         check("logged_in", kernel.optBoolean("logged_in", false), "AppRuntime.isLogin && uin>0")
         check("msg_listener", kernel.optLong("listener_id", 0) != 0L, "listenerId=" + kernel.optLong("listener_id", 0))

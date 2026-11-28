@@ -48,38 +48,47 @@ object ForwardActions {
     const val MODE_SILENT = "silent"
 
     fun register() {
-        ActionRouter.register("send_forward_msg") { p -> send(p) }
-        ActionRouter.register("send_group_forward_msg") { p ->
-            send(p.put("message_type", "group"))
-        }
-        ActionRouter.register("send_private_forward_msg") { p ->
-            send(p.put("message_type", "private"))
-        }
+        ActionRouter.register("send_forward_msg") { p -> send(p, null) }
+        ActionRouter.register("send_group_forward_msg") { p -> send(p, "group") }
+        ActionRouter.register("send_private_forward_msg") { p -> send(p, "private") }
     }
 
     /** 一个节点:显示名 + 它的消息元素。 */
     private class Node(val name: String, val elements: ArrayList<MsgElement>)
 
-    private fun send(p: JSONObject): JSONObject {
+    private fun optLongParam(p: JSONObject, key: String): Long {
+        if (p.isNull(key)) return 0L
+        return MsgCodec.optNonNullString(p, key).trim().toLongOrNull() ?: p.optLong(key, 0L)
+    }
+
+    private fun send(p: JSONObject, forcedType: String? = null): JSONObject {
         if (!KernelGate.ready) return Ob.notReady("send_forward_msg")
+
+        val rawType = forcedType ?: MsgCodec.optNonNullString(p, "message_type").trim()
+        val groupId = optLongParam(p, "group_id")
+        val userId = optLongParam(p, "user_id")
+        val effectiveType = rawType.ifEmpty { if (groupId > 0L) "group" else "private" }
 
         val dst: Contact
         val dstChatType: Int
-        val groupId = p.optLong("group_id", 0)
-        if (groupId > 0 && p.optString("message_type", "group") != "private") {
-            dstChatType = CHAT_GROUP
-            dst = Contact(CHAT_GROUP, groupId.toString(), "")
-        } else {
-            val userId = p.optLong("user_id", 0)
-            if (userId <= 0) return Ob.failed(Ob.RC_BAD_PARAM, "需要 group_id 或 user_id")
-            val uid = UinUidStore.uid(userId)
-            if (uid.isEmpty()) return Ob.failed(Ob.RC_NOT_READY, "拿不到 $userId 的 uid")
-            dstChatType = CHAT_PRIVATE
-            dst = Contact(CHAT_PRIVATE, uid, "")
+        when (effectiveType) {
+            "group" -> {
+                if (groupId <= 0L) return Ob.failed(Ob.RC_BAD_PARAM, "group_id 缺失或非法")
+                dstChatType = CHAT_GROUP
+                dst = Contact(CHAT_GROUP, groupId.toString(), "")
+            }
+            "private" -> {
+                if (userId <= 0L) return Ob.failed(Ob.RC_BAD_PARAM, "user_id 缺失或非法")
+                val uid = UinUidStore.uid(userId)
+                if (uid.isEmpty()) return Ob.failed(Ob.RC_NOT_READY, "拿不到 $userId 的 uid")
+                dstChatType = CHAT_PRIVATE
+                dst = Contact(CHAT_PRIVATE, uid, "")
+            }
+            else -> return Ob.failed(Ob.RC_BAD_PARAM, "非法 message_type: $effectiveType (仅支持 group / private)")
         }
 
         // 单次调用可以用 mode 覆盖全局配置,方便上游按场景选择
-        val mode = p.optString("mode", "").ifEmpty { Config.str("forward_mode", MODE_MERGE) }
+        val mode = MsgCodec.optNonNullString(p, "mode").trim().ifEmpty { Config.str("forward_mode", MODE_MERGE) }
         if (mode == MODE_SILENT) {
             PicoLog.i("forward: silent 模式,丢弃 " + dstChatType + "/" + dst.peerUid)
             return Ob.ok(
@@ -88,21 +97,32 @@ object ForwardActions {
             )
         }
 
-        val raw = MsgCodec.normalize(p.opt("messages") ?: p.opt("message"))
+        val rawMsg = when {
+            !p.isNull("messages") -> p.opt("messages")
+            !p.isNull("message") -> p.opt("message")
+            else -> null
+        }
+        val raw = MsgCodec.normalize(rawMsg)
         if (raw.length() == 0) return Ob.failed(Ob.RC_BAD_PARAM, "messages 为空")
 
         val nodes = ArrayList<Node>()
         for (i in 0 until raw.length()) {
             val seg = raw.optJSONObject(i) ?: continue
-            if (seg.optString("type") != "node") {
+            if (MsgCodec.optNonNullString(seg, "type") != "node") {
                 return Ob.failed(Ob.RC_BAD_PARAM, "第 $i 段不是 node")
             }
             val node = try {
                 toNode(seg.optJSONObject("data") ?: JSONObject(), i)
+            } catch (t: MsgCodec.BadSegmentParam) {
+                return Ob.failed(Ob.RC_BAD_PARAM, "node[$i] 参数非法: " + (t.message ?: ""))
             } catch (t: MsgCodec.UnsupportedSegment) {
                 return Ob.failed(Ob.RC_UNSUPPORTED, "node[$i] 含不支持的段: " + t.type)
             } catch (t: pico.onebot.media.MediaFiles.ResolveError) {
                 return Ob.failed(Ob.RC_BAD_PARAM, "node[$i] 媒体来源无法读取: " + t.message)
+            } catch (t: pico.onebot.media.MediaDownloader.DownloadError) {
+                return Ob.failed(Ob.RC_KERNEL_ERROR, "node[$i] 媒体下载失败: " + t.message)
+            } catch (t: pico.onebot.media.MediaBuilder.BuildError) {
+                return Ob.failed(Ob.RC_KERNEL_ERROR, "node[$i] 媒体元素构造失败: " + t.message)
             } catch (t: NodeError) {
                 return Ob.failed(Ob.RC_BAD_PARAM, t.message ?: "node 解析失败")
             } catch (t: Throwable) {
@@ -120,11 +140,13 @@ object ForwardActions {
 
     /** node 既可能带自定义 content,也可能只给一个已存在消息的 id。 */
     private fun toNode(data: JSONObject, index: Int): Node {
-        val name = data.optString("nickname", "").ifEmpty { data.optString("name", "") }
-        if (data.has("content")) {
+        val name = MsgCodec.optNonNullString(data, "nickname")
+            .ifEmpty { MsgCodec.optNonNullString(data, "name") }
+        if (!data.isNull("content")) {
             return Node(name, MsgCodec.toElements(MsgCodec.normalize(data.opt("content"))))
         }
-        val refId = data.optString("id", "").ifEmpty { data.optString("message_id", "") }
+        val refId = MsgCodec.optNonNullString(data, "id").trim()
+            .ifEmpty { MsgCodec.optNonNullString(data, "message_id").trim() }
         if (refId.isEmpty()) throw NodeError("node[$index] 既没有 content 也没有 id")
         val entry = MsgIdStore.byMessageId(refId.toIntOrNull() ?: -1)
             ?: throw NodeError("node[$index] 的 id 不是已知 message_id: $refId")
@@ -137,15 +159,28 @@ object ForwardActions {
         return Node(shown, ArrayList(rec.elements ?: emptyList()))
     }
 
+    private data class LoadResult(val code: Int, val msg: String, val records: ArrayList<MsgRecord>?)
+
     private fun loadRecord(chatType: Int, peerUid: String, msgId: Long): MsgRecord? {
         val svc = KernelGate.msgService() ?: return null
-        val result = Promise<ArrayList<MsgRecord>>()
+        val result = Promise<LoadResult>()
         return try {
             svc.getMsgsByMsgId(
                 Contact(chatType, peerUid, ""), arrayListOf(msgId),
-                IMsgOperateCallback { _, _, records -> result.resolve(records) }
+                IMsgOperateCallback { code, msg, records ->
+                    result.resolve(LoadResult(code, msg ?: "", records))
+                }
             )
-            result.await(Config.kernelTimeoutMs)?.firstOrNull()
+            val res = result.await(Config.kernelTimeoutMs)
+            if (res == null) {
+                PicoLog.w("加载被引用消息超时 msgId=$msgId")
+                null
+            } else if (res.code != 0) {
+                PicoLog.w("加载被引用消息失败 msgId=$msgId code=${res.code} ${res.msg}")
+                null
+            } else {
+                res.records?.firstOrNull()
+            }
         } catch (t: Throwable) {
             PicoLog.w("加载被引用消息失败 msgId=$msgId", t)
             null
@@ -167,8 +202,11 @@ object ForwardActions {
         }
         val resp = MsgActions.sendElements(dst, chatType, merged)
         if (resp.optInt("retcode", -1) == 0) {
-            (resp.optJSONObject("data") ?: JSONObject()).put("mode", MODE_MERGE)
+            val data = resp.optJSONObject("data") ?: JSONObject().also { resp.put("data", it) }
+            data.put("mode", MODE_MERGE)
                 .put("nodes", nodes.size)
+            val msgId = data.optInt("message_id", 0)
+            if (msgId != 0) data.put("message_ids", JSONArray().put(msgId))
             PicoLog.i("forward merge_one: " + nodes.size + " 个节点拼成一条")
         }
         return resp
@@ -199,6 +237,14 @@ object ForwardActions {
                 failed.optInt("retcode", Ob.RC_KERNEL_ERROR),
                 "逐条转发在第 " + (ids.length() + 1) + "/" + nodes.size + " 条中断: " +
                     failed.optString("message")
+            ).put(
+                "data",
+                JSONObject()
+                    .put("message_id", lastId)
+                    .put("message_ids", ids)
+                    .put("mode", MODE_SEPARATE)
+                    .put("sent_count", ids.length())
+                    .put("total_count", nodes.size)
             )
         }
         PicoLog.i("forward separate: 发出 " + ids.length() + " 条")

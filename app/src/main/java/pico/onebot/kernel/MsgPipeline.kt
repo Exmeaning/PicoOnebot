@@ -25,8 +25,8 @@ object MsgPipeline {
     private val seen = LinkedHashSet<Long>()
     private val recalled = LinkedHashSet<Long>()
 
-
     private val queueLock = Any()
+    private val pipelineEpoch = AtomicLong(0L)
 
     private lateinit var queue: ArrayBlockingQueue<Job>
 
@@ -41,16 +41,46 @@ object MsgPipeline {
     @Volatile
     private var running = false
 
-    private class Job(val kind: Int, val records: List<MsgRecord>)
+    private class SendErrorPayload(
+        val msgId: Long,
+        val chatType: Int,
+        val peerUid: String,
+        val code: Int,
+        val msg: String
+    )
+
+    private class Job(
+        val kind: Int,
+        val epoch: Long,
+        val records: List<MsgRecord> = emptyList(),
+        val sendError: SendErrorPayload? = null
+    )
 
     private const val KIND_INCOMING = 0
     private const val KIND_UPDATE = 1
+    private const val KIND_SELF_SENT = 2
+    private const val KIND_SEND_ERROR = 3
 
     fun start() {
-        if (running) return
-        queue = ArrayBlockingQueue(Config.eventQueueSize)
-        running = true
+        synchronized(this) {
+            if (running) return
+            queue = ArrayBlockingQueue(Config.eventQueueSize.coerceAtLeast(16))
+            running = true
+        }
         Thread({ pump() }, "pico-msgpipe").apply { isDaemon = true }.start()
+    }
+
+    /** 会话丢失/切号时递增代际并清空队列与去重表,阻止旧账号消息串发到新会话。 */
+    fun reset() {
+        pipelineEpoch.incrementAndGet()
+        if (running) {
+            synchronized(queueLock) {
+                queue.clear()
+            }
+        }
+        synchronized(seen) { seen.clear() }
+        synchronized(recalled) { recalled.clear() }
+        PicoLog.d("msg pipeline reset")
     }
 
     // ---------------- 内核回调入口(必须极快返回) ----------------
@@ -58,23 +88,22 @@ object MsgPipeline {
     fun onIncoming(source: String, records: ArrayList<MsgRecord>) {
         if (records.isEmpty()) return
         for (r in records) SendTracker.onRecordSeen(r)
-        offer(Job(KIND_INCOMING, ArrayList(records)))
+        offer(Job(KIND_INCOMING, pipelineEpoch.get(), ArrayList(records)))
     }
 
     fun onUpdate(records: ArrayList<MsgRecord>) {
         if (records.isEmpty()) return
         for (r in records) SendTracker.onRecordSeen(r)
-        offer(Job(KIND_UPDATE, ArrayList(records)))
+        offer(Job(KIND_UPDATE, pipelineEpoch.get(), ArrayList(records)))
     }
 
     fun onSelfSent(record: MsgRecord) {
         SendTracker.onRecordSeen(record)
-        offer(Job(KIND_INCOMING, listOf(record)))
+        offer(Job(KIND_SELF_SENT, pipelineEpoch.get(), listOf(record)))
     }
 
     /**
-     * 发送失败的异步通知。除了让等待中的调用方立刻失败,还要**主动告诉上游** ——
-     * 否则上游只看见一条 `message_sent`,永远不知道那条消息其实没发出去。
+     * 发送失败的异步通知。快路径立即唤醒 SendTracker,耗时的查表/JNI 富化卸载到管道线程执行。
      */
     fun onSendError(msgId: Long, contact: Any?, code: Int, msg: String) {
         val c = contact as? com.tencent.qqnt.kernelpublic.nativeinterface.Contact
@@ -83,20 +112,13 @@ object MsgPipeline {
         sendErrors.incrementAndGet()
         PicoLog.w("send failed msgId=$msgId chat=$chatType peer=$peerUid code=$code $msg")
         SendTracker.onSendError(msgId, chatType, peerUid, code, msg)
-
-        val entry = MsgIdStore.byMsgId(msgId)
-        val event = Ob.event("notice")
-            .put("notice_type", "pico_send_failed")
-            .put("message_id", entry?.messageId ?: 0)
-            .put("msg_id", msgId.toString())
-            .put("error_code", code)
-            .put("error_message", msg)
-        if (chatType == 2) {
-            event.put("group_id", peerUid.toLongOrNull() ?: 0L)
-        } else {
-            event.put("user_id", UinUidStore.uin(peerUid))
-        }
-        EventBus.post(event)
+        offer(
+            Job(
+                kind = KIND_SEND_ERROR,
+                epoch = pipelineEpoch.get(),
+                sendError = SendErrorPayload(msgId, chatType, peerUid, code, msg)
+            )
+        )
     }
 
     fun onSysMsg(payload: Any?) {
@@ -129,9 +151,23 @@ object MsgPipeline {
                 PicoLog.w("msgpipe take failed", t)
                 continue
             }
-            for (r in job.records) {
+            if (job.epoch != pipelineEpoch.get()) continue
+            if (job.kind == KIND_SEND_ERROR) {
                 try {
-                    if (job.kind == KIND_INCOMING) handleIncoming(r) else handleUpdate(r)
+                    job.sendError?.let { handleSendError(it, job.epoch) }
+                } catch (t: Throwable) {
+                    PicoLog.w("send error enrich failed msgId=" + (job.sendError?.msgId ?: 0L), t)
+                }
+                continue
+            }
+            for (r in job.records) {
+                if (job.epoch != pipelineEpoch.get()) break
+                try {
+                    when (job.kind) {
+                        KIND_INCOMING -> handleIncoming(r, job.epoch, forceSelf = false)
+                        KIND_SELF_SENT -> handleIncoming(r, job.epoch, forceSelf = true)
+                        else -> handleUpdate(r, job.epoch)
+                    }
                 } catch (t: Throwable) {
                     PicoLog.w("msg convert failed msgId=" + r.msgId, t)
                 }
@@ -139,7 +175,26 @@ object MsgPipeline {
         }
     }
 
-    private fun handleIncoming(rec: MsgRecord) {
+    private fun handleSendError(p: SendErrorPayload, epoch: Long) {
+        if (epoch != pipelineEpoch.get()) return
+        val entry = MsgIdStore.byMsgId(p.msgId)
+        val event = Ob.event("notice")
+            .put("notice_type", "pico_send_failed")
+            .put("message_id", entry?.messageId ?: 0)
+            .put("msg_id", p.msgId.toString())
+            .put("error_code", p.code)
+            .put("error_message", p.msg)
+        if (p.chatType == 2) {
+            event.put("group_id", p.peerUid.toLongOrNull() ?: 0L)
+        } else {
+            event.put("user_id", UinUidStore.uin(p.peerUid))
+        }
+        if (epoch != pipelineEpoch.get()) return
+        EventBus.post(event)
+    }
+
+    private fun handleIncoming(rec: MsgRecord, epoch: Long, forceSelf: Boolean = false) {
+        if (epoch != pipelineEpoch.get()) return
         // 内核会为"发送失败 / 占位 / 已清空"的消息也回调 MsgRecord,elements 是空的。
         // 放它过去就会变成一条 user_id=0、message=[] 的垃圾事件,还白占一个 message_id。
         if ((rec.elements?.size ?: 0) == 0) {
@@ -150,7 +205,7 @@ object MsgPipeline {
         if (rec.msgId == 0L) noMsgId.incrementAndGet()
         if (seenContains(rec.msgId)) return
 
-        val isSelf = isSelfSent(rec)
+        val isSelf = forceSelf || isSelfSent(rec)
         if (isSelf && !Config.reportSelfMessage) {
             markSeen(rec.msgId)
             return
@@ -162,6 +217,7 @@ object MsgPipeline {
             PicoLog.d("drop empty decoded record " + digest(rec))
             return
         }
+        if (epoch != pipelineEpoch.get()) return
         val event = Ob.event(if (isSelf) "message_sent" else "message")
         val keys = body.keys()
         while (keys.hasNext()) {
@@ -177,6 +233,7 @@ object MsgPipeline {
                 if (target > 0) event.put("target_id", target)
             }
         }
+        if (epoch != pipelineEpoch.get()) return
         if (!markSeen(rec.msgId)) return
         converted.incrementAndGet()
         pico.onebot.core.Counters.onRecv()
@@ -188,11 +245,13 @@ object MsgPipeline {
         EventBus.post(event)
     }
 
-    private fun handleUpdate(rec: MsgRecord) {
+    private fun handleUpdate(rec: MsgRecord, epoch: Long) {
+        if (epoch != pipelineEpoch.get()) return
         if (rec.recallTime > 0 && markRecalled(rec.msgId)) {
             val entry = MsgIdStore.byMsgId(rec.msgId)
             val messageId = entry?.messageId ?: 0
             val operator = if (rec.senderUin > 0) rec.senderUin else UinUidStore.uin(rec.senderUid)
+            if (epoch != pipelineEpoch.get()) return
             val event = Ob.event("notice")
             if (rec.chatType == 2) {
                 event.put("notice_type", "group_recall")
@@ -210,7 +269,7 @@ object MsgPipeline {
         }
         // 未被去重闸放行过的更新(例如离线消息先 update 后 add,或初始空记录后续补齐)也要能成为 message
         if (rec.recallTime <= 0 && !seenContains(rec.msgId) && (rec.elements?.size ?: 0) > 0) {
-            handleIncoming(rec)
+            handleIncoming(rec, epoch, forceSelf = false)
         }
     }
 
@@ -267,7 +326,6 @@ object MsgPipeline {
         .put("converted", converted.get())
         .put("dropped", droppedIn.get())
         .put("dropped_junk", droppedJunk.get())
-
         .put("send_errors", sendErrors.get())
         .put("no_msgid", noMsgId.get())
         .put("pending", if (running) queue.size else 0)

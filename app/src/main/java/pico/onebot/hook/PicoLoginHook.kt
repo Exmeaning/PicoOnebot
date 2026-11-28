@@ -78,7 +78,11 @@ abstract class PicoLoginWithStateHook : LoginWithStateFragment() {
     }
 
     override fun onDestroyView() {
-        PicoLoginManager.onStateFragmentDestroyed(this)
+        try {
+            PicoLoginManager.onStateFragmentDestroyed(this)
+        } catch (t: Throwable) {
+            PicoLog.e("PicoLoginWithStateHook.onDestroyView error", t)
+        }
         super.onDestroyView()
     }
 }
@@ -95,7 +99,11 @@ abstract class PicoLoginWithoutStateHook : LoginWithoutStatePage() {
     }
 
     override fun onDestroyView() {
-        PicoLoginManager.onWelcomeViewDestroyed(this)
+        try {
+            PicoLoginManager.onWelcomeViewDestroyed(this)
+        } catch (error: Throwable) {
+            PicoLog.e("PicoLoginWithoutStateHook.onDestroyView error", error)
+        }
         super.onDestroyView()
     }
 }
@@ -104,7 +112,13 @@ abstract class PicoLoginWithoutStateHook : LoginWithoutStatePage() {
 abstract class PicoPrivacyLicenseHook : PrivacyLicenseFragment() {
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
-        if (!DeploymentAutomation.autoAcceptPrivacy) return
+        val shouldAccept = try {
+            DeploymentAutomation.autoAcceptPrivacy
+        } catch (error: Throwable) {
+            PicoLog.e("PicoPrivacyLicenseHook: autoAcceptPrivacy check failed", error)
+            false
+        }
+        if (!shouldAccept) return
         view.post {
             try {
                 val id = view.resources.getIdentifier("agree", "id", view.context.packageName)

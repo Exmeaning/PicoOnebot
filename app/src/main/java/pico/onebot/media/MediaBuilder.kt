@@ -13,6 +13,7 @@ import pico.onebot.core.PicoLog
 import pico.onebot.kernel.KernelGate
 import java.io.File
 import java.io.FileOutputStream
+import java.util.Locale
 
 /**
  * 本地文件 → 可发送的 `MsgElement`。
@@ -95,8 +96,14 @@ object MediaBuilder {
     // ---------------- 语音 ----------------
 
     fun record(src: File, declaredDuration: Int = 0): MsgElement {
-        val ext = MediaFiles.sniffExt(MediaFiles.head(src))
-            .ifEmpty { "." + src.name.substringAfterLast('.', "") }
+        val sniffed = MediaFiles.sniffExt(MediaFiles.head(src))
+        val fileExt = src.name.substringAfterLast('.', "").lowercase(Locale.ROOT)
+            .let { if (it.isEmpty()) "" else ".$it" }
+        val ext = when {
+            sniffed == ".mp4" && fileExt == ".m4a" -> ".m4a"
+            sniffed.isNotEmpty() -> sniffed
+            else -> fileExt
+        }
         val format = when (ext) {
             ".silk" -> FMT_SILK
             ".amr" -> FMT_AMR
@@ -107,7 +114,7 @@ object MediaBuilder {
             )
         }
         val md5 = MediaFiles.md5File(src)
-        val name = kernelName(src, md5)
+        val name = kernelName(src, md5, ext.removePrefix("."))
         val path = kernelPath(E_PTT, 0, md5, name, DL_ORIGIN, 0)
             ?: throw BuildError("内核没有返回语音缓存路径")
         if (!MediaFiles.copyTo(src, path)) throw BuildError("拷贝到内核缓存失败: " + path)
@@ -182,19 +189,27 @@ object MediaBuilder {
         video.subBusiType = 0
 
         // 没有封面的视频在 QQ 里只是一块黑底,所以自己抽一帧
-        val thumb = thumbSrc ?: extractThumb(src)
-        if (thumb != null && thumb.isFile) {
-            val tMd5 = MediaFiles.md5File(thumb)
-            val tName = kernelName(thumb, tMd5)
-            val tPath = kernelPath(E_VIDEO, 0, tMd5, tName, DL_THUMB, 0)
-            if (tPath != null && MediaFiles.copyTo(thumb, tPath)) {
-                val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                BitmapFactory.decodeFile(tPath, opts)
-                video.thumbPath = HashMap<Int, String>().apply { put(0, tPath) }
-                video.thumbMd5 = tMd5
-                video.thumbSize = thumb.length().toInt()
-                video.thumbWidth = if (opts.outWidth > 0) opts.outWidth else 1
-                video.thumbHeight = if (opts.outHeight > 0) opts.outHeight else 1
+        val generatedThumb = if (thumbSrc == null) extractThumb(src) else null
+        val thumb = thumbSrc ?: generatedThumb
+        try {
+            if (thumb != null && thumb.isFile) {
+                val tMd5 = MediaFiles.md5File(thumb)
+                val tName = kernelName(thumb, tMd5)
+                val tPath = kernelPath(E_VIDEO, 0, tMd5, tName, DL_THUMB, 0)
+                if (tPath != null && MediaFiles.copyTo(thumb, tPath)) {
+                    val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                    BitmapFactory.decodeFile(tPath, opts)
+                    video.thumbPath = HashMap<Int, String>().apply { put(0, tPath) }
+                    video.thumbMd5 = tMd5
+                    video.thumbSize = thumb.length().toInt()
+                    video.thumbWidth = if (opts.outWidth > 0) opts.outWidth else 1
+                    video.thumbHeight = if (opts.outHeight > 0) opts.outHeight else 1
+                }
+            }
+        } finally {
+            generatedThumb?.let {
+                MediaFiles.unpinOutboxFile(it)
+                it.delete()
             }
         }
 
@@ -210,11 +225,32 @@ object MediaBuilder {
         try {
             mmr.setDataSource(src.absolutePath)
             val bmp: Bitmap? = mmr.getFrameAtTime(0)
-            if (bmp == null) null else {
-                val out = File(MediaFiles.outboxDir, "thumb-" + src.name + ".jpg")
-                FileOutputStream(out).use { bmp.compress(Bitmap.CompressFormat.JPEG, 80, it) }
-                bmp.recycle()
-                out
+            if (bmp == null) {
+                null
+            } else {
+                var out: File? = null
+                try {
+                    val tmp = File.createTempFile("thumb-", ".jpg", MediaFiles.outboxDir)
+                    MediaFiles.pinOutboxFile(tmp)
+                    out = tmp
+                    val ok = FileOutputStream(tmp).use {
+                        bmp.compress(Bitmap.CompressFormat.JPEG, 80, it)
+                    }
+                    if (!ok) {
+                        MediaFiles.unpinOutboxFile(tmp)
+                        tmp.delete()
+                        out = null
+                    }
+                    out
+                } catch (t: Throwable) {
+                    out?.let {
+                        MediaFiles.unpinOutboxFile(it)
+                        it.delete()
+                    }
+                    throw t
+                } finally {
+                    bmp.recycle()
+                }
             }
         } finally {
             mmr.release()
@@ -228,9 +264,11 @@ object MediaBuilder {
 
     fun file(src: File, displayName: String = ""): MsgElement {
         val md5 = MediaFiles.md5File(src)
-        val name = displayName.ifEmpty { src.name }
+        val name = sanitizeFileName(displayName, src.name)
         val path = kernelPath(E_FILE, 0, md5, name, DL_ORIGIN, 0)
-        if (path != null) MediaFiles.copyTo(src, path)
+        if (path != null && !MediaFiles.copyTo(src, path)) {
+            throw BuildError("拷贝文件到内核缓存失败: " + path)
+        }
 
         val fe = FileElement()
         fe.fileName = name
@@ -247,9 +285,43 @@ object MediaBuilder {
 
     // ---------------- 公共 ----------------
 
-    private fun kernelName(src: File, md5: String): String {
-        val ext = src.name.substringAfterLast('.', "")
-            .ifEmpty { MediaFiles.sniffExt(MediaFiles.head(src)).removePrefix(".") }
+    private val SAFE_EXT_BODY = Regex("^[a-z0-9]{1,5}$")
+    private val GENERIC_EXT_BODIES = setOf("tmp", "dat", "bin", "part", "bak", "cache", "file", "raw")
+
+    private fun sanitizeFileName(raw: String, fallback: String): String {
+        val cleaned = cleanBaseName(raw)
+        if (cleaned.isNotEmpty()) return cleaned
+        val fb = cleanBaseName(fallback)
+        return fb.ifEmpty { "file" }
+    }
+
+    private fun cleanBaseName(raw: String): String {
+        val base = raw
+            .replace('\u0000', '_')
+            .substringAfterLast('/')
+            .substringAfterLast('\\')
+            .filter { it >= ' ' && it != '\u007F' }
+            .trim()
+        if (base.isEmpty() || base == "." || base == "..") return ""
+        return base
+    }
+
+    private fun kernelName(src: File, md5: String, preferredExt: String = ""): String {
+        val pref = preferredExt.lowercase(Locale.ROOT)
+        if (SAFE_EXT_BODY.matches(pref) && pref !in GENERIC_EXT_BODIES) {
+            return "$md5.$pref"
+        }
+        val rawExt = src.name.substringAfterLast('.', "").lowercase(Locale.ROOT)
+        val validRaw = SAFE_EXT_BODY.matches(rawExt) && rawExt !in GENERIC_EXT_BODIES
+        val sniffed = MediaFiles.sniffExt(MediaFiles.head(src)).removePrefix(".")
+        val ext = when {
+            validRaw && sniffed == "mp4" && rawExt == "m4a" -> "m4a"
+            validRaw && sniffed == "png" && rawExt == "apng" -> "apng"
+            validRaw && sniffed == "jpg" && rawExt == "jpeg" -> "jpeg"
+            sniffed.isNotEmpty() -> sniffed
+            validRaw -> rawExt
+            else -> ""
+        }
         return if (ext.isEmpty()) md5 else md5 + "." + ext
     }
 

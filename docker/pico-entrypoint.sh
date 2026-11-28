@@ -1,6 +1,6 @@
 #!/system/bin/pico-bb/sh
 # pico-entrypoint.sh: 容器启动入口脚本
-# 负责 Binder 设备校验、权限检查、kmsg 日志转发与启动 Android init (PID 1)。
+# 负责 Binder 设备校验、权限检查、可选 kmsg 日志转发与启动 Android init (PID 1)。
 #
 # 注意：本脚本在 /init 之前运行。此时 /apex 尚未挂载，Android 自带的 /system/bin/sh、stat、
 # grep 等全部动态链接到 /apex/com.android.runtime 下的 linker/libc，execve 会直接报
@@ -8,12 +8,17 @@
 # 且 PATH 里 BusyBox 必须排在 /system/bin 之前。
 #
 # 环境变量：
-#   PICO_LOG_KMSG=1|all|0   将 /dev/kmsg 转发至 stdout。默认 1 (关键日志)，all (全量)，0 (关闭)
+#   PICO_LOG_KMSG=0|1|all   将容器启动后的 /dev/kmsg 转发至 stdout。
+#                           默认 0 (关闭，避免泄露宿主机内核日志；pico-boot 已直接输出至容器 stdout)
+#                           1 (仅转发容器 Android init/核心服务新增日志，去重 pico-boot 输出)
+#                           all (转发启动后全量内核日志，仅用于排障，含宿主机共享内核输出)
 #   PICO_BINDER_STRICT=1    Binder 校验未通过时直接退出（默认 0，仅告警）
+#   PICO_ENABLE_ADB=1|0     是否启用容器内 Redroid adbd 调试服务（默认 1，兼容 compose 仅回环映射；
+#                           设为 0 时在 init 阶段强制停用 adbd 并禁用 TCP 5555，K8s 清单默认设为 0）
 
 export PATH=/system/bin/pico-bb:/system/bin:/system/xbin
 
-say() { echo "[pico-entrypoint] $*"; }
+say() { printf '[pico-entrypoint] %s\n' "$*"; }
 
 say "=============================================================="
 say "PicoOnebot All-in-One 容器启动"
@@ -60,23 +65,75 @@ else
     say "未检测到外部 Binder 节点映射，将通过 binderfs 自动挂载。"
 fi
 
-# ── 转发 /dev/kmsg 至 stdout ────────────────────────────────────────────────
-case "${PICO_LOG_KMSG:-1}" in
-    0) say "已禁用 kmsg 日志转发 (PICO_LOG_KMSG=0)。" ;;
+# ── 可选转发 /dev/kmsg 至 stdout ────────────────────────────────────────────
+# /dev/kmsg 属于宿主机共享内核环形缓冲：
+# - 默认关闭 (PICO_LOG_KMSG=0)，避免向容器 stdout 泄露无关宿主机内核日志；
+# - 开启 1/all 时记录容器启动时刻 (/proc/uptime)，丢弃历史宿主机记录并过滤已直接输出至 stdout 的 pico-boot 日志。
+kmsg_relay() {
+    _mode="$1"
+    _start_sec=0
+    if [ -r /proc/uptime ]; then
+        read -r _up _ < /proc/uptime 2>/dev/null || true
+        _up_int="${_up%%.*}"
+        case "$_up_int" in
+            ''|*[!0-9]*) _start_sec=0 ;;
+            *) _start_sec="$_up_int" ;;
+        esac
+    fi
+    cat /dev/kmsg 2>/dev/null | while IFS= read -r _line; do
+        # 跳过续行元数据 (以空格开头或不含分号)
+        case "$_line" in
+            ' '*) continue ;;
+            *';'*) ;;
+            *) continue ;;
+        esac
+        _hdr="${_line%%;*}"
+        _msg="${_line#*;}"
+        # 提取第 3 字段 (微秒时间戳) 并转为整秒，跳过容器启动之前的宿主机历史日志
+        _ts_field="${_hdr#*,}"
+        _ts_field="${_ts_field#*,}"
+        _ts_us="${_ts_field%%,*}"
+        case "$_ts_us" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        if [ "${#_ts_us}" -le 6 ]; then
+            _ts_sec=0
+        else
+            _ts_sec="${_ts_us%??????}"
+        fi
+        [ "$_ts_sec" -ge "$_start_sec" ] || continue
+        # 避免重复输出已直写 /proc/1/fd/1 的 pico-boot / pico-entrypoint 日志
+        case "$_msg" in
+            *'[pico-boot '*|*'[pico-entrypoint]'*) continue ;;
+        esac
+        if [ "$_mode" = "all" ]; then
+            printf '[kmsg] %s\n' "$_msg"
+        else
+            case "$_msg" in
+                init:*|*'servicemanager'*|*'surfaceflinger'*|*'zygote'*|*'keystore'*|*'redroid'*)
+                    printf '[kmsg] %s\n' "$_msg"
+                    ;;
+            esac
+        fi
+    done
+}
+
+case "${PICO_LOG_KMSG:-0}" in
+    0|'')
+        say "已禁用 kmsg 日志转发 (默认 PICO_LOG_KMSG=0，可设为 1 或 all 排障)。"
+        ;;
     all)
         if [ -r /dev/kmsg ]; then
-            say "已开启 kmsg 全量日志转发。"
-            ( cat /dev/kmsg 2>/dev/null | while IFS= read -r line; do echo "[kmsg] $line"; done ) &
+            say "WARN: 已开启 kmsg 全量日志转发 (仅转发启动后记录；注意 /dev/kmsg 包含宿主机内核输出)。"
+            kmsg_relay all &
         else
             say "WARN: /dev/kmsg 不可读，无法转发日志。"
         fi
         ;;
     *)
         if [ -r /dev/kmsg ]; then
-            say "已开启 kmsg 核心日志转发 (可通过 PICO_LOG_KMSG=all 开启全量)。"
-            ( cat /dev/kmsg 2>/dev/null \
-                | grep -i -E 'init:|binder|pico|servicemanager|surfaceflinger|zygote|keystore|permission denied|selinux' \
-                | while IFS= read -r line; do echo "[kmsg] $line"; done ) &
+            say "已开启 kmsg 核心 Android 服务日志转发 (已过滤历史宿主机记录与重复输出)。"
+            kmsg_relay core &
         else
             say "WARN: /dev/kmsg 不可读，无法转发日志。"
         fi
@@ -88,21 +145,86 @@ if [ ! -x /init ]; then
     exit 127
 fi
 
+# shellcheck source=docker/pico-network.sh
 . /system/bin/pico-network.sh
 
 # redroid 官方镜像的 ENTRYPOINT 是 ["/init","qemu=1","androidboot.hardware=redroid"]。
 # 我们替换了 ENTRYPOINT，这两个参数必须由这里补回：缺少 androidboot.hardware=redroid 时
 # ro.hardware 不是 redroid，hwcomposer HAL 找不到 hwcomposer.redroid.so 而退出(status 1)，
 # 其 onrestart 会不断重启 surfaceflinger → zygote → 整个系统 5 秒一轮死循环，永远到不了 boot_completed。
-has_hw=0; has_qemu=0
-for boot_arg in "$@"; do
-    case "$boot_arg" in
-        androidboot.hardware=*) has_hw=1 ;;
-        qemu=*) has_qemu=1 ;;
-    esac
-done
-[ "$has_hw" = 1 ] || set -- androidboot.hardware=redroid "$@"
-[ "$has_qemu" = 1 ] || set -- qemu=1 "$@"
+has_boot_prop() {
+    _key="$1"
+    shift
+    for _arg in "$@"; do
+        case "$_arg" in
+            "${_key}="*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+has_boot_prop "androidboot.hardware" "$@" || set -- androidboot.hardware=redroid "$@"
+has_boot_prop "qemu" "$@" || set -- qemu=1 "$@"
+
+# 可选禁用容器内无认证 root adbd (TCP 5555)：
+# PICO_ENABLE_ADB=0 时通过 boot 属性 + /system/etc/init/pico-no-adb.rc 在 Android init 层阻止 adbd 运行；
+# 默认保持 1（与 docker/compose.yml 仅绑定 127.0.0.1:5555 兼容），并在恢复启用时清理残留规则文件。
+no_adb_rc="/system/etc/init/pico-no-adb.rc"
+case "${PICO_ENABLE_ADB:-1}" in
+    0|false|FALSE|no|NO)
+        for _adb_prop in \
+            "ro.adb.secure=1" \
+            "service.adb.tcp.port=-1" \
+            "persist.sys.usb.config=none" \
+            "sys.usb.config=none"; do
+            _key="${_adb_prop%%=*}"
+            has_boot_prop "$_key" "$@" || set -- "$@" "$_adb_prop"
+        done
+        if [ -L "$no_adb_rc" ]; then
+            say "WARN: PICO_ENABLE_ADB=${PICO_ENABLE_ADB}: $no_adb_rc 为符号链接，拒绝写入；仅通过启动属性尽力禁用 adbd，请配合 NetworkPolicy/防火墙封锁 TCP 5555。"
+        elif [ ! -d /system/etc/init ] || [ ! -w /system/etc/init ]; then
+            say "WARN: PICO_ENABLE_ADB=${PICO_ENABLE_ADB}: /system/etc/init 不可写（如只读 rootfs），未能写入 $no_adb_rc；仅注入启动属性可能无法彻底阻止 adbd 监听 TCP 5555，请确认网络隔离。"
+        elif cat > "$no_adb_rc" <<'EOF'
+# Generated by pico-entrypoint.sh when PICO_ENABLE_ADB=0
+on boot
+    setprop service.adb.tcp.port -1
+    setprop persist.adb.tcp.port -1
+    stop adbd
+
+on property:init.svc.adbd=running
+    stop adbd
+EOF
+        then
+            chmod 0644 "$no_adb_rc" 2>/dev/null || true
+            say "PICO_ENABLE_ADB=${PICO_ENABLE_ADB}: 已写入 $no_adb_rc 并禁用容器内 adbd (TCP 5555)。"
+        else
+            say "WARN: PICO_ENABLE_ADB=${PICO_ENABLE_ADB}: 写入 $no_adb_rc 失败；仅注入启动属性可能无法彻底阻止 adbd 监听 TCP 5555，请检查文件系统权限与网络隔离。"
+        fi
+        ;;
+    *)
+        if [ -f "$no_adb_rc" ] || [ -L "$no_adb_rc" ]; then
+            rm -f "$no_adb_rc" 2>/dev/null || true
+        fi
+        ;;
+esac
+
+# 仅在 x86_64 架构且镜像已内置 libndk_translation.so 时注入 ARM 转译属性，
+# 避免在 linux/arm64 镜像上误覆盖原生 ABI 列表或加载不存在的转译层。
+if [ "$(uname -m)" = "x86_64" ] && [ -f /system/lib64/libndk_translation.so ]; then
+    say "检测到 x86_64 与 libndk_translation.so，自动注入 ARM 转译启动参数。"
+    for _prop in \
+        "ro.product.cpu.abilist=x86_64,arm64-v8a,x86,armeabi-v7a,armeabi" \
+        "ro.product.cpu.abilist32=x86,armeabi-v7a,armeabi" \
+        "ro.product.cpu.abilist64=x86_64,arm64-v8a" \
+        "ro.dalvik.vm.isa.arm=x86" \
+        "ro.dalvik.vm.isa.arm64=x86_64" \
+        "ro.enable.native.bridge.exec=1" \
+        "ro.dalvik.vm.native.bridge=libndk_translation.so" \
+        "ro.ndk_translation.version=0.2.3"; do
+        _key="${_prop%%=*}"
+        has_boot_prop "$_key" "$@" || set -- "$@" "$_prop"
+    done
+fi
 
 say "启动 Android init: /init $*"
 say "首次启动初始化预计耗时 2–5 分钟。"

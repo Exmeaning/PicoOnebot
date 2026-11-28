@@ -4,6 +4,7 @@ import org.json.JSONObject
 import pico.onebot.core.Config
 import pico.onebot.core.PicoLog
 import java.io.File
+import java.io.FileOutputStream
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -19,19 +20,32 @@ import java.util.concurrent.atomic.AtomicLong
  */
 object UinUidStore {
 
-    private const val NEGATIVE_TTL_MS = 30_000L
+    private const val MAX_ENTRIES = 50_000
+    private const val NEGATIVE_TTL_NS = 30_000_000_000L
     private const val NEGATIVE_CAP = 2000
 
-    private val uidToUin = ConcurrentHashMap<String, Long>()
-    private val uinToUid = ConcurrentHashMap<Long, String>()
+    private val mapLock = Any()
+    private val uinToUid = HashMap<Long, String>()
+    private val uidToUin = object : LinkedHashMap<String, Long>(256, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Long>?): Boolean {
+            if (size <= MAX_ENTRIES) return false
+            if (eldest != null && uinToUid[eldest.value] == eldest.key) {
+                uinToUid.remove(eldest.value)
+            }
+            return true
+        }
+    }
+    private val negLock = Any()
     private val negUidMiss = ConcurrentHashMap<String, Long>()
     private val negUinMiss = ConcurrentHashMap<Long, Long>()
 
     private val hits = AtomicLong()
     private val misses = AtomicLong()
 
+    @Volatile
     private var file: File? = null
     private val dirty = AtomicInteger()
+    private val needsSave = AtomicBoolean(false)
     private val saveScheduled = AtomicBoolean(false)
     private val saveLock = Any()
     private val ioExecutor = Executors.newSingleThreadExecutor { r ->
@@ -50,7 +64,7 @@ object UinUidStore {
                 val uin = o.optLong(uid, 0)
                 if (uin > 0) feed(uid, uin, persist = false)
             }
-            PicoLog.i("uid/uin cache loaded: " + uidToUin.size)
+            PicoLog.i("uid/uin cache loaded: " + synchronized(mapLock) { uidToUin.size })
         } catch (t: Throwable) {
             PicoLog.w("uid/uin cache load failed", t)
         }
@@ -60,30 +74,52 @@ object UinUidStore {
         if (uid.isNullOrEmpty() || uin <= 0) return
         negUidMiss.remove(uid)
         negUinMiss.remove(uin)
-        val known = uidToUin.put(uid, uin)
-        uinToUid[uin] = uid
-        if (persist && known == null && dirty.incrementAndGet() >= 50) {
+        val changed = synchronized(mapLock) {
+            val oldUin = uidToUin[uid]
+            if (oldUin != null && oldUin != uin && uinToUid[oldUin] == uid) {
+                uinToUid.remove(oldUin)
+            }
+            val oldUid = uinToUid[uin]
+            if (oldUid != null && oldUid != uid && uidToUin[oldUid] == uin) {
+                uidToUin.remove(oldUid)
+            }
+            uidToUin[uid] = uin
+            uinToUid[uin] = uid
+            oldUin != uin
+        }
+        if (persist && changed && dirty.incrementAndGet() >= 50) {
             dirty.set(0)
+            needsSave.set(true)
             saveAsync()
         }
+    }
+
+    /** 切号/会话失效时清空 30s 负缓存，避免旧账号的查无结果阻断新账号回查。 */
+    fun reset() {
+        synchronized(negLock) {
+            negUidMiss.clear()
+            negUinMiss.clear()
+        }
+        PicoLog.d("uid/uin negative cache reset")
     }
 
     /** uid → uin,缓存未命中时问内核。 */
     fun uin(uid: String?): Long {
         if (uid.isNullOrEmpty()) return 0
-        uidToUin[uid]?.let {
+        synchronized(mapLock) { uidToUin[uid] }?.let {
             hits.incrementAndGet()
             return it
         }
-        val now = System.currentTimeMillis()
-        negUidMiss[uid]?.let { failedAt ->
-            if (now - failedAt < NEGATIVE_TTL_MS) {
+        val nowNs = System.nanoTime()
+        negUidMiss[uid]?.let { failedAtNs ->
+            if ((nowNs - failedAtNs).coerceAtLeast(0L) < NEGATIVE_TTL_NS) {
                 misses.incrementAndGet()
                 return 0
             }
-            negUidMiss.remove(uid, failedAt)
+            negUidMiss.remove(uid, failedAtNs)
         }
         misses.incrementAndGet()
+        val epoch = KernelGate.currentEpoch()
         val svc = KernelGate.profileService() ?: return 0
         return try {
             val map = svc.getUinByUid("", arrayListOf(uid))
@@ -91,11 +127,11 @@ object UinUidStore {
             if (uin > 0) {
                 feed(uid, uin)
             } else {
-                recordUidMiss(uid, now)
+                recordUidMiss(uid, System.nanoTime(), epoch)
             }
             uin
         } catch (t: Throwable) {
-            recordUidMiss(uid, now)
+            recordUidMiss(uid, System.nanoTime(), epoch)
             PicoLog.d("getUinByUid failed: " + t.message)
             0
         }
@@ -104,19 +140,25 @@ object UinUidStore {
     /** uin → uid,私聊发消息必须先拿到 uid。 */
     fun uid(uin: Long): String {
         if (uin <= 0) return ""
-        uinToUid[uin]?.let {
+        synchronized(mapLock) {
+            uinToUid[uin]?.also { u ->
+                // 同步触碰 LRU 访问序
+                uidToUin[u]
+            }
+        }?.let {
             hits.incrementAndGet()
             return it
         }
-        val now = System.currentTimeMillis()
-        negUinMiss[uin]?.let { failedAt ->
-            if (now - failedAt < NEGATIVE_TTL_MS) {
+        val nowNs = System.nanoTime()
+        negUinMiss[uin]?.let { failedAtNs ->
+            if ((nowNs - failedAtNs).coerceAtLeast(0L) < NEGATIVE_TTL_NS) {
                 misses.incrementAndGet()
                 return ""
             }
-            negUinMiss.remove(uin, failedAt)
+            negUinMiss.remove(uin, failedAtNs)
         }
         misses.incrementAndGet()
+        val epoch = KernelGate.currentEpoch()
         val svc = KernelGate.profileService() ?: return ""
         return try {
             val map = svc.getUidByUin("", arrayListOf(uin))
@@ -124,39 +166,50 @@ object UinUidStore {
             if (uid.isNotEmpty()) {
                 feed(uid, uin)
             } else {
-                recordUinMiss(uin, now)
+                recordUinMiss(uin, System.nanoTime(), epoch)
             }
             uid
         } catch (t: Throwable) {
-            recordUinMiss(uin, now)
+            recordUinMiss(uin, System.nanoTime(), epoch)
             PicoLog.d("getUidByUin failed: " + t.message)
             ""
         }
     }
 
-    private fun recordUidMiss(uid: String, now: Long) {
-        if (negUidMiss.size >= NEGATIVE_CAP) negUidMiss.clear()
-        negUidMiss[uid] = now
+    private fun recordUidMiss(uid: String, nowNs: Long, epoch: Long) {
+        synchronized(negLock) {
+            if (!KernelGate.isEpochCurrent(epoch)) return
+            if (negUidMiss.size >= NEGATIVE_CAP) negUidMiss.clear()
+            negUidMiss[uid] = nowNs
+        }
     }
 
-    private fun recordUinMiss(uin: Long, now: Long) {
-        if (negUinMiss.size >= NEGATIVE_CAP) negUinMiss.clear()
-        negUinMiss[uin] = now
+    private fun recordUinMiss(uin: Long, nowNs: Long, epoch: Long) {
+        synchronized(negLock) {
+            if (!KernelGate.isEpochCurrent(epoch)) return
+            if (negUinMiss.size >= NEGATIVE_CAP) negUinMiss.clear()
+            negUinMiss[uin] = nowNs
+        }
     }
 
     private fun saveAsync() {
         if (!saveScheduled.compareAndSet(false, true)) return
         ioExecutor.execute {
             try {
-                save()
+                while (true) {
+                    needsSave.set(false)
+                    save()
+                    if (!needsSave.get()) break
+                }
             } finally {
                 saveScheduled.set(false)
+                if (needsSave.get()) saveAsync()
             }
         }
     }
 
     fun stats(): JSONObject = JSONObject()
-        .put("size", uidToUin.size)
+        .put("size", synchronized(mapLock) { uidToUin.size })
         .put("hits", hits.get())
         .put("misses", misses.get())
 
@@ -164,17 +217,24 @@ object UinUidStore {
         val f = file ?: return
         dirty.set(0)
         synchronized(saveLock) {
+            val tmp = File(f.parentFile, "${f.name}.${System.nanoTime()}.tmp")
             try {
+                val snapshot = synchronized(mapLock) { HashMap(uidToUin) }
                 val o = JSONObject()
-                for ((uid, uin) in uidToUin) o.put(uid, uin)
-                val tmp = File(f.parentFile, f.name + ".tmp")
-                tmp.writeText(o.toString())
+                for ((uid, uin) in snapshot) o.put(uid, uin)
+                f.parentFile?.mkdirs()
+                FileOutputStream(tmp).use { fos ->
+                    fos.write(o.toString().toByteArray(Charsets.UTF_8))
+                    fos.flush()
+                    fos.fd.sync()
+                }
                 if (!tmp.renameTo(f)) {
-                    f.writeText(o.toString())
-                    tmp.delete()
+                    PicoLog.w("uid/uin cache atomic rename failed: " + f.absolutePath)
                 }
             } catch (t: Throwable) {
                 PicoLog.w("uid/uin cache save failed", t)
+            } finally {
+                if (tmp.exists()) tmp.delete()
             }
         }
     }

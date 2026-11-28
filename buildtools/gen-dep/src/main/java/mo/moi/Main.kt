@@ -12,10 +12,13 @@ import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
-import kotlin.random.Random
 
 fun main() {
     val inputJar = File("./buildtools/gen-dep/raw.jar")
@@ -24,32 +27,61 @@ fun main() {
 }
 
 val excluded = arrayOf("kotlin", "androidx")
+
 fun processJar(inputJar: File, outputJar: File) {
-    outputJar.parentFile?.mkdirs()
-    ZipOutputStream(BufferedOutputStream(FileOutputStream(outputJar))).use { zos ->
-        ZipInputStream(BufferedInputStream(FileInputStream(inputJar))).use { zis ->
-            var entry: ZipEntry? = zis.nextEntry
-            while (entry != null) {
-                // kotlin/ 与 androidx/ 一律**不进** source.jar:编译时用官方 artifact。
-                // 宿主 APK 里的 kotlin stdlib 是裁剪过的,若混进 classpath,kotlinc 内联
-                // `synchronized {}` 之类 stdlib inline 函数时会取到它的字节码而崩掉
-                // ("Couldn't inline method call ... MONITOREXIT")。
-                if (!entry.isDirectory && !excluded.any { entry.name.startsWith("$it/") }) {
-                    val entryName = entry.name
-                    val bytes = zis.readBytes()
-                    val modifiedBytes =
-                        if (entryName.endsWith(".class")) modifyClass(bytes) else bytes
-                    zos.putNextEntry(ZipEntry(entryName))
-                    zos.write(modifiedBytes)
-                    zos.closeEntry()
+    require(inputJar.isFile) { "Input JAR does not exist: ${inputJar.absolutePath}" }
+    val parentDir = outputJar.absoluteFile.parentFile
+        ?: error("Output JAR has no parent directory: ${outputJar.path}")
+    parentDir.mkdirs()
+
+    val tempPath = Files.createTempFile(parentDir.toPath(), "${outputJar.name}.", ".tmp")
+    val renameCounter = AtomicInteger(0)
+    try {
+        ZipOutputStream(BufferedOutputStream(FileOutputStream(tempPath.toFile()))).use { zos ->
+            ZipInputStream(BufferedInputStream(FileInputStream(inputJar))).use { zis ->
+                var entry: ZipEntry? = zis.nextEntry
+                while (entry != null) {
+                    // kotlin/ 与 androidx/ 一律**不进** source.jar:编译时用官方 artifact。
+                    // 宿主 APK 里的 kotlin stdlib 是裁剪过的,若混进 classpath,kotlinc 内联
+                    // `synchronized {}` 之类 stdlib inline 函数时会取到它的字节码而崩掉
+                    // ("Couldn't inline method call ... MONITOREXIT")。
+                    if (!entry.isDirectory && !excluded.any { entry.name.startsWith("$it/") }) {
+                        val entryName = entry.name
+                        val bytes = zis.readBytes()
+                        val modifiedBytes =
+                            if (entryName.endsWith(".class")) modifyClass(bytes, renameCounter) else bytes
+                        val outEntry = ZipEntry(entryName).apply {
+                            time = 0L
+                        }
+                        zos.putNextEntry(outEntry)
+                        zos.write(modifiedBytes)
+                        zos.closeEntry()
+                    }
+                    entry = zis.nextEntry
                 }
-                entry = zis.nextEntry
             }
         }
+        try {
+            Files.move(
+                tempPath,
+                outputJar.toPath(),
+                StandardCopyOption.REPLACE_EXISTING,
+                StandardCopyOption.ATOMIC_MOVE
+            )
+        } catch (_: AtomicMoveNotSupportedException) {
+            Files.move(
+                tempPath,
+                outputJar.toPath(),
+                StandardCopyOption.REPLACE_EXISTING
+            )
+        }
+    } catch (t: Throwable) {
+        runCatching { Files.deleteIfExists(tempPath) }
+        throw t
     }
 }
 
-fun modifyClass(classData: ByteArray): ByteArray {
+fun modifyClass(classData: ByteArray, renameCounter: AtomicInteger = AtomicInteger(0)): ByteArray {
     val reader = ClassReader(classData)
     val writer = ClassWriter(reader, 0)
     val visitor = object : ClassVisitor(Opcodes.ASM9, writer) {
@@ -70,14 +102,18 @@ fun modifyClass(classData: ByteArray): ByteArray {
             var newOuterName = outerName
             if (innerName == null && outerName == null && name != null) {
                 newInnerName = name.substringAfterLast("/")
-                newOuterName = name.substringBeforeLast("/")+"/"+newInnerName.substringBefore("$")
+                newOuterName = name.substringBeforeLast("/") + "/" + newInnerName.substringBefore("$")
             }
-            super.visitInnerClass(name, newOuterName, newInnerName,
+            super.visitInnerClass(
+                name,
+                newOuterName,
+                newInnerName,
                 access and Opcodes.ACC_PRIVATE.inv()
-                and Opcodes.ACC_FINAL.inv()
-                or Opcodes.ACC_PUBLIC
+                    and Opcodes.ACC_FINAL.inv()
+                    or Opcodes.ACC_PUBLIC
             )
         }
+
         val renameMethods = listOf(
             "K(Lcom/tencent/mvi/base/mvi/MviUIState;)V",
             "e(Lcom/tencent/qqnt/chats/core/adapter/itemdata/RecentContactChatItem;Lcom/tencent/qqnt/chats/core/adapter/holder/BaseChatViewHolder;)V",
@@ -94,7 +130,7 @@ fun modifyClass(classData: ByteArray): ByteArray {
         ): MethodVisitor {
             var newName = name
             if (renameMethods.contains("$name$descriptor")) {
-                newName = "Rename${Random.nextInt()}"
+                newName = "Rename${renameCounter.incrementAndGet()}"
             }
             var newAccess = access and Opcodes.ACC_FINAL.inv()
             if (name == "<init>" && (access and Opcodes.ACC_PRIVATE) != 0) {
@@ -120,8 +156,6 @@ fun modifyClass(classData: ByteArray): ByteArray {
             return if (removed.contains(descriptor)) null
             else super.visitAnnotation(descriptor, visible)
         }
-
-
     }
     reader.accept(visitor, 0)
     return writer.toByteArray()
